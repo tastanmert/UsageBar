@@ -1,0 +1,361 @@
+import Darwin
+import Foundation
+
+// Supervisor value types, pure decision helpers, and the small pieces of plumbing the resident loop
+// needs but does not have to hold: split from Supervisor.swift so that file stays under the size cap
+// and the logic that CAN be tested without spawning a child is testable on its own
+// (tests/supervisor compiles this alongside Supervisor.swift + Snapshot.swift).
+
+// MARK: - The poll tick
+
+/// What one poll tick tells its loop to do next.
+///
+/// The tick is a FUNCTION rather than the loop's own body because it runs inside an
+/// `autoreleasepool` (Supervisor.swift says why), and neither `continue` nor `break` crosses a
+/// closure boundary. So the two escapes the body used to spell are values here: the stand-down that
+/// leaves the child running, and the relaunch that has already replaced it.
+enum TickOutcome {
+    /// Nothing ended the child: poll again in two seconds.
+    case keepPolling
+    /// This tick performed the relaunch (or the self-update exec failed and fell through to one),
+    /// so the child it was watching is gone and the outer loop takes over.
+    case childReplaced
+}
+
+// MARK: - Child process
+
+/// posix_spawnp keeping the child in OUR process group. Foundation's `Process` puts the child in
+/// a NEW process group, so the interactive child is background to the terminal and job control
+/// stops it with SIGTTIN the moment it reads (claude suspended `T`, blank screen, 2026-07-18).
+/// Same-group spawn reproduces what a plain exec gives: the child shares the foreground group.
+///
+/// The PROGRAM is resolved past UsageBar's PATH shim first (ProviderExecutable.swift): this supervisor
+/// has already picked the account, and the shim would pick again and undo the handoff that just
+/// happened (session c80ebeb2, 2026-07-26). Resolved here rather than at the call site so no future
+/// spawn can forget, and per spawn rather than once per process because a session outlives PATH
+/// changes and the walk costs a handful of `stat`s once per child launch. `argv[0]` keeps the name
+/// the caller passed, which is what a shell leaves there and what `ps` shows.
+///
+/// The program is then mapped to Claude Code's app bundle when that is provably the current
+/// version (ClaudeStableExecutable.swift), so a supervised session keeps one macOS identity across
+/// Claude Code updates. `argv[0]` still keeps the caller's name.
+func spawnChild(_ argv: [String], environment: [String: String],
+                shimDirectory: URL = usageBarShimDirectory,
+                claudeInstall: ClaudeNativeInstall = .current) -> pid_t? {
+    let program = claudeStableExecutable(resolveProviderExecutable(argv[0], shimDirectory: shimDirectory),
+                                         install: claudeInstall)
+    var cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) }
+    cArgs.append(nil)
+    var cEnv: [UnsafeMutablePointer<CChar>?] = environment.map { strdup("\($0.key)=\($0.value)") }
+    cEnv.append(nil)
+    defer { for pointer in cArgs + cEnv { free(pointer) } }
+    var pid: pid_t = 0
+    return posix_spawnp(&pid, program, nil, nil, cArgs, cEnv) == 0 ? pid : nil
+}
+
+// MARK: - The child's environment
+
+/// The environment a supervised child is launched with: the account's config home, plus the markers
+/// the surfaces outside this process read back out of it.
+///
+/// Three of them are a contract with something else in this repo, which is why they are assembled in
+/// one place rather than at the spawn:
+///
+///   - `USAGEBAR_LAUNCHED` tells the status line this session runs under UsageBar (the ✦).
+///   - `USAGEBAR_SUPERVISOR_VERSION` lets it tell whether the supervisor watching the session is the
+///     current build (a session launched before an app update runs stale logic).
+///   - `USAGEBAR_SUPERVISOR_PID` addresses the session. The status line reads the drift badge and the
+///     pending notice under that pid, and `usagebar switch` writes its request there
+///     (SwitchRequest.swift) - it reaches the agent's own shell because every process the child
+///     spawns inherits this, as it does `USAGEBAR_SUPERVISOR_STARTED_AT` beside it, which says WHICH
+///     supervisor that pid means and is handed in rather than read here (HandoffKill.swift).
+///
+/// The provider's own home variable is cleared first and then set from the account, so a home
+/// exported in the parent's environment can never leak into a child the supervisor placed somewhere
+/// else; `launchEnv` returning nil is the DEFAULT home, which must launch with the variable unset
+/// (Snapshot.swift explains why).
+func supervisedChildEnvironment(provider: Provider, home: String, supervisorVersion: String?,
+                                supervisorPID: String, supervisorStartedAt: String?,
+                                taskListID: String? = nil, launchArgs: [String] = [],
+                                base: [String: String] = ProcessInfo.processInfo.environment)
+    -> [String: String] {
+    var environment = base
+    environment.removeValue(forKey: provider.envKey)
+    if clearsEntrypointMarker(provider: provider, args: launchArgs, stdoutIsTTY: true) {
+        environment.removeValue(forKey: claudeEntrypointKey)
+    }
+    environment["\(BrandPaths.envPrefix)LAUNCHED"] = "1"
+    environment["\(BrandPaths.envPrefix)SUPERVISOR_VERSION"] = supervisorVersion
+    environment["\(BrandPaths.envPrefix)SUPERVISED"] = "1"
+    environment.removeValue(forKey: "\(BrandPaths.envPrefix)CODEX_LAUNCH_NONCE")
+    environment["\(BrandPaths.envPrefix)SUPERVISOR_PID"] = supervisorPID
+    // Assigned from the optional, like the version above, so absent identity fields clear any
+    // inherited value. The pid is overwritten
+    // unconditionally, so a generation left in `base` by an OUTER supervised session is the only
+    // way the pair can end up naming two different supervisors. That pairing is the whole identity
+    // the sweep reads (HandoffKill.swift), and a stale one there costs it its own jobs.
+    environment["\(BrandPaths.envPrefix)SUPERVISOR_STARTED_AT"] = supervisorStartedAt
+    // The session's task list, assigned from the optional like the identity fields above: nil
+    // clears an id inherited from an OUTER supervised session, which would otherwise make a nested
+    // session write into that session's list (TaskListPin.swift).
+    environment[taskListEnvKey] = taskListID
+    // No spawn from here stops at Claude Code's "resume the whole conversation?" prompt: a relaunch
+    // resumes by id with nobody at the keyboard, and a first launch was asked for by somebody who
+    // typed the command (ResumePrompt.swift carries the reversal and the way back to the prompt).
+    if provider.id == "claude" {
+        for (key, value) in resumePromptSuppression(environment) {
+            environment[key] = value
+        }
+    }
+    if let env = launchEnv(provider, home: home) { environment[env.key] = env.value }
+    return environment
+}
+
+// MARK: - Non-urgent idle bar
+
+/// How still a session must be before a NON-URGENT relaunch takes it (a follow adoption, a reload
+/// request). The 5s default of `isQuiet` proves only that no turn is streaming, which is the right
+/// bar for a REPAIR (a cap handoff, a degradation rescue: the sooner the better) but far too low
+/// for a preference change: five seconds of silence is also what "read the answer, now typing the
+/// next prompt" looks like, and the relaunch would take the half-typed prompt with it. A preference
+/// can wait for the session to actually be left alone (owner request, 2026-07-25).
+let followIdleSeconds: TimeInterval = 120
+
+// MARK: - Build version and supervision status
+
+/// The directory, beside the Rust `usagebar` entry, that holds this Swift CLI. Must match
+/// SWIFT_CLI_DIR in rust/crates/sys/src/paths.rs (tests/run-entry-tests.sh compares the two).
+let swiftCLIDirectoryName = "swift"
+
+/// The bundle's `Contents` for a CLI at `<App>/Contents/Helpers/usagebar` or, since the Rust entry
+/// took that name, at `<App>/Contents/Helpers/swift/usagebar`. Only the one known extra level is
+/// skipped, so every other layout resolves exactly as it did before.
+func cliBundleContents(_ resolvedExecutable: URL) -> URL {
+    let parent = resolvedExecutable.deletingLastPathComponent()
+    let helpers = parent.lastPathComponent == swiftCLIDirectoryName
+        ? parent.deletingLastPathComponent() : parent
+    return helpers.deletingLastPathComponent()
+}
+
+/// The app version this `usagebar` binary ships inside, read from the enclosing bundle's Info.plist.
+/// The CLI is embedded at <App>/Contents/Helpers/usagebar (the Swift CLI behind the Rust entry at
+/// <App>/Contents/Helpers/swift/usagebar), so the plist sits in `cliBundleContents`. nil when not
+/// running from inside the app bundle (a standalone or dev build), which the status line renders
+/// as "unknown" rather than asserting "outdated".
+///
+/// The path is resolved first: the installed command is a symlink (/usr/local/bin/usagebar points into
+/// the bundle), and `executableURL` reports the path as invoked, so walking up from the symlink
+/// looked for /Info.plist and found nothing. Every launch through the installed command therefore
+/// stamped no version and every supervised session then read as "status unknown" forever, which no
+/// restart could clear (2026-07-25).
+func supervisorBuildVersion(executable: URL? = Bundle.main.executableURL) -> String? {
+    guard let exe = executable?.resolvingSymlinksInPath() else { return nil }
+    let plistURL = cliBundleContents(exe).appendingPathComponent("Info.plist")
+    guard let data = try? Data(contentsOf: plistURL),
+          let plist = try? PropertyListSerialization.propertyList(from: data, format: nil)
+              as? [String: Any],
+          let version = plist["CFBundleShortVersionString"] as? String else { return nil }
+    return version
+}
+
+/// The health of the supervisor watching THIS session, judged by the status line from the version
+/// the supervisor stamped into the child env against the installed binary's own version.
+enum SupervisionStatus: Equatable {
+    case notSteered      // not launched through UsageBar at all - no note
+    case notSupervised   // launched through UsageBar but deliberately without a supervisor - no note
+    case ok              // supervisor version matches the installed app
+    case unknown         // no version and no opt-out marker: an old pre-update supervisor
+    case outdated        // supervisor version differs from the installed app: it runs stale logic
+
+    /// The status-line note, or nil when there is nothing to say. `outdated` describes what is
+    /// already under way rather than asking for anything: since 0.26.0 the supervisor replaces
+    /// itself with the new build at the next idle moment (or on the next relaunch it is making
+    /// anyway), so the old "restart after update" read as an instruction to do by hand what happens
+    /// on its own. `unknown` still asks, and must: a supervisor too old to stamp its version is also
+    /// too old to self-update, so only the user can end that session.
+    var note: String? {
+        switch self {
+        case .notSteered, .notSupervised, .ok: return nil
+        case .unknown: return "supervisor status unknown, restart after update"
+        case .outdated: return "supervisor updating at next idle"
+        }
+    }
+}
+
+/// Pure comparison so the status-line note is testable without a bundle. `supervised` is false when
+/// the launcher stamped the opt-out marker (a --account/--no-handoff plain exec, or a shim-steered
+/// bare launch): a deliberate choice, so it stays quiet rather than nagging. Only a launch that
+/// SHOULD have a supervisor but carries no version is "unknown" (an old pre-marker supervisor); a
+/// missing INSTALLED version means we can't compare, so assume ok.
+func supervisionStatus(steered: Bool, supervised: Bool, supervisorVersion: String?,
+                       installedVersion: String?) -> SupervisionStatus {
+    guard steered else { return .notSteered }
+    guard supervised else { return .notSupervised }
+    guard let supervisorVersion else { return .unknown }
+    guard let installedVersion else { return .ok }
+    return supervisorVersion == installedVersion ? .ok : .outdated
+}
+
+// MARK: - Recovery fuse (per supervised session, in memory)
+
+/// At most `max` AUTOMATIC cross-account recoveries (a cap handoff or a degradation rescue) per
+/// rolling `window`, so a systemic failure can't burn through logins in a loop. Scoped to ONE
+/// supervised session and held in memory, unlike the old shared file gate: five sessions hitting
+/// a model-window drain at the same instant each recorded into one file and tripped every other
+/// session's fuse, so nobody could hand off (2026-07-24). Deliberate moves (a pin switch, a follow
+/// adoption) and same-account relaunches (the fallback profile) are never counted.
+///
+/// Per SESSION, not per process, and the difference is not academic: a self-update replaces the
+/// supervisor with `execv`, so a fuse that reset there would enforce a limit the user never
+/// experiences. The sequence is reachable in one sitting: two recoveries spent, the current account
+/// not capped at that instant (so nothing blocks the upgrade), the app updates, the fuse is back to
+/// zero, and the same conversation can be restarted three more times, each restart a visible
+/// interruption. So the recoveries ride across the exec in the `__resupervise` contract
+/// (SelfUpdate.swift) and seed the new process's fuse.
+struct RecoveryFuse {
+    let max: Int
+    let window: TimeInterval
+    private var recent: [Date] = []
+
+    /// `recovered` seeds the fuse from the supervisor this process replaced; empty (the default) is
+    /// a supervisor started normally. Filtered against `now` on the way in as well as on the way
+    /// out, because the exec takes real time: an entry that was live when it was encoded may have
+    /// left the window by the time the new image reads it.
+    init(max: Int = 3, window: TimeInterval = 10 * 60, recovered: [Date] = [], now: Date = Date()) {
+        self.max = max
+        self.window = window
+        recent = recovered.filter { now.timeIntervalSince($0) < window }
+    }
+
+    /// True while the fuse has room. Prunes entries older than the window as a side effect.
+    mutating func allows(now: Date = Date()) -> Bool {
+        recent.removeAll { now.timeIntervalSince($0) >= window }
+        return recent.count < max
+    }
+
+    mutating func record(now: Date = Date()) {
+        recent.append(now)
+    }
+
+    /// The recoveries to hand to the process replacing this one. Pruned first (via `allows`), so an
+    /// entry past the window never travels: it could only be dead weight the new process would have
+    /// to drop anyway, and carrying it invites reading the list as a count rather than as times.
+    mutating func carried(now: Date = Date()) -> [Date] {
+        _ = allows(now: now)
+        return recent
+    }
+}
+
+/// The shared handoff audit log (pure observability now the fuse is per supervisor). Kept for
+/// after-the-fact debugging: which session moved from which account to which, and why.
+let handoffLog = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("\(BrandPaths.stateDirName)/handoff.log")
+
+/// The name a relaunch is recorded under, which is the question this log exists to answer: WHY did
+/// this conversation end up on a different account. The plan's own reason is an internal tag shared
+/// with the terminal warnings, so the three that a reader has to tell apart after the fact are given
+/// the names the feature uses out loud - a hand-typed `usagebar switch`, a hard cap, and the quota
+/// reasoning that re-picks an account on its own. The rest keep their tag: `pin` (moved in the
+/// panel), `reload`, `follow`, `degraded`, `fallback`, `safeguard`, `self-update`.
+///
+/// `pinCleared` outranks all of it, because that move is the one an owner reading this log is
+/// looking for: the session was pinned by hand, and something moved it anyway (SessionSwitch.swift).
+/// It keeps the mover's own tag behind the prefix rather than flattening every clearance into one
+/// word: a cap still reads `pin-cleared-cap`, which is what is on disk and in every grep written
+/// against it, and the preventive movers a spent account releases (DroughtWatch.swift) name
+/// themselves the same way - the question the log is consulted for is which move took the pin.
+func handoffReason(_ planReason: String, pinCleared: Bool) -> String {
+    if pinCleared { return "pin-cleared-\(planReason)" }
+    switch planReason {
+    case "switch": return "manual-switch"
+    case "cap": return "cap-handoff"
+    case "rebalance": return "auto-select"
+    default: return planReason
+    }
+}
+
+/// One audit line, formatted. Pure, so the shape can be asserted without a home directory - the
+/// whole point of the fields is that somebody reads them back weeks later, and a format nothing
+/// tests is a format that drifts.
+///
+/// `cwd` goes LAST because it is the one field that can contain a space: everything before it stays
+/// at a fixed offset for a reader with an eye or a `grep`. Never contains a token; the fields are
+/// the session id prefix, the supervisor's pid, the from->to labels, the reason, and the directory
+/// the session runs in.
+func handoffLogLine(sessionID: String?, from: String, to: String, reason: String, pid: String,
+                    cwd: String, now: Date = Date()) -> String {
+    let stamp = ISO8601DateFormatter().string(from: now)
+    let sid = sessionID.map { String($0.prefix(8)) } ?? "unknown"
+    return "\(stamp) session=\(sid) pid=\(pid) \(from)->\(to) reason=\(reason) cwd=\(cwd)\n"
+}
+
+/// Append one audit line.
+///
+/// The pid and the cwd are here because the reason alone could not answer the question this log was
+/// consulted for: with several sessions moving accounts on one machine, "which session was this, and
+/// where was it running" had no answer at all, and the account a conversation ended up on could not
+/// be traced back to the decision that put it there (2026-08-06).
+func logHandoff(sessionID: String?, from: String, to: String, reason: String, pid: String,
+                cwd: String, now: Date = Date(), log: URL = handoffLog) {
+    appendHandoffLine(handoffLogLine(sessionID: sessionID, from: from, to: to, reason: reason,
+                                     pid: pid, cwd: cwd, now: now), to: log)
+}
+
+/// The line a relaunch HELD by an unresolved fork leaves (grep `hold=unresolved-fork`): the tick
+/// stood its restart down because a new transcript here has no turn in it yet, so it cannot be told
+/// apart from the file this conversation moved to (TranscriptFork.swift).
+///
+/// A log line rather than a terminal one, which is what it used to be: this tick relaunches nothing,
+/// so the child is still drawing when it is written (PendingNotice.swift's rule). Said once per
+/// session either way - the caller latches it - and this is the only trace of a restart that was
+/// asked for and did not happen.
+func unresolvedForkHoldLine(pid: String, cwd: String, now: Date = Date()) -> String {
+    "\(ISO8601DateFormatter().string(from: now)) pid=\(pid) hold=unresolved-fork cwd=\(cwd)\n"
+}
+
+/// The line an AMBIGUOUS fork leaves (grep `fork=ambiguous`): two transcripts continue this
+/// conversation and their mtimes tie, so the watcher keeps the file it is bound to rather than
+/// guessing. Same channel, same reason as the hold above; the session id is the one it stayed on.
+func forkAmbiguityLine(boundID: String, now: Date = Date()) -> String {
+    "\(ISO8601DateFormatter().string(from: now)) session=\(boundID.prefix(8)) fork=ambiguous "
+        + "action=staying-on-parent\n"
+}
+
+/// Append one whole line to the shared handoff log, O_APPEND so concurrent supervisors interleave
+/// without a lock. Best-effort: a logging failure must never disturb the caller. Internal, not
+/// private: the drift writers in DriftMonitor.swift share it.
+///
+/// `log` is injectable for the reason every directory on this track is (`switchRequestDir`,
+/// `supervisorStateDir`, `quarantineDir`): a test that reaches a code path which logs must not write
+/// into the user's own audit history. It did - a suite run put 1,231 invented lines into a real
+/// `~/.usagebar/handoff.log` before this parameter existed (2026-08-07), which is the same rule the
+/// suites already keep for every other home-directory file.
+///
+/// AND IT HAS NO DEFAULT, deliberately. A default is what let a call site reach the user's file by
+/// saying nothing, which is exactly how the ninth one was missed while the eight above it were being
+/// threaded (review, 2026-08-07). Naming the sink is now the compiler's requirement rather than a
+/// reviewer's, and a logging path added later cannot inherit the old hazard by omission.
+func appendHandoffLine(_ line: String, to log: URL) {
+    try? FileManager.default.createDirectory(at: log.deletingLastPathComponent(),
+                                             withIntermediateDirectories: true)
+    let fd = open(log.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+    guard fd >= 0 else { return }
+    _ = line.withCString { write(fd, $0, strlen($0)) }
+    close(fd)
+}
+
+/// Make a conversation's transcript visible to the account a handoff moves it to, so the relaunch
+/// can `--resume` it there. A no-op on a shared tree (both homes resolve to the same file) and when
+/// the destination already holds it. Best-effort throughout: a copy that fails costs the resume, not
+/// the handoff, and the child then starts fresh on the target rather than not starting at all.
+func shareTranscript(_ sessionFile: URL, toHome home: String, slug: String) {
+    let sourceResolved = sessionFile.resolvingSymlinksInPath()
+    let destDir = URL(fileURLWithPath: home).appendingPathComponent("projects/\(slug)")
+    let dest = destDir.appendingPathComponent(sessionFile.lastPathComponent)
+    guard dest.resolvingSymlinksInPath() != sourceResolved,
+          !FileManager.default.fileExists(atPath: dest.path) else { return }
+    try? FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+    try? FileManager.default.copyItem(at: sessionFile, to: dest)
+}
+
+// The cap-recovery section that used to sit here is in CapRecovery.swift (500-line file cap).

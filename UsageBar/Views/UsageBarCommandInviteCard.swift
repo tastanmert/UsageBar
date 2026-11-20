@@ -1,0 +1,35 @@
+import SwiftUI
+
+/// The panel's invitation to put `usagebar` on the PATH: one dismissible card under the accounts. "Set
+/// Up" opens the small install window; the cross is the only other way it goes away for good.
+struct UsageBarCommandInviteCard: View {
+    let onSetUp: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            PanelHintGlyph(diameter: 28) {
+                Text(verbatim: ">_").font(.system(size: 12, weight: .bold, design: .monospaced))
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(L("Start Claude on the account with room")).font(.system(size: 14, weight: .semibold))
+                HintText.withCode(L("Type `usagebar claude` instead of `claude` and UsageBar picks the account."), size: 12.5)
+                    .font(.system(size: 12.5)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Button(L("Set Up"), action: onSetUp)
+                .buttonStyle(PanelHintButtonStyle(fontSize: 13))
+            Button(action: onDismiss) {
+                Image(systemName: "xmark").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(L("Dismiss"))
+        }
+        .padding(.horizontal, 14).padding(.vertical, 12)
+        .modifier(CommandCardStyle())
+        .padding(.horizontal, 12)
+        .padding(.bottom, 12)
+    }
+}

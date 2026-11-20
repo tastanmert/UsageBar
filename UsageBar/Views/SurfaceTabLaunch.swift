@@ -1,0 +1,42 @@
+import Foundation
+
+/// Which page a launch asks the surface to open on (`-UsageBarTab sessions`, demo and dev builds only,
+/// argument domain so nothing persists).
+///
+/// It exists because the selection is deliberately not persisted (`SurfaceTabState`), so every
+/// surface opens on Usage and the only other way to another page is the header switch. Clicking it
+/// means synthesizing a click into the app, which takes the pointer and the frontmost app away from
+/// whoever is using the machine, and a dev-only flag that puts the state on screen instead is the
+/// sanctioned answer (~/.claude/docs/patterns/macos-app-verification.md).
+///
+/// It is the other half of `-UsageBarPanelCapture`, and the two are written together: that flag decides
+/// that a surface is on screen at all without anybody clicking the status item, this one decides what
+/// that surface is showing. Alone it shows nothing, which is why it only ever qualifies a launch that
+/// already puts a window up (a capture, or a restored dashboard window).
+enum SurfaceTabLaunch {
+    /// What a surface opens on. Asked here rather than in each host so that the three copies of the
+    /// surface (popover, pinned panel, dashboard window) cannot answer it differently.
+    ///
+    /// Gated exactly like `-UsageBarAppearance` and `-UsageBarPanelCapture`: a release instance somebody
+    /// is actually using must open where its own state says, whatever arguments reach its defaults.
+    ///
+    /// The page is named by the tab's own word, or a Cost page's (`SurfacePage.named`, which is
+    /// where `tokens` keeps meaning the token history now that it lives inside Cost), matched without
+    /// regard to case, because the label is what whoever writes the capture command has in front of
+    /// them. A word this app has no page for is ignored rather than refused: the flag exists to save
+    /// that command a click, and failing the launch over a typo in one would cost the whole instance.
+    ///
+    /// Falling back to `-UsageBarTokenGraphPreview`'s implied page, and after it rather than before:
+    /// that flag says which ROW to unfold and the Cost tab's Tokens page follows from it, while this
+    /// one is a statement about the page itself, so the more specific instruction wins when both
+    /// are given.
+    static var initialPage: SurfacePage {
+        if DemoUsage.isActive || BuildVariant.isDev,
+           let raw = UserDefaults.standard.string(forKey: "UsageBarTab"),
+           let named = SurfacePage.named(raw) {
+            return named
+        }
+        return TokenGraphPreview.project == nil
+            ? SurfacePage(tab: .usage) : SurfacePage(tab: .cost, costPage: .tokens)
+    }
+}

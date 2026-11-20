@@ -1,0 +1,17 @@
+# Permanent exemptions: file<TAB>Type.func<TAB>api<TAB>reason. A row without a reason is red.
+UsageBar/MenuBar/MenuBarStrip.swift	MenuBarStripRenderer.writeSnapshot	write	demo-only README capture (-UsageBarStripSnapshot), never runs in a user session
+UsageBar/MenuBar/StatusItemButton.swift	StatusItemController.writeButtonSnapshot	write	demo-only status button capture (-UsageBarStripSnapshot with -UsageBarMenuBarAppearance), never runs in a user session
+UsageBar/Core/ResetHintNotifier.swift	ResetHintNotifier.runExpiryDeliveryTest	write	developer test hook, not reachable from UI
+UsageBar/App/WindowSnapshot.swift	WindowSnapshot.write	createDirectory	dev/demo-only window capture (-UsageBarWindowSnapshot), the launch quits right after, never runs in a user session
+UsageBar/App/WindowSnapshot.swift	WindowSnapshot.write	write	dev/demo-only window capture (-UsageBarWindowSnapshot), the launch quits right after, never runs in a user session
+UsageBar/Stores/IntegrationsShim.swift	IntegrationsStore.installShim	fileExists	explicit integration transaction: validate the existing small file before backup/replacement; automatic maintenance stays gated off
+UsageBar/Stores/IntegrationsShim.swift	IntegrationsStore.installShim	readString	explicit integration transaction: validate the existing small file before backup/replacement; automatic maintenance stays gated off
+UsageBar/Stores/IntegrationsShim.swift	IntegrationsStore.removeShim	fileExists	explicit integration transaction: validate the existing small file before backup/replacement; automatic maintenance stays gated off
+UsageBar/Stores/IntegrationsShim.swift	IntegrationsStore.removeShim	readString	explicit integration transaction: validate the existing small file before backup/replacement; automatic maintenance stays gated off
+UsageBar/Stores/IntegrationsStore.swift	IntegrationsStore.existingText	fileExists	explicit integration transaction: validate the existing small file before backup/replacement; automatic maintenance stays gated off
+UsageBar/Stores/IntegrationsStore.swift	IntegrationsStore.existingText	readString	explicit integration transaction: validate the existing small file before backup/replacement; automatic maintenance stays gated off
+UsageBar/Stores/IntegrationsStore.swift	IntegrationsStore.writeShellFile	write	explicit integration transaction: validate the existing small file before backup/replacement; automatic maintenance stays gated off
+UsageBar/Stores/IntegrationsStore.swift	IntegrationsStore.recordManifest	fileExists	explicit integration transaction: validate the existing small file before backup/replacement; automatic maintenance stays gated off
+UsageBar/Stores/IntegrationsStore.swift	IntegrationsStore.recordManifest	readData	explicit integration transaction: validate the existing small file before backup/replacement; automatic maintenance stays gated off
+UsageBar/Stores/IntegrationsStore.swift	IntegrationsStore.integrationCLIDeliverable	isExecutableFile	single executable stat for the installed bundle fallback; no process or account scan
+UsageBar/Stores/IntegrationsStore.swift	IntegrationsStore.integrationCLIPath	isExecutableFile	single executable stat for the installed bundle fallback; no process or account scan

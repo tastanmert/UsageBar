@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/sys", "crates/ffi", "crates/cli", "crates/uniffi-bindgen"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[profile.release]
+# catch_unwind at the FFI boundary only works with unwinding panics.
+panic = "unwind"
+# No LTO: with it the archive holds LLVM bitcode from rustc's LLVM, which Apple's linker
+# cannot read. Plain machine code links everywhere.
+lto = false
+codegen-units = 1
+debug = "line-tables-only"

@@ -1,0 +1,118 @@
+import SwiftUI
+
+/// One usage window on a single line: `label · bar · value`, so an account stays compact and several
+/// accounts fit at a glance. The bar is the sole carrier of urgency colour (green → amber → red); the
+/// numeral stays neutral. The headline (top-tier) window is `prominent` - bolder, with a reset/warning
+/// line beneath; secondary windows are one clean line each.
+struct MetricRowView: View {
+    let metric: UsageMetric
+    let mode: DisplayMode
+    var prominent: Bool = false
+    /// The account just redeemed a banked reset and the provider has not published the cleared
+    /// counters yet. An exhausted row then reports the pending reset rather than the limit it is
+    /// about to lose.
+    var settlingReset: Bool = false
+    /// The figure is held over from before this window's reset, which has already happened
+    /// (`AccountUsage.resetPassed`): the row shows "?" and says so instead of a stale percentage.
+    var resetPassed: Bool = false
+    /// The personal account's water line, 0 on every other account (ReserveMark.swift). Passed for
+    /// every window because the bar is per window, and DRAWN on the ones the reserve is held back
+    /// from: the weekly all-models bar, the 5h one and the FLAGSHIP model's (PersonalAccount.
+    /// reserved, UsageBar/Core/AccountReserve.swift).
+    var reserve: Int = 0
+
+    /// Whether this row is the account's headline window, which the reserve needs and `prominent`
+    /// may not be trusted for: that one is styling, this one decides whether a bar claims quota is
+    /// protected. Only the flagship model window carries the line, and the other tiers "show every
+    /// model tier" reveals are the same kind (`PersonalAccount.reserved`).
+    var isHeadline: Bool = false
+
+    /// What this row's own bar reserves: the number above where the window carries one, and zero
+    /// where it does not, so the mark and the tooltip cannot disagree about it.
+    private var barReserve: Int {
+        PersonalAccount.reserved(metric.kind, isHeadline: isHeadline) ? reserve : 0
+    }
+
+    private static let labelWidth: CGFloat = 72
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                // The label is a NAME and names must look identical everywhere - hierarchy is
+                // carried by the data instead (the prominent row keeps its larger numeral and
+                // thicker bar). No minimumScaleFactor: it silently shrank the label on cards
+                // stretched to fill their grid row (probe-verified 2026-07-19); a rare too-long
+                // label truncating with an ellipsis is honest, a randomly smaller one is not.
+                Text(L(metric.label))
+                    .font(.footnote)
+                    .foregroundStyle(Color.secondary)
+                    .lineLimit(1)
+                    .frame(width: Self.labelWidth, alignment: .leading)
+                bar
+                Text(UsageFormat.percent(metric, mode: mode, resetPassed: resetPassed))
+                    .font((prominent ? Font.callout : Font.footnote).weight(.semibold).monospacedDigit())
+                    .foregroundStyle(resetPassed ? Color.secondary : Color.primary)
+                    .frame(width: 46, alignment: .trailing)
+            }
+            contextLine
+        }
+    }
+
+    private var bar: some View {
+        // Used fills from the left; remaining anchors right, so the two modes split the same track at
+        // the same boundary.
+        GeometryReader { geo in
+            ZStack(alignment: mode == .used ? .leading : .trailing) {
+                Capsule().fill(.quaternary)
+                if !resetPassed {
+                    Capsule()
+                        .fill(metric.severity.color)
+                        .frame(width: max(3, geo.size.width * UsageFormat.fillFraction(metric, mode: mode)))
+                }
+                ReserveMark(reserve: barReserve)
+            }
+        }
+        .frame(height: prominent ? 7 : 6)
+        .usageBarTooltip(barReserve > 0 ? L("Kept for web use") : "")
+    }
+
+    /// What this window's reset slot says (an untouched session window included: the provider starts
+    /// the 5h clock on the first message), decided once for every surface (`UsageFormat.resetState`).
+    private var resetState: UsageFormat.ResetState {
+        UsageFormat.resetState(metric, resetPassed: resetPassed)
+    }
+
+    /// A tiny line under every window's bar: a critical warning on the left, ITS OWN reset on the
+    /// right - per-row so a reset can never be misread as belonging to a neighbouring window.
+    /// The reset reads as a countdown; hovering it adds the exact time.
+    @ViewBuilder
+    private var contextLine: some View {
+        if resetState != .absent || metric.severity == .critical {
+            HStack(spacing: 6) {
+                // A window that has already reset is not at its limit, whatever the held-over
+                // figure says: "Limit reached" there is exactly the line that got misread.
+                if metric.severity == .critical && !resetPassed {
+                    criticalNote
+                }
+                Spacer(minLength: 0)
+                ResetCaption(state: resetState, style: .line)
+            }
+        }
+    }
+
+    /// The left half of a critical row's context line. Normally the limit in red, but neutral while
+    /// a redeemed reset settles: the number under it is stale by seconds and the quota is on its
+    /// way back, so that is a wait rather than a warning.
+    @ViewBuilder
+    private var criticalNote: some View {
+        if settlingReset && metric.usedPercent >= 100 {
+            Text(L("Reset is taking effect"))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        } else {
+            Text(metric.usedPercent >= 100 ? L("Limit reached") : L("Near limit"))
+                .font(.caption2)
+                .foregroundStyle(UsageBarColor.critical)
+        }
+    }
+}

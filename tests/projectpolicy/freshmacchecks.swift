@@ -1,0 +1,117 @@
+import Foundation
+
+// A Mac that has only just been set up: Claude Code lives where its installer put it and PATH does
+// not name that directory, there are no developer tools behind /usr/bin/git, and a CLI may not be
+// installed at all. Every case here is a way `usagebar claude` used to leave a first-time user with a
+// bare error (or a system dialog) and no next step (B-3753).
+
+func runFreshMacChecks() {
+    let fm = FileManager.default
+    let root = tmp.appendingPathComponent("fresh-mac-\(UUID().uuidString)")
+    defer { try? fm.removeItem(at: root) }
+    func executable(_ url: URL) {
+        try! fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try! "#!/bin/sh\n".write(to: url, atomically: true, encoding: .utf8)
+        try! fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+    let home = root.appendingPathComponent("home")
+    let shimDir = home.appendingPathComponent("\(BrandPaths.stateDirName)/bin")
+    let localBin = home.appendingPathComponent(".local/bin")
+    let fallbacks = providerFallbackDirectories(home: home.path)
+    let onPath = root.appendingPathComponent("on-path")
+
+    check("the fixed install places are the app's, in the app's order",
+          fallbacks == ["\(home.path)/.local/bin", "/opt/homebrew/bin", "/usr/local/bin",
+                        "\(home.path)/.claude/local"])
+
+    // 1. PATH does not name ~/.local/bin; the installer's binary is still found.
+    executable(localBin.appendingPathComponent("claude"))
+    check("a claude only in ~/.local/bin is found when PATH does not name it",
+          resolveProviderExecutable("claude", path: "/usr/bin:/bin", shimDirectory: shimDir,
+                                    fallbackDirectories: fallbacks)
+              == localBin.appendingPathComponent("claude").path)
+    executable(onPath.appendingPathComponent("claude"))
+    check("a claude on PATH still wins over the fixed places",
+          resolveProviderExecutable("claude", path: onPath.path, shimDirectory: shimDir,
+                                    fallbackDirectories: fallbacks)
+              == onPath.appendingPathComponent("claude").path)
+
+    let legacyShim = home.appendingPathComponent("legacy-bin")
+    executable(legacyShim.appendingPathComponent("claude"))
+    check("a legacy wrapper on PATH is skipped in favor of the real binary",
+          resolveProviderExecutable("claude", path: legacyShim.path + ":" + onPath.path,
+                                    shimDirectory: shimDir, excludedShimDirectories: [legacyShim.path],
+                                    fallbackDirectories: []) == onPath.appendingPathComponent("claude").path)
+
+    for linkedParent in [false, true] {
+        let base = root.appendingPathComponent("linked-\(linkedParent)")
+        let backing = base.appendingPathComponent("backing")
+        let bin = linkedParent ? backing.appendingPathComponent("bin") : backing
+        executable(bin.appendingPathComponent("claude"))
+        let legacy = base.appendingPathComponent(".usagebar/bin")
+        if !linkedParent { try! fm.createDirectory(at: legacy.deletingLastPathComponent(), withIntermediateDirectories: true) }
+        try! fm.createSymbolicLink(at: linkedParent ? legacy.deletingLastPathComponent() : legacy,
+                                   withDestinationURL: backing)
+        for entry in [legacy, bin] {
+            check("legacy symlink excluded (parent=\(linkedParent), entry=\(entry.path))",
+                  resolveProviderExecutable("claude", path: entry.path + ":" + onPath.path,
+                                            shimDirectory: shimDir, excludedShimDirectories: [legacy.path],
+                                            fallbackDirectories: []) == onPath.appendingPathComponent("claude").path)
+        }
+    }
+
+    // 2. A shim in a fixed place is not a match, same as on PATH.
+    executable(shimDir.appendingPathComponent("claude"))
+    check("the shim directory is skipped among the fixed places too",
+          resolveProviderExecutable("claude", path: "", shimDirectory: shimDir,
+                                    fallbackDirectories: [shimDir.path]) == "claude")
+    check("nothing anywhere falls back to the bare name",
+          resolveProviderExecutable("no-such-cli-b3753", path: "/usr/bin", shimDirectory: shimDir,
+                                    fallbackDirectories: fallbacks) == "no-such-cli-b3753")
+
+    // 3. No developer tools: git is not started, and the answer is the ordinary "not a repo" one.
+    let withoutTools = runGit(["--version"], gitIsInstalled: { false })
+    check("with no developer tools runGit reports exit 127 instead of starting git",
+          withoutTools.code == 127 && withoutTools.out.isEmpty)
+    var asked = false
+    let notARepo = runGit(["rev-parse", "--git-common-dir"], cwd: tmp.path,
+                          gitIsInstalled: { asked = true; return false })
+    check("with no developer tools the ordinary not-a-repo answer comes back and the probe was asked",
+          notARepo.code != 0 && notARepo.out.isEmpty && asked)
+    let withTools = runGit(["--version"], gitIsInstalled: { true })
+    check("with the tools present git runs as before",
+          withTools.code == 0 && withTools.out.hasPrefix("git version"))
+
+    // 4. The hint a missing CLI gets.
+    let noHome = root.appendingPathComponent("empty-home").path
+    check("a missing claude is told how to install it",
+          missingCLIHint("claude", home: noHome)?.joined(separator: "\n")
+              .contains("curl -fsSL https://claude.ai/install.sh | bash") == true)
+    check("a missing codex is told how to install it",
+          missingCLIHint("codex", home: noHome)?.joined(separator: "\n")
+              .contains("curl -fsSL https://chatgpt.com/codex/install.sh | sh") == true)
+    check("the install hint ends with the new-window instruction",
+          missingCLIHint("claude", home: noHome)?.last
+              == "Then open a new Terminal window and run usagebar again.")
+    check("a CLI UsageBar has no install route for gets no hint", missingCLIHint("vim", home: noHome) == nil)
+    let pathHint = missingCLIHint("claude", home: home.path)?.joined(separator: "\n") ?? ""
+    check("a claude sitting in ~/.local/bin is told to fix PATH, not to reinstall",
+          pathHint.contains(".local/bin:$PATH") && !pathHint.contains("install.sh"))
+
+    // 5. The call both launch paths make: the hint is printed on "not found" and only then, and
+    // each path still makes the call (a deleted call leaves every check above green).
+    var printed: [String] = []
+    warnMissingCLIHint("claude", notFound: true, home: noHome) { printed.append($0) }
+    check("a launch that failed with the CLI not found prints the install hint",
+          printed == missingCLIHint("claude", home: noHome) && !printed.isEmpty)
+    printed = []
+    warnMissingCLIHint("claude", notFound: false, home: noHome) { printed.append($0) }
+    check("a launch that failed for any other reason prints no install hint", printed.isEmpty)
+    let execSource = (try? String(contentsOfFile: "UsageBarCLI/Snapshot.swift", encoding: .utf8)) ?? ""
+    let superviseSource = (try? String(contentsOfFile: "UsageBarCLI/Supervisor.swift", encoding: .utf8)) ?? ""
+    check("the exec path asks for the hint when execvp failed with ENOENT",
+          execSource.contains("warnMissingCLIHint(cli, notFound: failure == ENOENT, warn: warn)"))
+    check("the supervisor asks for the hint when the CLI resolves nowhere",
+          superviseSource.contains("warnMissingCLIHint(provider.cli,")
+              && superviseSource.contains(#"notFound: !resolveProviderExecutable(provider.cli).contains("/"),"#))
+}

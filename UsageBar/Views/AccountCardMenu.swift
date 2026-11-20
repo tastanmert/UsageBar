@@ -1,0 +1,129 @@
+import AppKit
+import SwiftUI
+
+/// The account card's right-click menu, split out of AccountCardView for file size: renewing THIS
+/// account's login without first working out which config home it lives in, opening that home in
+/// Finder, and removing the account altogether.
+///
+/// The first two entries are launchers and nothing more. UsageBar never reads, writes or forwards a
+/// credential: "Renew login" starts the provider's own login against that account's config home, the
+/// CLI opens the browser and completes the round trip itself, and the app only ever learns whether
+/// it worked (see RenewLoginStore).
+///
+/// "Remove account…" is the one destructive entry, which is why it sits below a separator, asks
+/// first, and moves the folder to the Trash rather than deleting it (RemoveAccountAction).
+extension AccountCardView {
+    @ViewBuilder
+    var cardContextMenu: some View {
+        AccountActionsMenu(accountID: usage.id, providerID: usage.providerID,
+                           label: settings.displayLabel(accountID: usage.id,
+                                                        fallback: usage.accountLabel),
+                           home: configHome)
+    }
+}
+
+/// The entries themselves, as a view rather than a card-shaped extension, because the Settings
+/// account list offers the same three actions from its own "⋯" button. Two surfaces, one
+/// implementation: a second copy would drift on exactly the details that matter here (which entry is
+/// disabled when, and which home a removal acts on).
+///
+/// Everything it needs is passed in as plain values, so neither caller has to hold a card's worth of
+/// state to show it.
+struct AccountActionsMenu: View {
+    let accountID: String
+    let providerID: String
+    /// The user-facing name (nickname applied), for the confirmation dialogs.
+    let label: String
+    /// The account's config home, or nil when UsageBar has none to act on (a demo fixture). The
+    /// RENEWAL home: a signed-out account keeps it, which is exactly what "Renew login" acts on.
+    let home: String?
+    /// Start renaming, for the surface that owns a rename field. Absent on the card, which has no
+    /// rename of its own; the Settings list passes its popover trigger, and the entry then leads the
+    /// menu because it is the one people go looking for.
+    var rename: (() -> Void)?
+    /// Move this account up or down the order, nil at the ends (and on the card, which reorders by
+    /// dragging instead). They live in the menu because a settings row has room for exactly one
+    /// occasional-action control, and a permanent pair of arrows spent that room on the rarest of
+    /// them: measured on 2026-08-04, the arrows plus this button together squeezed the row until
+    /// both the address and the quota percentages truncated.
+    var moveUp: (() -> Void)?
+    var moveDown: (() -> Void)?
+    /// Mark this account as the one the user browses claude.ai on, or unmark it. Passed by the
+    /// Settings list alone, which is the surface that also draws the reserve the marking unlocks: an
+    /// entry offered where that stepper cannot appear would be half a feature. Absent = not offered,
+    /// the same shape `rename` uses.
+    var togglePersonal: (() -> Void)?
+    var isPersonal: Bool = false
+    /// Unlink this account from the main account's shared setup, leaving every other account
+    /// shared (IntegrationsStore.stopSharingHarness). Passed by the Settings list alone, which is
+    /// the surface that draws the link mark this entry takes away: on the card, which has no mark,
+    /// the press would change nothing anybody can see. Absent = not offered, the shape `rename`
+    /// uses. The caller decides WHEN to pass it (the account shows the mark and is not the
+    /// provider's main home); this view only draws it.
+    var stopSharing: (() -> Void)?
+
+    @ViewBuilder
+    var body: some View {
+        if let rename {
+            Button(L("Rename…")) { rename() }
+            Divider()
+        }
+        if let togglePersonal {
+            // A checkable entry rather than two verbs: one control both ways, like the pin circle on
+            // a card. The marking is single-select, so ticking another account unticks this one.
+            Toggle(isOn: Binding(get: { isPersonal }, set: { _ in togglePersonal() })) {
+                Text(L("Personal account (web)"))
+            }
+            .help(L("The account you are signed into on claude.ai. UsageBar can keep part of its quota free for you."))
+            Divider()
+        }
+        if moveUp != nil || moveDown != nil {
+            Button(L("Move up")) { moveUp?() }.disabled(moveUp == nil)
+            Button(L("Move down")) { moveDown?() }.disabled(moveDown == nil)
+            Divider()
+        }
+        Button(L("Renew login…")) {
+            guard let home else { return }
+            RenewLoginStore.shared.renew(accountID: accountID, providerID: providerID,
+                                         label: label, home: home)
+        }
+        .disabled(!RenewLoginStore.shared.canRenew(accountID: accountID, providerID: providerID,
+                                                   home: home))
+        Button(L("Open config folder")) {
+            guard let home else { return }
+            // Open the folder itself rather than revealing it inside its parent: every config home
+            // is a dotfolder, and revealing one in a Finder that is not showing hidden files
+            // selects nothing.
+            NSWorkspace.shared.open(URL(fileURLWithPath: home))
+        }
+        .disabled(home == nil)
+        if let stopSharing {
+            Button(L("Stop sharing settings")) { stopSharing() }
+                // The dev build never changes a real config home (IntegrationsStore.guardNotDev,
+                // which the store asks again). A demo capture acts on its fixtures' marks only, so
+                // it stays pressable there for the screenshot.
+                .disabled(BuildVariant.isUnshipped && !DemoUsage.isActive)
+        }
+        // Absent rather than greyed for the provider's default home (`~/.claude`, `~/.codex`): that
+        // one is the user's primary setup and the target of every other account's share links, so
+        // "remove" is not a thing it can mean. A greyed entry would only invite the question.
+        if let home, accountHomeIsRemovable(providerID: providerID, home: home) {
+            Divider()
+            Button(L("Remove account…")) {
+                RemoveAccountAction.present(accountID: accountID, providerID: providerID,
+                                            label: label, home: home)
+            }
+            // Demo fixtures stand for accounts that do not exist on this machine (a marketing
+            // capture must not be able to move a real folder anywhere).
+            //
+            // Nor while a login is running against this very home: the provider's CLI is writing a
+            // credential into the folder this entry moves to the Trash, and the two racing leave
+            // either a half-written login in the Trash or a recreated home nobody asked for. The
+            // renewal entry above is greyed for the same reason, and a destructive one has more
+            // reason to be, not less (codex review, 2026-08-04).
+            // BRIM-GATE: Phase 1 removes no account home (shared with the installed UsageBar).
+            .disabled(!BrimFeatures.providerHomeMutation || DemoUsage.isActive
+                      || RenewLoginStore.shared.isRenewing(accountID))
+        }
+    }
+}

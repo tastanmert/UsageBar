@@ -1,0 +1,493 @@
+import Darwin
+import Foundation
+
+// The session-transcript tailer the supervisor uses to notice a cap hit and a model degradation.
+//
+// Detection is grounded in real transcript data (this machine's history, 2026-07-16): genuine cap
+// hits are `isApiErrorMessage:true` events whose text starts with "You've" ("You've hit your
+// session limit…", "You've reached your Fable 5 limit…"). Server-side trouble ("API Error: …",
+// "Server is temporarily limiting requests (not your usage limit)", 529/500, login expiry) never
+// starts with "You've" and must never trigger a handoff.
+//
+// HOW QUIET A SESSION IS lives next door in SessionQuiet.swift (`isQuiet` and the walk behind it),
+// which is an extension of this same watcher: nothing there reads an event, and everything there is
+// about mtimes, which is the seam the two are split on.
+
+// MARK: - Following a fork
+//
+// Why a conversation moves to a new transcript, how a fork is told from a sibling session, and
+// the code that follows it: TranscriptFork.swift.
+
+/// Bytes one `sawCapHit` reads per block (TranscriptWatcherScan.swift, issue #3).
+let transcriptScanBlockBytes = 4 << 20
+/// Bytes one `sawCapHit` may read before yielding the rest of the file to the next tick, once at
+/// least one line has been consumed. Chosen by measurement (issue #3, optimized build, a 321 MB
+/// synthetic transcript): 64 MiB cost 332 ms a call, 32 MiB keeps a call under the 250 ms bar.
+let transcriptScanBudgetBytes = 32 << 20
+
+/// Watches one session transcript for a cap-hit event newer than `since`.
+struct TranscriptWatcher {
+    let projectDir: URL
+    var file: URL? {
+        didSet {
+            if oldValue?.path != file?.path { loginSignals = TranscriptLoginSignals() }
+        }
+    }
+    var loginSignals = TranscriptLoginSignals()
+    /// The unresolved authentication error in the currently bound transcript.
+    var loginRequiredAt: Date? { loginSignals.requiredAt }
+    var offset: UInt64 = 0
+    /// How many bytes one `sawCapHit` may read before leaving the rest to the next tick
+    /// (`transcriptScanBudgetBytes`, issue #3). A var so a suite can drive a catch-up in small steps.
+    var scanBudgetBytes = transcriptScanBudgetBytes
+    /// Whether the last `sawCapHit` read to the end of the file as it stood when that call began:
+    /// false while a bounded catch-up still has bytes left, and before the first scan. Every reading
+    /// here describes only the part already read, so a writer that acts on the ABSENCE of an event
+    /// (no prompt yet, so nobody is here) waits for this (`CapResumeHold.catchingUp`).
+    var caughtUp = false
+    /// False sends every line through the full scan: the semantics before issue #3, which the
+    /// catch-up checks compare the history path against. Nothing in the product sets it.
+    var skipsHistoryCheaply = true
+    /// Lines handed to the full scan so far: the cost the history path keeps off the tick, counted
+    /// so a suite can bound it without timing anything.
+    var fullPathLines = 0
+    /// Reads every live line with the substring readers even where the Rust core is linked: the
+    /// ctxrust suite compares the two readers through it. Nothing in the product sets it.
+    var forceStringLineView = false
+    let since: Date
+    /// The session id this child was launched to resume, when known (set after a handoff, which
+    /// relaunches with `--resume <id>`). Lets `locateFile` pin `<id>.jsonl` directly instead of
+    /// guessing by mtime - two sessions in one directory otherwise cross-bind to whichever file
+    /// was touched last. nil on a fresh launch, where the heuristic still applies.
+    var resumeID: String?
+    /// Whether a transcript id is being written by ANOTHER live session in this directory. The mtime
+    /// guess below skips those: a fresh child has no file until its first prompt, and until then the
+    /// newest file here is a sibling's, so without this a sibling's next write bound this session to
+    /// that conversation (2026-09-26: supervisor 43275 reported a477080c, which 28094 was running).
+    var isForeign: (String) -> Bool = { _ in false }
+    /// The conversation a `--fork-session` launch forked from, which another head is writing and
+    /// which this watcher must never bind: not as the `resumeID` pin, and not through the mtime
+    /// guess below, whatever `isForeign` says by then (the holder may have exited since).
+    var forkedFrom: String?
+    /// The fork-discovery join key: the id THIS child process was launched with, which every file
+    /// it moves the conversation into carries as its `session_id` (see TranscriptFork.swift). A
+    /// per-process constant, so unlike `resumeID` it is NEVER moved by an adoption: `resumeID`
+    /// tracks the live file because it feeds the next `--resume`, this one tracks the process.
+    /// Resolved on first use (from `resumeID`, or from the first file bound on a fresh launch)
+    /// rather than at init, so the same value is reached whichever way the watcher was built.
+    var launchID: String?
+    /// The model id of the newest assistant event seen so far - how the supervisor notices a
+    /// server-side model fallback.
+    var lastModel: String?
+    /// When the user last typed Claude Code's OWN `/model` in this child, and the effort the line
+    /// it printed named.
+    ///
+    /// Claude Code writes that command as two adjacent main-chain user events sharing one stamp: the
+    /// invocation (`<command-name>/model</command-name>`) and what it printed
+    /// (`<local-command-stdout>Set model to ...`). Neither asks anything of this supervisor; they
+    /// are how a session says "the person changed the model themselves", which is the one signal
+    /// that tells that apart from the server degrading it. What is then DONE about it, and why the
+    /// answer is the opposite of a rescue, is `adoptNativeModelChoice` (SessionModel.swift).
+    ///
+    /// The same guards `lastModel` carries, for the same reason: a resumed session replays its whole
+    /// history, and that history holds every earlier `/model` - four of them in the session this was
+    /// written for. A replayed one is not somebody changing the model now.
+    var lastModelCommandAt: Date?
+    /// The effort named by that line, when it named one. Best effort in the literal sense: the two
+    /// shapes on this machine are "... for new sessions" and "... for new sessions with <effort>
+    /// effort" (78 and 92 occurrences respectively), so an absent one is ordinary rather than a
+    /// parse failure, and nil means "leave the effort axis alone".
+    var lastModelCommandEffort: String?
+    /// The timestamp of the newest main-chain, real, post-launch assistant event. A cap recovery
+    /// is cleared when this passes the cap time (a genuine turn happened after the cap, so the
+    /// account came back on its own). Same three guards as `lastModel`.
+    var lastMainChainEventAt: Date?
+    /// The timestamp of the newest main-chain, post-launch event where THE USER SAID SOMETHING: a
+    /// prompt they typed, not a tool result and not a synthetic injection.
+    ///
+    /// The distinction is the whole reason this exists beside `lastMainChainEventAt`. Claude Code
+    /// writes a tool's return as a `"type":"user"` event, and an assistant event follows every one
+    /// of them, so "an assistant event happened" is true several times INSIDE a single turn - which
+    /// makes it useless as an answer to "has the person been back since". A `usagebar switch` is run as
+    /// a tool call from inside a turn, so anything measured that way expires while the user is still
+    /// reading the answer that tool call was part of (SessionSwitch.swift's cancellation notice was,
+    /// caught in review 2026-08-06).
+    ///
+    /// FOUR refusals, and the third is the one that matters most in practice. Claude Code appends a
+    /// main-chain `user` event when a background agent or task finishes - the `<task-notification>`
+    /// events - and those carry no `tool_result` and are not `isMeta`, so the first two guards wave
+    /// them through. On a machine running agents that is not an edge case: 4,796 of them sit in this
+    /// user's transcripts against 6,455 typed prompts (counted 2026-08-06 across ~/.claude/projects,
+    /// structure only), so a notice waiting for "the user came back" would be cleared by an agent
+    /// finishing while nobody was there.
+    ///
+    /// The discriminator is structural and Claude Code's own: those events carry
+    /// `"promptSource":"system"`, and no typed prompt in that corpus does (typed ones read `typed`,
+    /// `queued`, `suggestion_accepted`, `sdk`, or carry no such field at all, which is what older
+    /// transcripts look like). So the rule is a REFUSAL of `system` rather than a whitelist of the
+    /// others: absent stays "possibly a person", which is how every transcript written before the
+    /// field existed reads.
+    ///
+    /// The fourth guard is the content shape, and it is admittedly the fragile one - it is here only
+    /// for those older transcripts, where the structural field is missing (3 such events in the same
+    /// corpus). A future rename of the marker costs exactly that fallback and nothing else.
+    ///
+    /// Cheap substring tests rather than a JSON parse, like every other signal in this scan. Every
+    /// refusal fails in the safe direction: a prompt that happens to contain one of these words is
+    /// simply not counted, and the wait it would have ended lasts until the next prompt.
+    var lastUserTurnAt: Date?
+    /// The newest user turns that passed the same tests as `lastUserTurnAt`, oldest first, so a
+    /// person's prompt is not hidden by an automatic line typed after it (AutomaticInput.swift).
+    var recentUserTurns: [Date] = []
+    /// The newest post-launch stopped/killed background-work notice (`stoppedTaskNotice`).
+    var lastStoppedTasks: StoppedTaskNotice?
+    /// What this child still has running, post-launch (RestartLiveWork.swift). Per process: a
+    /// transcript switch inside the same child (a /clear) never resets it.
+    var liveWork = RestartLiveWork()
+    /// The timestamp of the newest main-chain, post-launch CONVERSATION event: a `user` (tool
+    /// results included) or `assistant` record carrying its own `uuid` and `timestamp`. This is the
+    /// clock a standing notice is measured against ("has the conversation moved since the notice
+    /// fired", `userNoticeStillOpen`), and it replaces the file's mtime there.
+    ///
+    /// NOT `system` records: Claude Code writes those about the session with nobody there (an
+    /// auto mode notice, an away summary, a turn duration), and one stamped 0.97s after a wait
+    /// opened read as its answer (H1 rerun O4, 2.1.280). Whether the move was a person's doing is
+    /// the narrower clock below.
+    ///
+    /// WHY NOT THE MTIME: an idle Claude Code appends bookkeeping records to the transcript with
+    /// nobody at the keyboard (`cost-state`, `last-prompt`, `ai-title`, `mode`, `permission-mode`,
+    /// `atis-latch`, `file-history-snapshot`). None of them has a top-level `uuid`, and none but the
+    /// snapshot has a `timestamp` at all (its one is nested), so requiring both keeps every one of
+    /// them from moving this clock. Measured in the H1 sandbox run (Claude Code 2.1.280): a
+    /// `cost-state` write 16s after a permission notice read as the answer to it.
+    ///
+    /// Newest by stamp rather than last by position, because a transcript's stamps are not
+    /// monotonic. Sidechain (subagent) records never count: an agent writing is not the person
+    /// answering.
+    var lastConversationEventAt: Date?
+    /// The newest main-chain, post-launch, stamped record a PERSON produced (`lineIsPersonInput`):
+    /// the only clock that may explain a standing wait as `answered` (`resolvedWaitOutcome`). A
+    /// conversation that moved without one (a task notification, a peer message) resolves `unknown`.
+    var lastPersonInputAt: Date?
+    /// The size of the conversation as of its newest main-chain assistant event, that turn's own
+    /// answer included: how much context a resume of this conversation would reload
+    /// (SessionContext.swift).
+    ///
+    /// Deliberately WITHOUT the post-launch guard the two signals above carry. Those answer "what is
+    /// this session doing now", so a replayed history is noise. This one answers "how big is this
+    /// conversation", and a resumed session's replayed history is the conversation: the guard would
+    /// blank the number for exactly the sessions whose size is worth knowing, until the next turn.
+    var lastContextTokens: Int?
+    /// The timestamp the cap event `sawCapHit` last reported carries, or nil when that event had
+    /// none. The cap's OWN instant, which is up to one poll interval earlier than the moment this
+    /// process notices it: the recovery boundary is measured against the cap once and never
+    /// recomputed, so a reset landing inside that gap would otherwise be read as a stale stamp and
+    /// leave the session with no reset path for the rest of its life (CapRecovery.swift).
+    var capHitAt: Date?
+    /// WHICH WALL that cap event was, read off the sentence itself (`capScope`). Assigned in the
+    /// same breath as `capHitAt`, so a reported cap always describes the event just seen.
+    ///
+    /// It exists for exactly one reader: the weekly session-limit reset answers a 5-HOUR wall and
+    /// nothing else (CapLimitReset.swift). Spending a weekly credit on a weekly wall clears
+    /// nothing, and spending it on a model wall clears the wrong window - both would be a credit
+    /// gone for a session that still cannot run.
+    var capHitScope: CapScope?
+    /// The newest thing this conversation has been told about its account's weekly session-limit
+    /// reset, and when.
+    ///
+    /// WHOEVER TYPED IT. The observer that folds this into the account's record does not care
+    /// whether the line came from UsageBar's automatic path, from the panel's button or from somebody
+    /// typing `/limit-reset` themselves, and that is the point: one reading, so the app can never
+    /// draw a credit a session has already spent by hand (Core/LimitReset.swift states the whole
+    /// state machine).
+    var lastLimitReset: (outcome: LimitResetOutcome, at: Date)?
+    /// The newest Fable safeguard fallback event seen (`model_refusal_fallback`), post-launch and
+    /// main-chain. How the supervisor notices the API forced this session onto a fallback model.
+    var lastFlag: SafeguardFlag?
+    /// A small rolling map from a user event's uuid to its text, so a fallback's
+    /// `refusedUserMessageUuid` can be resolved to a readable trigger excerpt for the log. Bounded
+    /// FIFO (a long session has thousands of turns; only recent ones can be a live trigger).
+    var recentUserExcerpts: [String: String] = [:]
+    /// Insertion order backing `recentUserExcerpts`' FIFO eviction.
+    var excerptOrder: [String] = []
+    /// How far each candidate has been read while looking for the fork marker, so a rescan resumes
+    /// instead of starting over. Keyed by session id.
+    var forkScanOffsets: [String: UInt64] = [:]
+    /// Candidates already proven to carry the marker, so proving it costs one read, not one per
+    /// scan (and so a proof can never be scanned past and lost).
+    var forkMarked: Set<String> = []
+    /// Candidates already proven to be another conversation, for the same reason. Deliberately NOT
+    /// cleared on an adoption the way `forkMarked` is: being a sibling is a fact about the file and
+    /// this child's CONSTANT launch id, not about which file the watcher is bound to, and the
+    /// offsets are cleared there - so re-proving it would re-read every sibling in the directory
+    /// from byte zero on every move.
+    var forkSibling: Set<String> = []
+    /// True while a transcript written more recently than the bound one cannot yet be told apart
+    /// from the file this conversation moved to - a `/clear` with no turn typed into it yet
+    /// (TranscriptFork.swift). Holds `isQuiet` false, so every non-urgent relaunch waits instead of
+    /// resuming an id the conversation may have just left.
+    var hasUnresolvedFork = false
+    /// Which turn each event belongs to (TranscriptSignals.swift), which is what makes the answer to
+    /// a `/model` identifiable without guessing anything about the user's side.
+    var turnRoots = TurnRoots()
+    /// The turn that ANSWERED the newest `/model`: the first main-chain event carrying a real model
+    /// id whose TURN began at or after the command.
+    ///
+    /// ANCHORED ON THE ASSISTANT SIDE, which is the fourth and last shape this rule has had. The
+    /// three before it all asked the user side which record would produce a model request - the last
+    /// of them, "the first prompt typed after the command", was refuted by `/effort`: its invocation
+    /// is indistinguishable from a prompt, so the tail of the turn already in flight cleared the bar
+    /// and was read as the answer (codex probe, 2026-08-07). A served model event is not a guess
+    /// about what will happen; asking which turn it belongs to is not a guess either.
+    ///
+    /// An in-flight tail is excluded by construction rather than by timing: its turn began before
+    /// the command, so no arrival time can make it eligible. The command's own two events need no
+    /// special case for the same reason - nothing is served from them, so they never root anything.
+    ///
+    /// Cleared by a newer `/model`, which asks the question again.
+    var modelConfirmation: (model: String, at: Date)?
+    /// The turn that LOOKS like the answer, held until the transcript has finished saying what
+    /// happened in it.
+    ///
+    /// A confirmation cannot be settled when it arrives, and the reason is an ordering fact rather
+    /// than a preference: when the API falls a request onto another model, Claude Code writes the
+    /// assistant records FIRST and the `model_refusal_fallback` system record after them. Deciding
+    /// at arrival therefore reads the fallback before the evidence that it was one, pins it as the
+    /// user's choice, and blinds the degradation rescue for the rest of the session - the very hole
+    /// the fallback check was added to close, reached one record earlier (gate review, 2026-08-07).
+    ///
+    /// So the candidate waits for its turn to be OVER. The signal is structural rather than timed:
+    /// the next turn's root appearing means the previous turn has stopped writing, and by then any
+    /// flag belonging to it has landed. THE COST, stated plainly: a `/model` answered by one turn
+    /// and then silence is adopted late - at the user's next turn rather than at that answer. Late
+    /// is the direction this whole feature fails in on purpose; the pin is what a session is
+    /// expected to run, and a wrong one cannot be noticed by anything downstream.
+    var pendingConfirmation: (model: String, at: Date, root: TurnRoot)?
+    /// How many events this watcher has placed in a turn, which is the file position everything
+    /// about "after the command" is judged by (`TurnRoot.seq`). Monotonic by construction, unlike
+    /// the timestamps in the file.
+    var scanSeq = 0
+    /// Where the newest `/model` sits in that order. nil until one is seen.
+    var commandSeq: Int?
+    /// Flags seen since that command, not just the newest: two fallbacks inside one command's window
+    /// are possible, and comparing a candidate against only the last one lets the earlier turn
+    /// through (gate review, 2026-08-07). Bounded by the reset on every new command.
+    var flagsSinceCommand: [SafeguardFlag] = []
+    /// Whether an unresolved turn is EXPECTED right now rather than a symptom: the events at the top
+    /// of a file this conversation has just moved to have parents that were never in this map.
+    var anchorGraceAfterMove = false
+    /// Real model events served since the newest `/model` whose turn could not be resolved at all,
+    /// and whether the canary has already been written for this command
+    /// (`unanchoredConfirmationLimit`).
+    var unanchoredServed = 0
+    var anchorLossReported = false
+    /// Where this watcher's own audit lines go (the ambiguous-fork report, TranscriptFork.swift).
+    /// Injectable for the reason `appendHandoffLine` is: a suite that exercises the tie must not
+    /// write invented reports into the user's history.
+    var auditLog: URL = handoffLog
+    /// True once the ambiguity warning has been said, so it is said once rather than every scan.
+    var forkAmbiguityWarned = false
+    /// The last open-turn scan, keyed by the file it read and the mtime it read it at.
+    ///
+    /// The supervisor asks its quiet question every 2s poll (`Supervisor.swift`), and on an idle
+    /// session two or three of those asks reach the open-turn check on every single tick, because
+    /// the arguments are evaluated whether or not a relaunch is being planned. Quiet is the common
+    /// state, not the rare one, so re-reading a 256 KB tail and re-parsing every line in it to
+    /// re-derive an answer that cannot have changed is pure waste all night long.
+    ///
+    /// The SCAN is cached, never the verdict: `openTurnHoldsSession` expires the evidence at
+    /// `openTurnMaxSeconds` while the mtime stands still, so a cached verdict would wedge a session
+    /// whose child was killed mid-call as busy forever, the one thing OpenTurn.swift exists to
+    /// prevent. Invalidation needs no bookkeeping either: a fork changes the path and a write
+    /// changes the mtime, so the key stops matching exactly when the answer could differ.
+    var openScanCache: (path: String, modified: Date, call: OpenToolCall?)?
+    private var excerptCapacity: Int { 64 }
+
+    /// The user prompt that triggered the current drift, resolved from the flag's refused uuid, or
+    /// nil when unknown (no flag, no uuid, or the message aged out of the FIFO).
+    var driftTriggerExcerpt: String? {
+        guard let uuid = lastFlag?.refusedUUID else { return nil }
+        return recentUserExcerpts[uuid]
+    }
+
+    /// Twins: TranscriptLineBytes.swift and rust/crates/core/src/line.rs
+    /// (TranscriptLineView.swift holds it).
+    func lineUUID(_ line: Substring) -> String? { transcriptLineUUIDText(line) }
+
+    /// Twins: TranscriptLineBytes.swift and rust/crates/core/src/line.rs
+    /// (TranscriptLineView.swift holds it).
+    func userExcerpt(_ line: Substring) -> String? { transcriptUserExcerptText(line) }
+
+    /// Store a user prompt under its uuid, evicting the oldest past the capacity. Re-seen uuids keep
+    /// their place (the text does not change), so the FIFO tracks distinct recent messages.
+    /// Decide the held candidate now that its turn is over: it becomes the answer, or it is dropped
+    /// and the wait goes on.
+    ///
+    /// DROPPED when the API says it served that turn on a model of its own choosing. A `/model`
+    /// naming a model whose window is spent gets its first fresh turn served by the fallback, and
+    /// adopting that makes the fallback what this session is EXPECTED to run - which is the one
+    /// thing that stops the degradation rescue from ever seeing a difference again. Two conditions,
+    /// not three: the API said so itself (`model_refusal_fallback`) at some point since the command,
+    /// and the model it named is the one this candidate carries.
+    ///
+    /// The upper bound the arrival-time version had - the flag must predate the answer - is exactly
+    /// what made it useless: the flag is written AFTER the records it explains. Judging at the end
+    /// of the turn is what lets both orders work, and the remaining looseness (a flag from a later
+    /// turn naming the same model) errs toward waiting, which is the safe direction.
+    ///
+    /// EVERY flag since the command is considered, not the newest one: a window holding two
+    /// fallbacks would otherwise clear a candidate the earlier one disqualifies.
+    /// Settle a held candidate because the transcript has gone quiet: the user chose a model, read
+    /// the answer, and stopped. Without this the candidate is held until they type again, and in the
+    /// meantime the session's expected model is still the old one - which the degradation rescue
+    /// reads as a session that has drifted and moves to another account to "fix"
+    /// (`pendingSettleQuietSeconds` states the argument and how to refute it).
+    mutating func settlePendingIfQuiet() {
+        // `isQuiet` rather than the bound file's mtime alone, and that is the whole fix: silence
+        // means "this turn is finished" only while it is still THIS conversation's silence. A
+        // `/clear` right after the answer leaves a new transcript with no turn in it yet, so the
+        // watcher is still bound to the old file and that file is, of course, quiet - and settling
+        // there pins a choice from a conversation the user has left, walking straight past the drop
+        // the move itself performs (`followFork`, TranscriptFork.swift; review, 2026-08-07).
+        //
+        // The hold already exists and already means this: an unresolved fork keeps `isQuiet` false
+        // so that every non-urgent relaunch waits. Asking through it is what stops this settlement
+        // from being a second, weaker definition of the same idea.
+        guard pendingConfirmation != nil,
+              isQuiet(pendingSettleQuietSeconds) else { return }
+        settlePendingConfirmation()
+    }
+
+    mutating func settlePendingConfirmation() {
+        guard let pending = pendingConfirmation, modelConfirmation == nil else { return }
+        pendingConfirmation = nil
+        if flagsSinceCommand.contains(where: { modelsAgree(pending.model, $0.to) }) { return }
+        modelConfirmation = (pending.model, pending.at)
+    }
+
+    /// A request was served while a `/model` was still waiting for its answer. Counted, and said out
+    /// loud once when there have been too many.
+    ///
+    /// THE CANARY the design asked for. This feature now rests on `parentUuid` chains, which are
+    /// Claude Code's own private format: if their shape changes, roots stop resolving, the fail-safe
+    /// holds, nothing is adopted - and nothing is heard either. That is the failure mode this design
+    /// chose on purpose, and a silent one is exactly what a canary is for. To the audit log rather
+    /// than the terminal, because no relaunch follows it (PendingNotice.swift's rule).
+    mutating func noteUnanchoredService(commandAt: Date) {
+        unanchoredServed += 1
+        guard unanchoredServed > unanchoredConfirmationLimit, !anchorLossReported else { return }
+        anchorLossReported = true
+        appendHandoffLine(
+            modelAnchorLostLine(sessionID: file?.deletingPathExtension().lastPathComponent,
+                                served: unanchoredServed, commandAt: commandAt),
+            to: auditLog)
+    }
+
+    mutating func rememberExcerpt(uuid: String, text: String) {
+        guard recentUserExcerpts[uuid] == nil else { return }
+        recentUserExcerpts[uuid] = String(text.prefix(160))
+        excerptOrder.append(uuid)
+        if excerptOrder.count > excerptCapacity {
+            let evicted = excerptOrder.removeFirst()
+            recentUserExcerpts.removeValue(forKey: evicted)
+        }
+    }
+
+    /// The still-unanswered tool call, reading the tail only when the file has moved.
+    ///
+    /// `modified` is the mtime the caller already stat'd, both as the cache key and to keep this to
+    /// one stat per ask.
+    mutating func openTurn(of file: URL, modified: Date) -> OpenToolCall? {
+        if let cache = openScanCache, cache.path == file.path, cache.modified == modified {
+            return cache.call
+        }
+        let call = openToolCall(inTail: transcriptTail(of: file) ?? "")
+        openScanCache = (path: file.path, modified: modified, call: call)
+        return call
+    }
+
+    /// The tool this conversation is holding open that only a PERSON can answer, or nil when it is
+    /// not holding one (SessionStateSync.swift is the caller, and OpenTurn.swift says which tools
+    /// and why the transcript is asked at all).
+    ///
+    /// FROM THE SCAN THIS TICK ALREADY TOOK AND FROM NOTHING ELSE: it reads the cache under the
+    /// mtime the caller stat'd, and answers nil rather than reading a tail of its own. That is what
+    /// keeps it free on the common path, and it is why it says nothing about a MOVING transcript -
+    /// `isQuiet` returns at the mtime bar without scanning, so there is nothing cached for the file
+    /// as it now stands. Which is the right answer anyway: a conversation being written to is
+    /// working by every reading here, and a question nobody has answered does not write. The cost
+    /// of that honesty is that a question asked less than `sessionStateQuietSeconds` ago is not on
+    /// the board yet.
+    ///
+    /// NOT AGED AGAINST `openTurnMaxSeconds`, unlike the veto beside it, and the difference is the
+    /// question being asked. That cap exists so a call left unmatched by a killed child cannot wedge
+    /// a session out of every relaunch for ever; this decides what a card SAYS, where the fact is
+    /// self-clearing - the moment somebody answers, Claude Code writes the `tool_result` and the
+    /// next scan finds the turn closed. Capping it would take the red dot away from a question
+    /// standing over lunch, which is precisely the wait the board exists to show.
+    func openUserQuestion(asOf modified: Date?) -> String? {
+        guard let file, let modified, let cache = openScanCache, cache.path == file.path,
+              cache.modified == modified else { return nil }
+        return cache.call?.names.first { userQuestionTools[$0] != nil }
+    }
+
+    /// Claude Code's own id for the conversation being tailed, which is the transcript's basename
+    /// (measured 2026-08-07: a hook's `session_id` equals the stem of its `transcript_path`).
+    ///
+    /// Published by the supervisor so a prompt hook can tell THIS session from another one running
+    /// in the same directory - the case neither the environment marker nor the working directory
+    /// can separate (SessionContext.swift, SwitchRequest.swift). Derived rather than stored, so a
+    /// `/clear` or a fork that rebinds `file` changes this with it.
+    var transcriptSessionID: String? {
+        file.map { $0.deletingPathExtension().lastPathComponent }
+    }
+
+    /// The transcript this child is writing: bound once, then kept pointing at the live file.
+    ///
+    /// `forceForkCheck` skips the cost gates below. The relaunch path uses it: the id it resumes
+    /// has to be the live one, and there the check runs once rather than every 2s.
+    mutating func locateFile(forceForkCheck: Bool = false) {
+        if file == nil { bindFile() }
+        followFork(force: forceForkCheck)
+    }
+
+    /// The first binding: a pin when the launch resumed a known id, else the mtime heuristic.
+    private mutating func bindFile() {
+        // A resumed handoff knows its session id, so bind `<id>.jsonl` directly: mtime guessing
+        // would otherwise pick the wrong file when the directory holds a second session (a
+        // sibling tab, an unrelated older conversation). Only a first launch (no known id, or
+        // the file not yet copied into this account's tree) falls back to the heuristic below.
+        if let resumeID, resumeID != forkedFrom {
+            let pinned = projectDir.appendingPathComponent("\(resumeID).jsonl")
+            if FileManager.default.fileExists(atPath: pinned.path) { file = pinned; return }
+        }
+        // No prefetch, for the reason `scanCandidates` states (TranscriptFork.swift): the mtime is
+        // asked for below, over the files that survive the extension filter, and this pass runs on
+        // every tick of a session whose transcript does not exist yet.
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: projectDir, includingPropertiesForKeys: nil)) ?? []
+        let candidate = files
+            .filter { $0.pathExtension == "jsonl" }
+            .compactMap { url -> (URL, Date)? in
+                guard let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate else { return nil }
+                return modified >= since.addingTimeInterval(-5) ? (url, modified) : nil
+            }
+            .filter {
+                let id = $0.0.deletingPathExtension().lastPathComponent
+                return id != forkedFrom && !isForeign(id)
+            }
+            .max { $0.1 < $1.1 }
+        file = candidate?.0
+    }
+
+}
+
+/// A resumed Claude Code's notice of unfinished background work; `ids` omits `__orphan_summary__`.
+struct StoppedTaskNotice: Equatable {
+    let at: Date, uuid: String, ids: Set<String>
+    func merged(with other: StoppedTaskNotice) -> StoppedTaskNotice {
+        StoppedTaskNotice(at: max(at, other.at), uuid: other.at >= at ? other.uuid : uuid,
+                          ids: ids.union(other.ids))
+    }
+}

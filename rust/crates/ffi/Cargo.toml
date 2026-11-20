@@ -1,0 +1,20 @@
+[package]
+name = "usagebar_ffi"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+# staticlib is what Xcode links; rlib lets `cargo test` exercise the same code.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+usagebar_core = { path = "../core" }
+usagebar_sys = { path = "../sys" }
+# Bindings for the token statistics API (src/tokenstats.rs). Pinned exactly: the generated Swift
+# (rust/generated/swift) checks the scaffolding's API checksums, so both sides must be one version.
+uniffi = "=0.32.2"
+
+[features]
+# Test-only: tests/run-ctxrust-tests.sh builds its own copy with it.
+panic-probe = ["usagebar_core/panic-probe"]

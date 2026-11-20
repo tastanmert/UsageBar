@@ -1,0 +1,253 @@
+import Foundation
+
+// Assertion harness for what a failed refresh publishes (UsageBar/Core/LastGoodFold.swift).
+//
+// THE BEHAVIOUR UNDER TEST is one round told to two audiences. The card is debounced: a single
+// missed poll (the seconds while the CLI rotates an OAuth token) keeps the last-good numbers with
+// no "Outdated" badge, so the badge does not flicker. A supervisor is not: it decides whether to
+// move a session off an account that reads 0%, and between the first failure and the second the
+// numbers look freshly fetched and are not. That interval is a real one, at least a poll apart,
+// and every idle supervisor on the account reads the same held-over zero inside it (codex review
+// of 54eebaa, the second finding: the CLI guard added there only saw the badge, which had not
+// been raised yet).
+//
+// So the fold sets `lastRefreshFailed` on the FIRST failure and leaves `isStale` on its two, and
+// these checks hold the two apart at every step: the failure that is not yet a badge, the one that
+// is, and the success that clears both.
+
+/// The fold localizes its retrying line; the app bundle is not compiled in, so the key reads as-is.
+func L(_ key: String) -> String { key }
+
+var passed = 0, failed = 0
+func check(_ name: String, _ condition: Bool) {
+    if condition { passed += 1; print("PASS \(name)") } else { failed += 1; print("FAIL \(name)") }
+}
+
+let fetched = Date(timeIntervalSince1970: 1_700_000_000)
+let window = UsageMetric(id: "weekly", kind: .weeklyAll, label: "Weekly", modelName: nil,
+                         usedPercent: 100, severity: .critical, resetsAt: nil, isActive: true)
+/// A good round: real numbers, no error. The metric is a spent weekly window on purpose, because
+/// the reading this whole fold protects is exactly the one that says "nothing left here".
+let good = AccountUsage(id: "A", providerID: "claude", accountLabel: "Claude",
+                        planName: "Max 20x", accountEmail: "a@example.com",
+                        metrics: [window], refreshedAt: fetched)
+/// The same account's failing round: providers return the failure rather than throwing, so it
+/// arrives with no metrics at all and an error string. It carries a REASON as well, the way a
+/// provider that could tell one does: the short line is the app's own and the detail is why
+/// (`CodexProvider.detail`, where a vendor's 404 becomes the second half of a hover).
+let failure = AccountUsage.failure(account: ProviderAccount(id: "A", providerID: "claude",
+                                                            label: "Claude", locator: [:]),
+                                   providerID: "claude", message: "network down",
+                                   errorDetail: "Codex app-server said: 404 Not Found")
+
+func fold(_ usage: AccountUsage, previous: AccountUsage?, streak: Int) -> AccountUsage {
+    foldLastGood(usage, previous: previous, failureStreak: streak, staleAfterFailures: 2,
+                 bareErrorAfterFailures: 3)
+}
+
+// MARK: - A successful round
+
+let fresh = fold(good, previous: nil, streak: 0)
+check("a successful round keeps its own numbers", fresh.metrics.first?.remainingPercent == 0)
+check("…and reports that the latest poll did not fail", !fresh.lastRefreshFailed)
+check("…and is not badged", !fresh.isStale && fresh.error == nil)
+
+// MARK: - The first failure: the numbers are held over, and it says so
+
+// This is the whole point of the field. The card must look unchanged here, so nothing about the
+// PRESENTATION may move; the machine-readable fact must move immediately, because the interval
+// this state lasts is the one in which a supervisor would act on the zero above.
+let first = fold(failure, previous: fresh, streak: 1)
+check("a first failure keeps the last-good numbers", first.metrics.first?.remainingPercent == 0)
+check("…and says the latest refresh failed, with no debounce at all", first.lastRefreshFailed)
+check("…while the badge has not moved", !first.isStale)
+check("…nor the tooltip behind it", first.error == nil)
+// The callout has two halves and the debounce holds BOTH: a reason arriving one round before the
+// badge that is supposed to carry it would be a tooltip on nothing.
+check("first failure preserves the panel reason", first.lastRefreshError == failure.error && first.lastRefreshErrorDetail == failure.errorDetail)
+check("…nor the reason under it", first.errorDetail == nil && first.errorDetail == fresh.errorDetail)
+check("…so the card is unchanged, which is what the debounce is for",
+      first.isStale == fresh.isStale && first.error == fresh.error
+          && first.errorDetail == fresh.errorDetail && first.metrics == fresh.metrics)
+
+// MARK: - The second failure: now the person is told too
+
+let second = fold(failure, previous: first, streak: 2)
+check("a sustained failure raises the badge", second.isStale)
+check("…with the reason behind it", second.error == "network down")
+// AND WITH THE WHY UNDER THE REASON, which is the half a provider fills in and the half this fold
+// used to drop. An account with numbers behind it is folded through HERE on every failing round,
+// so carrying only the short line left the last GOOD round's detail standing (nil), and a reason
+// the provider had gone to the trouble of establishing was visible on no card that had ever
+// loaded: the commonest path there is, and the one 2026-09-03's Codex 404 actually took.
+check("…and the why under the reason, carried off the failing round rather than the good one",
+      second.errorDetail == "Codex app-server said: 404 Not Found"
+          && second.errorDetail == failure.errorDetail && fresh.errorDetail == nil)
+check("…and the flag is still set, rather than handed over to the badge",
+      second.lastRefreshFailed)
+
+// MARK: - Recovery clears both
+
+// The flag describes THIS account's latest poll, not any poll it ever had: a reader that saw it
+// set once and never cleared would refuse to believe the account for the rest of the session.
+var recovered = good
+recovered.isStale = true
+recovered.lastRefreshFailed = true
+let healed = fold(recovered, previous: second, streak: 0)
+check("a round that succeeds clears the flag", !healed.lastRefreshFailed)
+
+// MARK: - An account that never succeeded
+
+// Nothing to hold over, so the failure is returned as it arrived, except its short line: for the
+// first two rounds it says "retrying" rather than the provider's line, because right after a
+// relaunch an empty /usage clears by itself and that line can say "run /login" (2026-10-06, two
+// accounts recovered within 4 minutes with nobody signing in). It is flagged all the same, since
+// what the flag states is that the latest poll failed.
+let never = fold(failure, previous: nil, streak: 1)
+check("an account that never succeeded says it is retrying on its first failure",
+      never.error == "Reading quota, retrying")
+check("…while the why under it is left as it arrived", never.errorDetail == failure.errorDetail)
+check("…and has no numbers to be believed", never.metrics.isEmpty)
+check("…and is flagged too, because its latest poll did fail", never.lastRefreshFailed)
+// The badge, asserted rather than assumed: this branch never raises it, and three surfaces read
+// that as "this account has never loaded" (see the sustained case below, which is where raising it
+// would actually be tempting).
+check("…while its badge stays down, which is what keeps the card on the error and a Retry",
+      !never.isStale)
+
+// MARK: - …and the streak reaches that branch too
+
+// THE THIRD FACT, and the reason it exists. Both fields above are about NUMBERS - are these this
+// moment's, are the held-over ones old enough to badge - so on a branch that has none, neither of
+// them could ever say that a signed-in account has been failing every poll since launch. That is
+// the one account a "something is wrong here" reader most wants named, and before this field it was
+// the one account no reader could see (codex review of 60a4fe7).
+let neverAgain = fold(failure, previous: nil, streak: 2)
+check("a never-succeeded account whose failures are sustained says so", neverAgain.pollsKeepFailing)
+check("…while one missed round does not, which is the badge's own debounce",
+      !never.pollsKeepFailing)
+// AND THE BADGE STAYS DOWN HERE, permanently and on purpose. `AccountFacts.isHardError` is
+// `error != nil && !isStale`, and it is what collapses a never-loaded card to the message and a
+// Retry button (the menu bar's "!" mark and the hover's error line read the same pair). Raising the
+// badge to carry the streak would have taken all three away from the only accounts they are for.
+check("…and the badge is still not raised, so the card keeps its error and its Retry",
+      !neverAgain.isStale && neverAgain.error != nil && neverAgain.metrics.isEmpty)
+check("…and the second failure still says retrying, flagged as failed",
+      neverAgain.error == "Reading quota, retrying" && neverAgain.lastRefreshFailed)
+
+// The third round in a row is no longer a relaunch hiccup: the provider's own line comes through.
+let neverThird = fold(failure, previous: nil, streak: 3)
+check("a third failure in a row shows the provider's own line",
+      neverThird.error == "network down" && neverThird.errorDetail == failure.errorDetail)
+check("…still flagged, still sustained, badge still down",
+      neverThird.lastRefreshFailed && neverThird.pollsKeepFailing && !neverThird.isStale)
+let neverHealed = fold(good, previous: nil, streak: 0)
+check("a round that succeeds after them clears the retrying line and both flags",
+      neverHealed.error == nil && !neverHealed.lastRefreshFailed && !neverHealed.pollsKeepFailing)
+
+// The held-over branch answers the same question the same way, which is what lets one reader ask
+// one field and get both kinds of broken account.
+check("a sustained failure over good numbers says it too", second.pollsKeepFailing)
+check("…a first failure over them does not", !first.pollsKeepFailing)
+check("…and a round that succeeds clears it, like the flag beside it", !healed.pollsKeepFailing)
+
+// MARK: - The identity a failed round did establish still lands
+
+// Unchanged behaviour, asserted because the fold moved file: a config dir signed in as somebody
+// else corrects the email while the numbers stay held over.
+var reidentified = failure
+reidentified.accountEmail = "b@example.com"
+let renamed = fold(reidentified, previous: fresh, streak: 1)
+check("a failed round still replaces the identity it could establish",
+      renamed.accountEmail == "b@example.com")
+check("…and leaves what it could not tell alone", renamed.planName == "Max 20x")
+
+// MARK: - The flag reaches the CLI, which is the only reason it exists
+
+// The snapshot is the app→CLI channel, so a fact the fold sets and the publisher drops is a fact
+// nobody downstream can read.
+let published = UsageSnapshot.make(accounts: [first, fresh], launchHomes: ["A": "/tmp/A"])
+check("snapshot publishes the first failure reason and detail", published.accounts.first?.lastRefreshError == failure.error && published.accounts.first?.errorDetail == failure.errorDetail)
+check("the published row carries the held-over flag",
+      published.accounts.first?.lastRefreshFailed == true)
+check("…and a healthy row publishes false rather than nothing, which is a different sentence",
+      published.accounts.last?.lastRefreshFailed == false)
+// nil is reserved for an app that predates the field: a reader must be able to tell "the poll
+// succeeded" from "this writer cannot answer", because it treats them differently.
+check("…so nil is left to mean cannot tell",
+      UsageSnapshot.Account(id: "A", provider: "claude", label: "A", isStale: false)
+          .lastRefreshFailed == nil)
+
+// MARK: - sameAccountAs reaches the snapshot
+
+var sharedRow = AccountUsage(id: "claude:.claude-am", providerID: "claude", accountLabel: "AM",
+                             metrics: [], refreshedAt: Date(), error: "shared")
+sharedRow.sameAccountAs = "claude:.claude-gm"
+let sharedEncoded = try! JSONEncoder().encode(UsageSnapshot.make(
+    accounts: [sharedRow, AccountUsage(id: "claude:.claude-gm", providerID: "claude", accountLabel: "GM",
+                                       metrics: [], refreshedAt: Date())],
+    launchHomes: ["claude:.claude-gm": "/tmp/gm"]))
+let sharedRows = ((try? JSONSerialization.jsonObject(with: sharedEncoded)) as? [String: Any])?["accounts"]
+    as? [[String: Any]] ?? []
+check("a duplicate home publishes the kept account's id",
+      sharedRows.first?["sameAccountAs"] as? String == "claude:.claude-gm")
+check("…and every other row publishes nothing for it", sharedRows.last?["sameAccountAs"] == nil)
+check("…and no identity rides along: the row's keys are the snapshot's own",
+      !String(decoding: sharedEncoded, as: UTF8.self).lowercased().contains("uuid"))
+
+// MARK: - The store is really wired to this fold
+
+// The streak counters stay in the store, so the wiring cannot be compiled in here; without this
+// the checks above would pass against a function nobody calls.
+let storeSource = (try? String(contentsOfFile: "UsageBar/Stores/UsageStore.swift", encoding: .utf8))
+    ?? ""
+check("the store source is readable from these checks", !storeSource.isEmpty)
+check("the failing branch folds through this function with its own streak",
+      storeSource.contains("foldLastGood(usage, previous: lastGood[usage.id], failureStreak: streak,"))
+check("…and the successful branch through it too, so recovery clears the flag",
+      storeSource.contains("foldLastGood(usage, previous: nil, failureStreak: 0,"))
+let foldSource = (try? String(contentsOfFile: "UsageBar/Core/LastGoodFold.swift", encoding: .utf8))
+    ?? ""
+check("…and both folds get the badge's debounce from LastGoodThresholds, which holds 2",
+      storeSource.components(separatedBy: "staleAfterFailures: LastGoodThresholds.staleAfterFailures")
+          .count == 3 && foldSource.contains("static let staleAfterFailures = 2"))
+check("…and the retrying window the same way, which holds 3",
+      storeSource.components(separatedBy: "bareErrorAfterFailures: LastGoodThresholds.bareErrorAfterFailures")
+          .count == 3 && foldSource.contains("static let bareErrorAfterFailures = 3"))
+
+// MARK: - The reader the third fact was added for
+
+// Asserted from here because THIS suite is the one that knows the two fields apart: the early-start
+// suite hands its rule a fixture and cannot tell which field the app fills in, so a consumer that
+// went back to asking the badge would pass there while silently never seeing a never-succeeded
+// account again. Read as the one line the rule is, so a rule that grew a second one fails loudly
+// rather than being matched by a prefix.
+let earlyStartSource = (try? String(contentsOfFile: "UsageBar/Core/EarlyStart.swift", encoding: .utf8))
+    ?? ""
+let keepsFailingRule = earlyStartSource.components(separatedBy: "func readingKeepsFailing")
+    .dropFirst().first?.components(separatedBy: "\n").first ?? ""
+check("the early-start row asks this fact rather than the badge",
+      keepsFailingRule.contains("usage.pollsKeepFailing")
+          && !keepsFailingRule.contains("usage.isStale"))
+
+// A login that landed this launch gets one quick second look after its first failure (B-1702).
+check("a new account's first failure retries soon",
+      FailureRetry.isSoon(failed: ["n"], streaks: ["n": 1], arrived: ["n"]))
+check("…only the first: its second failure is back on the ladder",
+      !FailureRetry.isSoon(failed: ["n"], streaks: ["n": 2], arrived: ["n"]))
+check("an account that was there at launch does not retry soon",
+      !FailureRetry.isSoon(failed: ["n"], streaks: ["n": 1], arrived: []))
+check("no failures, no quick retry",
+      !FailureRetry.isSoon(failed: [], streaks: ["n": 1], arrived: ["n"]))
+
+let catalogue = (try? Data(contentsOf: URL(fileURLWithPath: "UsageBar/Resources/Localizable.xcstrings")))
+    .flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+let retrying = ((catalogue?["strings"] as? [String: Any])?["Reading quota, retrying"]
+    as? [String: Any])?["localizations"] as? [String: Any] ?? [:]
+check("the retrying line is in all four translations",
+      ["zh-Hant", "zh-Hans", "ja", "ko"].allSatisfy { retrying[$0] != nil })
+
+runCacheChecks()
+
+print(failed == 0 ? "ALL \(passed) PASS" : "\(failed) FAILED")
+exit(failed == 0 ? 0 : 1)

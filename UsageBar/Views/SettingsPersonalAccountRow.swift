@@ -1,0 +1,79 @@
+import SwiftUI
+
+/// THE PERSONAL ACCOUNT'S OWN TWO PIECES OF THE ACCOUNTS PANE, split out of SettingsAccountsView for
+/// file size: the mark, and the water line it opens. Both sit on the one line under the account's
+/// row (B-2526 G17), which is why the name column never has to give up room to a badge.
+///
+/// What the marking means, and why one account gets it, is in UsageBar/Core/AccountReserve.swift. What
+/// this file adds is the surface: the pane is where somebody comes to say "this one is the account I
+/// use in my browser", so it is also where they say how much of it to leave alone.
+extension SettingsAccountsView {
+    /// The mark itself. In the app's own accent rather than a launch colour: this is not a launch
+    /// mode (the panel's Smart purple and Pinned orange are), it is a fact about the account.
+    var personalBadge: some View {
+        Text(L("Personal"))
+            .font(.system(size: AccountTableStyle.current.secondary - 1, weight: .medium))
+            .foregroundStyle(UsageBarColor.ai)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(UsageBarColor.ai.opacity(0.15)))
+            .fixedSize()   // a badge must never wrap
+            // UsageBar's own callout, like every other hover on this row since 2026-08-24: the badge
+            // sits on the account's name line, and one native box among the row's own chips is the
+            // seam the owner spotted on the sign-in chip.
+            .usageBarTooltip(L("The account you are signed into on claude.ai. UsageBar can keep part of its quota free for you."))
+    }
+
+    /// "Keep at least 30% of the week, the 5h window and the flagship one for web use", and the
+    /// ten-cell strip that sets it.
+    ///
+    /// THE NUMBER IS IN THE SENTENCE rather than in a field beside it, because the sentence is what
+    /// the setting means and a bare "30" next to "Reserve" is a number the reader has to translate
+    /// every time. The strip is the only control, and it carries the same number a second way: the
+    /// sentence says what the setting IS, the cells say where it sits on the scale and what is left
+    /// (`ReserveCellBar` states why ten of them, `AccountRoles.reserveStep` what one is worth). A
+    /// typed field would invite a precision this figure does not have.
+    ///
+    /// AND THE SENTENCE NAMES ALL THREE WINDOWS, because that is what the number does: the reserve
+    /// is held back from the account's weekly window, its 5h one and its flagship model's, the three
+    /// its owner's browser draws on as well, and from no other (UsageBar/Core/AccountReserve.swift
+    /// states why). A bare "quota" would promise a line on every bar, and the account's other
+    /// per-model windows carry none.
+    ///
+    /// The hover is the part somebody will otherwise get wrong in the expensive direction: a reserve
+    /// binds USAGEBAR'S OWN choices and nothing else, so naming this account still launches on it.
+    /// Without that sentence the control reads as a cap on the account, which is a thing people
+    /// would rightly be afraid to set.
+    func reserveRow(_ home: String, owner: String) -> some View {
+        // A capture shows the fixture's figure, and its strip writes nothing (the marking itself
+        // does not exist on a demo launch - PersonalAccount).
+        let shown = DemoUsage.isActive ? DemoUsage.personalReserve
+            : LaunchPolicyStore.shared.reserve(home: home)
+        let explanation = L("UsageBar leaves this much of the account's weekly, 5-hour and flagship-model quota alone when it picks or moves sessions by itself, because your browser draws on all three. The flagship window holds the same line rather than being emptied under it, and launching on it yourself always works.")
+        let style = AccountTableStyle.current
+        let sentence = String(format: L("Keep at least %lld%% of the week, the 5h window and the flagship one for web use"), shown)
+        return HStack(spacing: 6) {
+            // One line among twenty that look alike, so it says whose setting it is: a turn arrow
+            // off the row above, then the mark. The explanation rides the hover.
+            Image(systemName: "arrow.turn.down.right")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+            personalBadge
+            Text(sentence)
+                .font(.system(size: style.secondary))
+                .foregroundStyle(.secondary)
+                .lineLimit(1).truncationMode(.tail)
+                .usageBarTooltip(sentence + "\n" + explanation)
+                .accessibilityLabel(owner + ": " + sentence)
+            Spacer(minLength: 12)
+            ReserveCellBar(value: shown) { LaunchPolicyStore.shared.setReserve(home, $0) }
+                .disabled(DemoUsage.isActive)
+                .usageBarTooltipAroundControl(L("Each cell is 10%. The striped cells are the share kept for the web; click a cell to change it."))
+        }
+        .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+        // ALIGNED WITH THE ACCOUNT'S NAME, not merely indented past it: this row is a property of
+        // the row above and the eye reads that from one shared left edge; the strip ends on the
+        // table's right edge, under the grip.
+        .padding(.leading, style.nameLeading)
+        .padding(.trailing, style.inset)
+    }
+}

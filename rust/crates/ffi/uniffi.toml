@@ -1,0 +1,6 @@
+[bindings.swift]
+# The generated header joins the existing UsageBarRustCore module (rust/include/module.modulemap),
+# which already links libusagebar_ffi.a, so no second module or linker flag is needed.
+ffi_module_name = "UsageBarRustCore"
+ffi_module_filename = "usagebar_uniffi"
+generate_module_map = false

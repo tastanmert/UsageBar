@@ -1,0 +1,1504 @@
+import Darwin
+import Foundation
+
+// Auto-handoff supervision (Phase B).
+//
+// `usagebar claude` stays resident as a thin parent around the interactive claude child. It tails the
+// session transcript for a cap-hit event; on a hit it terminates the child, re-picks the best other
+// account, and relaunches `claude --resume <session>` in the same terminal - the conversation
+// continues on the fresh account with no manual step. The transcript tailer that detects the cap
+// lives in TranscriptWatcher.swift; the value types and pure helpers in SupervisorRuntime.swift.
+
+/// Resident supervision: spawn claude, tail its transcript, hand off on a cap hit.
+///
+/// `follow`: the axes that adopt a later change to the launch default at the next quiet moment. The
+/// caller holds an axis when the user typed its flag, and both when they passed `--no-follow`.
+///
+/// `recoveries`: the recovery fuse this session had already spent, handed over by the supervisor
+/// this process replaced in a self-update. Empty for every normal launch.
+///
+/// `resumed`: this process took over a session that was ALREADY running (the self-update exec), so
+/// even its first spawn is a relaunch. Two things read it: the resume-prompt suppression in
+/// ResumePrompt.swift (nobody is at the keyboard for a restart UsageBar performed on its own), and the
+/// switch request's served stamp, which must not be seeded from a request this same session made.
+///
+/// `sessionPin`: the account a `usagebar switch` pinned this session to, handed over by the supervisor
+/// this process replaced (SessionSwitch.swift). `pinOverride`: the pin a switch took a session off
+/// under an older build, which had no session pin. Both nil for every normal launch.
+///
+/// `pendingCap`: the cap recovery that supervisor was still waiting out, handed over the same way
+/// (SelfUpdate.swift) - without it an upgrade would hand a capped session back with nothing left to
+/// notice a sibling freeing up. `sessionModel`: the pair a `usagebar model` pinned, on the same terms
+/// and for the same reason as the account pin (SessionModel.swift). Both nil for a normal launch.
+func runSupervised(_ provider: Provider, account initial: Snapshot.Account, args: [String],
+                   follow: FollowAxes = .none, recoveries: [Date] = [], resumed: Bool = false,
+                   sessionPin: String? = nil, pinOverride: String? = nil,
+                   pendingCap: PendingCapRecovery? = nil,
+                   sessionModel: SessionModelPin? = nil,
+                   lastConversation: String? = nil,
+                   capResume carriedResume: CapResumeState? = nil,
+                   taskList carriedTaskList: TaskListPin? = nil,
+                   clearedConversation: String? = nil,
+                   restartNote carriedNote: RestartNote? = nil,
+                   spendReserve: Bool = false) -> Never {
+    let cwd = FileManager.default.currentDirectoryPath
+    let slug = projectSlug(forCwd: cwd)
+    /// This session's project launch profile (ProjectPolicy.swift), read ONCE: the cwd cannot change
+    /// under a running supervisor, and the git probe behind the key must not run on every 2s tick.
+    /// Its model and effort are re-read at each relaunch (B-1091); the account it pins keeps this.
+    var project = projectPolicy(provider.id)
+
+    // THE USER'S PRE-SPAWN CHECK, first launch only (PreSpawnHook.swift). Before the signal
+    // dispositions below, so Ctrl+C still ends usagebar while the check runs, and before any state
+    // file is written, so a rejection leaves nothing to clean. A self-update image (`resumed`)
+    // skips it: the image it replaced ran the check against this home before it exec'd.
+    if !resumed {
+        let gate = preSpawnVerdict(preSpawnContext(provider, initial, reason: "launch"))
+        if gate.unreadable {
+            warn("\(preSpawnConfigURL.path) exists but cannot be read; ignoring the pre-spawn check")
+        }
+        if let line = preSpawnTerminalLine(gate.verdict, label: initial.label) { warn(line) }
+        if case .rejected = gate.verdict { exit(1) }
+    }
+
+    // The parent must survive Ctrl+C - claude uses SIGINT to interrupt a turn, and the whole
+    // foreground process group (which the child shares) receives it.
+    signal(SIGINT, SIG_IGN)
+    signal(SIGQUIT, SIG_IGN)
+    installSupervisorTerminationHandlers()   // SIGHUP/SIGTERM end through the exit path below
+
+    var account = initial
+    // UsageBar's own flags, dropped from the OPTIONS only: past a `--` the same word is the user's
+    // prompt, and filtering the whole vector edited what they said (Snapshot.swift).
+    //
+    // A RESUMED process (the self-update exec) drops the positionals as well, and that is the
+    // existing-damage half of the fossil fix (`withoutPositionals`, LaunchFlags.swift): the argv it
+    // inherited was written by the OLD build, which copied the prompt forward, so a session already
+    // carrying terminal noise cleans itself at its next upgrade instead of needing a human. Never on
+    // a first launch: there the positional is the prompt the user just typed, and this process is
+    // about to hand it to their first child.
+    var launchArgs = removingOption(removingOption(args, "--no-handoff"), "--no-follow")
+    if resumed { launchArgs = withoutPositionals(launchArgs) }
+    /// The fallback profile fires at most once per session.
+    var fallbackApplied = false
+    /// Everything the launch-default follow remembers between ticks, seeded from this session's own
+    /// command line (FollowAdoption.swift). Held across relaunches, like the fuse and the quarantine.
+    var followState = FollowState(launchArgs: launchArgs)
+    // A self-update image re-derives the pair before its first spawn (B-1091; FollowAdoption.swift).
+    if resumed {
+        launchArgs = resumedLaunchArgs(launchArgs, state: &followState,
+                                       following: follow.gated(by: sessionModel?.isEmpty ?? true),
+                                       policy: effectivePolicy(launchPolicy(provider.id),
+                                                               project: project),
+                                       target: initial)
+    }
+    /// The recovery fuse for THIS session, held across relaunches AND across a self-update exec
+    /// (seeded from `recoveries`): at most `maxHandoffs` (Routing pane, default 3) automatic
+    /// cross-account recoveries per 10 minutes (a
+    /// cap handoff or a degradation rescue). In memory and per session, so a fleet-wide drain never
+    /// trips one session on another's account switches, while an app update mid-session cannot
+    /// hand this one a fresh budget. Deliberate moves (pin, follow) and same-account relaunches
+    /// (fallback) do not count.
+    var fuse = RecoveryFuse(max: routingSettings().maxHandoffs, recovered: recoveries)
+    /// Accounts THIS supervisor saw cap, with the model window that capped, excluded from its own
+    /// automatic picks for that model until the TTL passes (union with the cross-supervisor shared
+    /// records). Persists across relaunches.
+    var quarantine: [String: (model: String?, until: Date)] = [:]
+    /// The `usagebar reload` stamp this supervisor has already served. Captured at startup so an older
+    /// request is never replayed - a child spawned now already carries the edited hooks, skills, and
+    /// instructions the request was about. Held across relaunches, like the fuse and the quarantine.
+    /// The newer of the fleet-wide stamp and this pid's own `usagebar reload --self` stamp
+    /// (ReloadSelf.swift): one served stamp covers both, a file left by a dead supervisor that wore
+    /// this pid is old news, and a self-update exec restarts the child, which serves a pending one.
+    var reloadEpoch = max(readReloadRequest()?.epoch ?? 0,
+                          readReloadRequest(from: reloadSelfFile(sessionKey: String(getpid())))?
+                              .epoch ?? 0)
+    /// What has been said about a queued reload: the stamp it was said for, so a session in use
+    /// says it once, and when the wait began, so past five minutes the badge is recomputed every
+    /// tick and names the gate holding it now.
+    var reloadNotice = ReloadWait()
+    /// Every stamp the keyboard tracker classified while a reload waits (KeyboardTrace.swift).
+    var keyboardTrace = KeyboardTrace()
+    /// How big this session's conversation has grown, published on the same track for `usagebar status`
+    /// (SessionContext.swift). Outside the loop, like the notice: the session survives its children.
+    var sessionContext = SessionContextWriter()
+    /// Which conversation this directory last held, published for the NEXT launch here rather than
+    /// for this one (LastConversation.swift). Outside the loop for the same reason as the reading
+    /// above: the session survives its children, and so does the record - and seeded from the
+    /// supervisor this process replaced in a self-update, so an upgrade does not re-announce an
+    /// unchanged conversation over a sibling session's newer one.
+    var lastConversation = LastConversationWriter(current: lastConversation)
+    var taskListRecord = ConversationTaskListRecorder(forkedFrom: forkParentID(launchArgs))
+    /// Whether the next child is a RELAUNCH rather than the launch the user typed: every spawn
+    /// after the first, and all of them when this process is a self-update taking a running session
+    /// over. Read only by the resume-prompt suppression (ResumePrompt.swift).
+    var relaunching = resumed
+    /// Relaunch targets the user's pre-spawn check rejected, left alone for `preSpawnHoldSeconds`.
+    var preSpawnHold = PreSpawnHold()
+    /// A pending cap recovery handed from one child to the next (see `capCarriedAcrossRelaunch`),
+    /// seeded from the supervisor this process replaced in a self-update: that exec is one of the
+    /// relaunches which carry it, and the argv is how it arrived (SelfUpdate.swift).
+    var carriedCap = pendingCap
+    /// Stamped into the child env so the status line can tell whether the supervisor watching this
+    /// session is the current build (a session launched before an app update runs stale logic).
+    let supervisorVersion = supervisorBuildVersion()
+    /// The version a self-update exec was aiming for: read from the environment when this process
+    /// IS that exec, and written again when this process attempts one of its own.
+    var selfUpdateAttempted = consumeSelfUpdateAttempt()
+    var appRelaunch = AppRelaunchState()
+    let supervisorPID = String(getpid())
+    /// Which supervisor that pid means, stamped into every child so a handoff can tell this
+    /// session's detached jobs from those of whatever wore the number before it
+    /// (HandoffKill.swift). A process's start time is fixed for its whole life, exec included.
+    let supervisorStartedAt = handoffProcess(getpid()).map { String($0.startedAt) }
+    /// The status line's view of what this supervisor is waiting to do, SEEDED from this pid's own
+    /// notice file: a self-update exec keeps the pid and leaves its badge behind for the image it
+    /// hands over to, which then has to be the one that takes it down (PendingNotice.swift).
+    var pendingNotice = PendingNoticeWriter(pid: supervisorPID)   // cleared when it exits
+    /// What this session is DOING, for the status board outside this terminal (SessionState.swift).
+    /// Seeded from this pid's own file for the same reason the notice above is: a self-update keeps
+    /// the pid, and the image it hands over to has to be the one that decides what stands there.
+    var sessionState = SessionStateWriter(pid: supervisorPID)
+    /// Publishes to `~/.usagebar/events` (plan §6.8), seeded like `sessionState` above.
+    var sessionWaits = SessionWaitTracker(pid: supervisorPID, supervisorPid: Int(getpid()),
+        supervisorStartedAt: Int(supervisorStartedAt ?? "") ?? 0)
+    /// Throttles the detached delivery spawn (plan §5.3 revision 2) to at most once per 10s.
+    var lastDeliverySpawn: Date?
+    /// Which project this session is in, resolved ONCE: a supervisor's cwd cannot change under it
+    /// (`writeSupervisorCwd` rests on the same fact), and the answer costs two git subprocesses.
+    /// Asked here rather than in the app so a panel that lists ten sessions is ten file reads
+    /// rather than twenty git spawns, and so the board and the pickers name a project by the one
+    /// rule (`pickProject`).
+    let boardProject = pickProjectForCwd(cwd)
+    /// What the user has asked for by hand about the account this session runs on, held across
+    /// relaunches and across a self-update exec like the fuse (SessionSwitch.swift owns the rules;
+    /// `resumed` is what stops a request this same session just made from being seeded away).
+    var manualMoves = ManualMoveState(sessionKey: supervisorPID, servedEpoch: resumed ? 0 : nil,
+                                      sessionPin: sessionPin, overriddenPin: pinOverride)
+    /// What the user has asked this session to RUN, on the same terms as the account pin above
+    /// (SessionModel.swift owns the rules; `resumed` stops a request this session just made from
+    /// being seeded away as served).
+    var sessionModelState = SessionModelState(sessionKey: supervisorPID,
+                                              servedEpoch: resumed ? 0 : nil,
+                                              pin: sessionModel ?? SessionModelPin())
+    /// What this session has been asked to TYPE on its own behalf (SessionInput.swift owns the
+    /// rules). `resumed` carries the same meaning it does above: a self-update exec keeps the pid
+    /// and is the same session, so a request written moments before it must not be seeded away.
+    var sessionInput = SessionInputState(sessionKey: supervisorPID, servedEpoch: resumed ? 0 : nil)
+    /// What this session has been TOLD about the account under it running out (QuotaKnock.swift
+    /// owns the rules). Per session rather than per child, so a relaunch does not re-announce a
+    /// drought this conversation has already heard about; a relaunch that moves accounts re-arms it
+    /// by itself, because the new account's binding window is a different cycle.
+    var quotaKnock = QuotaKnockState()
+    /// What this session knows about the account under it running out (DroughtWatch.swift owns the
+    /// rules): whether the pins over it still hold, and whether the one line a blocked drought
+    /// leaves has been written. Per session on the same terms as the arm above, and re-keyed by the
+    /// ACCOUNT rather than aged out, so a relaunch that moves reads the new account at once.
+    var drought = DroughtWatch()
+    /// Whether the current reserve hold (B-1213) has left its handoff.log line.
+    var reserveHoldLogged = false
+    /// And what it owes the conversation once a wall has actually moved it (CapResume.swift owns the
+    /// rules): the one line saying the turn was cut short and asking it to carry on. Per session and
+    /// necessarily so - the arm is raised by the tick that ends one child and spent by a tick of the
+    /// next one, which is the one event a per-child value could never carry it across.
+    var capResume = carriedResume ?? CapResumeState()
+    // What this supervisor types from here on (AutomaticInput.swift); anything earlier is unknown.
+    automaticInputLedger = AutomaticInputLedger(knownSince: Date())
+    /// The first tick an idle self-update was held for background work (`selfUpdateHeldByBackground`).
+    var selfUpdateHeldSince: Date?
+    /// What this session has tried about answering a 5-hour wall with the account's own weekly
+    /// `/limit-reset` rather than by moving the conversation (CapLimitReset.swift owns every rule).
+    /// Per session and necessarily so, on `capResume`'s own terms: the wall is seen by one child
+    /// and the answer can land in the next.
+    var capLimitReset = CapLimitResetState()
+    /// The newest reset signal already folded into this ACCOUNT's shared record, so a reading the
+    /// watcher goes on holding is written once rather than on every tick for the rest of the
+    /// session (`observeLimitReset`). Per session because the reading is, and re-keyed by nothing:
+    /// a handoff onto another account writes that account's record from that account's own
+    /// observations, and a signal from before the move is older than the one that follows it.
+    var limitResetFolded: Date?
+    /// And HOW it is told: filed for this child's own hooks to deliver where they are registered and
+    /// runnable, typed into the composer where they are not (QuotaKnockNotice.swift).
+    ///
+    /// DECLARED BESIDE THE ARM AND ANSWERED BESIDE THE CHILD, which is the one thing about this
+    /// value that is load-bearing: the arm belongs to the conversation and outlives every relaunch,
+    /// while this belongs to the PROCESS, because the hooks a Claude Code runs are the ones its
+    /// settings.json held when it started (`quotaKnockFilingAvailable`). It is re-read at each
+    /// spawn below and holds for exactly that child. False until then, so a session that somehow
+    /// announced before its first child was up would be typed into rather than filed for.
+    var quotaKnockFiling = false
+    /// And what it has been told about the MACHINE the session is running on (HostHealthKnock.swift
+    /// owns the rules). Per session rather than per child, on the arm above's terms: a relaunch
+    /// replaces the conversation's process and not the alarm, and an alarm this session has already
+    /// heard about must not be announced again because its child restarted.
+    var hostHealthKnock = HostHealthKnockState()
+    // A self-update keeps the pid and gives this state a fresh start, so a cancellation notice the
+    // replaced image had just raised lives only in its file - where the seeded writer above would
+    // take it down on the first tick, as the honest answer to "this session has nothing pending".
+    // Adopted back only on that path (`resumed`): on a normal launch the pid is this process's own
+    // and any notice under it belongs to a dead session, which the sweep below removes.
+    // Both axes are offered the same file, and each takes it only if the kind is its own: the
+    // notice track holds one badge at a time, so at most one of these adopts anything.
+    if resumed {
+        let carried = readPendingNotice(pid: supervisorPID)
+        manualMoves.adoptCancellation(carried)
+        sessionModelState.adoptAdoption(carried)
+    }
+    // THE OTHER DOCUMENT AN IMAGE CAN LEAVE UNDER ITS OWN PID, reconciled the other way: a knock
+    // filed and not yet delivered is news rather than a live wait, and this image has announced
+    // nothing, so it is discarded rather than adopted. Unconditional, and outside the `resumed`
+    // branch on purpose - the self-update is the case the sweep below cannot reach, because the pid
+    // never died (QuotaKnockNotice.swift enumerates all four ways the file outlives its arm).
+    discardCarriedQuotaKnockNotice(pid: supervisorPID)
+    // Reap drift-state files left by dead supervisors (a SIGKILL skips the clear path) before this
+    // one starts writing its own; also shrinks the pid-reuse window for a stale badge.
+    sweepDeadSupervisorState()
+    // Register in the same directory as a live supervisor (an empty file; a drift episode fills it
+    // in later): `usagebar reload` counts these to say how many sessions its request will restart.
+    markSupervisorLive(pid: supervisorPID)
+    // Where this session runs, for a `usagebar switch` typed in a shell with no session marker; written
+    // once, because a supervisor's cwd cannot change under it (SwitchRequest.swift).
+    writeSupervisorCwd(cwd, pid: supervisorPID)
+    // How this session was launched, for reopening it after a reboot (SessionLaunchRecord.swift).
+    publishSessionLaunch(provider: provider.id, args: args, cwd: cwd, pid: supervisorPID, resumed: resumed)
+    /// What the last handoff told the next child about the restart (RestartWake.swift): nil on a
+    /// fresh first launch and on a fresh relaunch. An exec is a self-update whose old image counted
+    /// nothing here, and a first launch that resumes a conversation is a session brought back by
+    /// hand; either first child is owed the restart line on the notice or on nothing.
+    var restartNote: RestartNote? = firstLaunchRestartNote(launchArgs: launchArgs, exec: resumed,
+                                                           carried: carriedNote)
+    /// Whether this session is owed the line that wakes it after a restart killed its background
+    /// work. Per session, since it is raised and spent against the child after a handoff.
+    var restartWake = RestartWakeState()
+    /// The list every child of this session writes (TaskListPin.swift). Per session and decided
+    /// once: carried across a self-update, else the one the user exported, else the one recorded
+    /// for the conversation being resumed (`clearedConversation`: the start mode found it cleared
+    /// and unused), otherwise new. A fork writes a new conversation, so it never takes a record.
+    var taskList: TaskListPin
+    let resumedID = resumedConversation(launchArgs: launchArgs, cleared: clearedConversation)
+    if let carriedTaskList {
+        taskList = carriedTaskList
+        appendHandoffLine(taskListLine(pid: supervisorPID, pin: taskList, source: "carried"),
+                          to: handoffLog)
+    } else if exportedTaskListPin(home: account.launchHome!,
+                                  base: ProcessInfo.processInfo.environment) == nil,
+              let recorded = conversationTaskListPin(resumedID, selfPID: supervisorPID) {
+        taskList = recorded
+        appendHandoffLine(taskListLine(pid: supervisorPID, pin: taskList, source: "conversation"),
+                          to: handoffLog)
+    } else {
+        taskList = initialTaskListPin(home: account.launchHome!,
+                                      base: ProcessInfo.processInfo.environment)
+        appendHandoffLine(taskListLine(pid: supervisorPID, pin: taskList,
+                                       source: resumed ? "unpinned-predecessor" : "fresh"),
+                          to: handoffLog)
+    }
+
+    while true {
+        let launchedAt = Date()
+        // What the child is launched with: the account's config home and the markers every UsageBar
+        // surface reads back out of it (SupervisorRuntime.swift).
+        // Make this pass's home reach the session's one task list before the child reads it.
+        let placement = placeTaskList(taskList, inHome: account.launchHome!)
+        if case .rebased(let moved) = placement { taskList = moved }
+        if placement != .inPlace && placement != .alreadyLinked {
+            appendHandoffLine(taskListLine(pid: supervisorPID, pin: taskList, source: "place",
+                                           placement: placement), to: handoffLog)
+        }
+        let environment = supervisedChildEnvironment(
+            provider: provider, home: account.launchHome!, supervisorVersion: supervisorVersion,
+            supervisorPID: supervisorPID, supervisorStartedAt: supervisorStartedAt,
+            taskListID: provider.id == "claude" ? taskList.id : nil, launchArgs: launchArgs)
+        // A relaunch inherits a terminal whose reader was just killed, and everything queued on it
+        // since - the answer to a query the dead child never collected, a keystroke typed into the
+        // gap - would arrive as the first thing the new child reads and land in its prompt box
+        // (TerminalHandover.swift). Not on the user's own first launch: they typed the command a
+        // moment ago, nothing has died here, and anything they type next is theirs.
+        if relaunching { drainTerminalInput() }
+        // Void the last child's report before a new pid can inherit it (TranscriptIdentity.swift).
+        clearTranscriptIdentity(pid: supervisorPID)
+        // WHICH CHANNEL THIS CHILD CAN BE TOLD THROUGH, read here and held for its whole life: the
+        // hooks a Claude Code runs are the ones its settings.json held when it started, so this is a
+        // property of the process about to exist rather than of the account or of the supervisor
+        // (`quotaKnockFilingAvailable` argues the reading, and why it is taken BEFORE the spawn
+        // rather than after). Re-read on every pass, so a relaunch onto another account - or one
+        // that follows an install - answers for the child it is starting.
+        quotaKnockFiling = quotaKnockFilingAvailable(home: account.launchHome)
+        // The MCP authorizations this account is missing, taken from the siblings that have them
+        // (MCPAuthSync.swift). Inside the loop rather than before it, because the account can CHANGE
+        // between two passes: a cap handoff moves the session onto a home that has never authorized
+        // anything, and that is the case this whole feature exists for. Silent and best-effort, so a
+        // home it cannot seed is a home Claude Code will ask about, exactly as it does today.
+        //
+        // INTERACTIVE ONLY ON THE FIRST PASS, read off the same flag the terminal drain above reads:
+        // this pass happens in the same second as the command the user typed, so this process is
+        // allowed to keep its own Keychain consent on. Every pass after it is something this
+        // supervisor decided to do on its own - a cap handoff, a settings follow, a resupervise after
+        // an app update - and one of those stopping on a panel would hang a session with nobody at
+        // the machine. A resumed supervisor starts with `relaunching` already true, which is right
+        // for the same reason: an app update is not somebody typing. The seeding's secret reads no
+        // longer raise a panel on any path (MCPAuthSync.swift); what this flag still covers is the
+        // write and the attribute probes.
+        // The same Keychain repair the plain exec runs, on the same axis and for the same reason
+        // (MCPAuthSync.swift: `repairClaudeKeychain`), and it is NOT inside the `launchHome` branch
+        // below: the items it heals belong to config homes rather than to this launch, and a session
+        // whose home the snapshot cannot name still spawns a `claude` that will read one of them.
+        repairClaudeKeychain(provider: provider, interactive: !relaunching)
+        if let seedHome = account.launchHome {
+            seedMCPAuthorization(provider: provider, home: seedHome, interactive: !relaunching)
+            // AND THE OTHER QUESTION A FRESH CHILD ASKS: is this folder trusted. Claude Code decides
+            // that once, at start-up, so a conversation can run for hours past the decision that let
+            // it start and still be asked again the moment UsageBar restarts it. On 2026-09-02 that is
+            // exactly what happened: a session launched in a directory that was not yet a git
+            // repository (the trust walk climbed to `~/workspace`, which was accepted, and said
+            // nothing), the conversation ran `git init`, and three hours later a self-update
+            // relaunched it with `--resume`. The new child's walk was now bounded to that directory,
+            // nothing named it, and the trust dialog stopped the session for three minutes with
+            // nobody at the machine. Anything typed in from outside would have queued behind it.
+            //
+            // ON RELAUNCHES ONLY, off the same flag as the drain and the seeding above, and that is
+            // the whole boundary of this: a relaunch restarts a session that was ALREADY running in
+            // this directory, by a decision of UsageBar's, so re-asking is friction and nothing else.
+            // The user's own first pass is left to Claude Code untouched, because their answer is
+            // the only thing that can put the flag there in the first place. The home is this pass's
+            // TARGET (`seedHome`), which is what makes a cap handoff onto an account that has never
+            // seen this folder work as well.
+            if relaunching,
+               seedFolderTrust(forDirectory: cwd, inConfigDir: URL(fileURLWithPath: seedHome)) {
+                appendHandoffLine(
+                    trustSeedLine(sessionID: flagValue(launchArgs, "--resume")
+                                      ?? flagValue(launchArgs, "-r"),
+                                  pid: supervisorPID, home: seedHome, cwd: cwd),
+                    to: handoffLog)
+            }
+        }
+        // Read before the flag flips below: whether THIS child is one UsageBar restarted, what the
+        // handoff said about it, and whether it resumes a conversation at all (RestartWake.swift).
+        // A first child carrying a note (a resume by hand) is armed as if UsageBar restarted it.
+        let spawnedByUsageBar = relaunching || restartNote != nil
+        let childNote = restartNote
+        restartNote = nil
+        let resumeID = flagValue(launchArgs, "--resume") ?? flagValue(launchArgs, "-r")
+        let resumesConversation = launchResumesConversation(launchArgs)
+        guard let childPID = spawnChild([provider.cli] + launchArgs, environment: environment) else {
+            warn("cannot launch `\(provider.cli)`")
+            // Only "not found anywhere" (PATH or the fixed install places) gets a hint; a binary
+            // that resolved but would not start has a different cause.
+            warnMissingCLIHint(provider.cli,
+                               notFound: !resolveProviderExecutable(provider.cli).contains("/"),
+                               warn: warn)
+            exit(127)
+        }
+        // Every child from here on is one this supervisor decided to start.
+        relaunching = true
+        // WHICH CLAUDE CODE THIS SESSION IS, published now rather than with the first reading: it
+        // is what a prompt hook matches its own parent against, and the commonest way to reach the
+        // pickers at all is a bare `/usagebar` typed before the conversation has had a single
+        // turn (SwitchRequest.swift states the whole rule). Written here rather than at start-up so
+        // a relaunch replaces the pid of the child it just ended.
+        writeSupervisorChild(childPID, pid: supervisorPID)
+        // AND WHICH ACCOUNT IT IS ON, published on the same terms and for the same reason: the
+        // inventory `usagebar status --json` answers with is a roster of live supervisors, and the
+        // reading next door cannot attribute one until the conversation has had a turn
+        // (SwitchRequest.swift). Written beside the pid rather than derived from it so a handoff
+        // names the account this child is really running on.
+        writeSupervisorAccount(account.id, pid: supervisorPID)
+        publishTaskListPin(taskList, pid: supervisorPID)
+
+        // What became of this child, remembered because a reaped pid cannot be waited on twice
+        // and three places here ask (ChildReaper.swift).
+        var child = ChildReaper(pid: childPID)
+
+        var watcher = TranscriptWatcher(
+            projectDir: URL(fileURLWithPath: account.launchHome!).appendingPathComponent("projects/\(slug)"),
+            since: launchedAt, resumeID: resumeID,
+            isForeign: { liveConversations(in: cwd, excluding: supervisorPID).contains($0) })
+        // A fork's parent is never this child's file, the holder's or not (TranscriptWatcher.swift).
+        watcher.forkedFrom = forkParentID(launchArgs)
+        var handoff = false
+        /// Set when a `usagebar session clear` chose to reopen this window as another provider.
+        var reopenAs: String?
+        /// Whether the relaunch this child ends in found the conversation it was in being written by
+        /// somebody else, so it resumes a FORK of it instead of the file itself (HandoffResume.swift).
+        /// Per child like the flag above, and read by the three places that would otherwise attribute
+        /// a conversation to a window that is not in it.
+        var secondHead = false
+
+        // Terminate the child and set up the relaunch on `target` - shared by cap-hit handoffs
+        // and live UI pin switches. Continues the SAME conversation when one exists; a session
+        // with no transcript yet just starts fresh on the target (any --continue/--resume flags
+        // are stripped so it can't pull up an unrelated old conversation there).
+        // `countingFuse` records against the per-supervisor fuse: true for AUTOMATIC recoveries
+        // (cap handoff, degradation rescue), false for deliberate or same-account relaunches (pin
+        // switch, follow adoption, fallback profile) - a Settings change must not eat the budget a
+        // real cap hit may need minutes later. `reason` is the audit-log tag only.
+        func performHandoff(to target: Snapshot.Account, reason: String, countingFuse: Bool = true,
+                            fresh: Bool = false) {
+            let fromLabel = account.label
+            // Read before `account` moves: a same-account relaunch (fallback profile, reload) keeps
+            // a `--continue` the watcher cannot yet turn into a session id; a real move drops it.
+            let sameAccount = target.id == account.id
+            // TERM, two seconds, KILL - the child AND whatever the turn it was inside had started.
+            // A bare TERM to `claude` reaches neither a fork-style launcher in front of it nor the
+            // builds and dev servers behind it, and both of those go on running on the account this
+            // session is leaving (HandoffKill.swift carries the measurement and the shape).
+            // THE JOBS THAT TURN DETACHED, only when the account really moves, and the distinction
+            // is the point rather than the flag: an attached process is part of the turn being
+            // ended, while one the turn detached was detached so that it would outlive the turn. A
+            // same-account relaunch leaves no account, so nothing about it asks for those to stop -
+            // and it is most of what comes through here (the app's own self-update is 818 of the
+            // 1289 handoffs on this machine, with reload, model fallback, safeguard and
+            // cap-fallback behind it).
+            endChildTree(&child, sweepDetached: !sameAccount)
+            clearDriftState(pid: supervisorPID)   // a new child gets a fresh drift monitor
+
+            // Forced, because the id this resumes must be the file the conversation is actually in:
+            // a child that moved (a `/clear`, a resume that forked) leaves the pinned file dead, and
+            // resuming that one orphans every turn written since (twice in one afternoon,
+            // 2026-07-26; the rule lives in TranscriptWatcher.swift).
+            watcher.locateFile(forceForkCheck: true)
+            let sessionFile = watcher.file
+            // A FRESH RELAUNCH CARRIES NOTHING, which is the one thing `usagebar session clear` needs
+            // of this path: the request it answers asked for an empty window, so resuming the
+            // conversation on the target would move the context it was told to drop (and copying it
+            // there would leave the whole transcript in another account's projects directory for
+            // nothing). The id is still LOGGED below - which conversation ended here is what that
+            // line is for - and only the resume and the copy are dropped.
+            // AND WHETHER THAT FILE IS STILL SOMEBODY ELSE'S, asked here because this is the first
+            // point at which the id being resumed is the one the conversation is really in: the
+            // locate above has just followed a fork. A conversation another session in this
+            // directory is writing is left with the head that has it, and this one starts a fresh
+            // window on the target rather than a second writer on it (HandoffResume.swift).
+            // This supervisor's own publish is excluded, or it would refuse every resume there is;
+            // its own CHILD is not a witness here and does not need to be, the kill above having
+            // already taken that process and its tree down.
+            let conversation = sessionFile?.deletingPathExtension().lastPathComponent
+            let holders = conversationHolders(in: cwd, excluding: supervisorPID)
+            secondHead = resumeForksConversation(conversation, liveElsewhere: Set(holders.keys))
+            if secondHead, let conversation {
+                let holder = holders[conversation]
+                noteSecondHead(conversation: conversation, target: target.label,
+                               pid: supervisorPID, cwd: cwd, log: handoffLog, holder: holder)
+                manualMoves.noteFreshStart(
+                    secondHeadFreshBadge(conversation: conversation, holder: holder,
+                                         target: target.label), at: Date())
+            }
+            let carrying = fresh ? nil : sessionFile
+            if reason == "switch", !secondHead, let id = carrying?.deletingPathExtension().lastPathComponent {
+                warn(switchResumedNotice(conversation: id, target: target.label))
+            }
+            if let carrying {
+                shareTranscript(carrying, toHome: target.launchHome!, slug: slug)
+            }
+
+            // A hard cap is allowed past a session pin, and so is a preventive move off an account
+            // with nothing left (DroughtWatch.swift): either way the move ends the pin. Said here,
+            // after the child is gone, because the terminal is only ours between a tear-down and
+            // the next spawn (PendingNotice.swift), and recorded here so a stood-down relaunch
+            // never clears a pin it did not act on.
+            let pinCleared = manualMoves.pinCleared(by: reason)
+            if pinCleared { warn(sessionPinClearedNotice(reason: reason)) }
+            // `conversation`, which is that same id already derived above: the AUDIT line names
+            // what ended here whether or not it was carried, which is what makes it different from
+            // the `carrying` the relaunch below resumes.
+            logHandoff(sessionID: conversation,
+                       from: fromLabel, to: target.label,
+                       reason: handoffReason(reason, pinCleared: pinCleared),
+                       pid: supervisorPID, cwd: cwd)
+            if countingFuse { fuse.record() }
+            account = target
+            launchArgs = relaunchArgs(
+                launchArgs,
+                sessionID: carrying?.deletingPathExtension().lastPathComponent,
+                // `!secondHead` beside `!fresh`, and it has to be there: a same-account relaunch
+                // re-adds the `--continue` it was launched with, which on the account this session
+                // is already on names the very conversation the guard above declined to resume.
+                sameAccount: sameAccount && !fresh && !secondHead,
+                // A second head gets a fork of the conversation: the history without a second
+                // writer on the holder's file (`usagebar session clear` still gets an empty window).
+                fork: secondHead && !fresh)
+            handoff = true
+        }
+
+        // A cap this child could not hand off yet: remembered across poll ticks so a blocked
+        // handoff retries instead of stranding the session. Reset per child - a fresh launch is
+        // a clean slate; the previous account's cap is not this one's - except for what the last
+        // relaunch chose to hand over, which is consumed here so it can never leak further.
+        var pendingCap = carriedCap
+        carriedCap = nil
+        // Per-child drift tracking: the safeguard episode is this session's, and a handoff starts a
+        // fresh child (and a fresh monitor). Its state file is cleared on handoff and on exit.
+        var drift = DriftMonitor()
+        // Per-child keyboard history. Fed once per tick below, because what the non-urgent gates
+        // need is whether stamps arrive in RUNS (typing) or alone (terminal chatter), and that is
+        // only visible across successive readings (KeyboardIdle.swift).
+        var keyboard = KeyboardActivity()
+        /// When this supervisor last typed into this child's composer itself, and nil until it has.
+        /// Per child, like the keyboard history above, and for a sharper reason than symmetry: what
+        /// reads it is the draft guard, whose question is whether a PERSON has typed lately - and
+        /// injected bytes stamp that terminal exactly as fingers do (SessionInputDraft.swift). A
+        /// stamp left by the previous child is not evidence about this one either way.
+        var lastComposerWrite: Date?
+        /// What this child has been asked to type that closes its own window (WindowRepick.swift).
+        /// Per child, like the keyboard history above: a relaunch replaces the conversation, so
+        /// anything armed against the old one is already answered.
+        var windowRepick = WindowRepickState()
+        /// Which turn boundaries the turn-boundary mover has already ruled on (TurnBoundaryMove.
+        /// swift). Per child on the same terms as the arm above: a relaunch replaces the
+        /// conversation, and a boundary recorded against the old one is answered by the restart.
+        var turnBoundary = TurnBoundaryState()
+        var burnCache = BurnSampleCache()
+        /// Said once per child rather than on every 2s tick a plan is stood down: the planners keep
+        /// re-planning while they wait, and the child is drawing on this terminal. Never reset -
+        /// the only way out of the hold is a relaunch, and that child gets a fresh one of these.
+        var unresolvedHoldWarned = false
+
+        /// ONE POLL TICK, and a function rather than the loop's own body so that the loop can run it
+        /// inside an `autoreleasepool`: neither `continue` nor `break` crosses a closure boundary, so
+        /// the two escapes it used to spell are `TickOutcome` values now (SupervisorRuntime.swift).
+        ///
+        /// WHY THE POOL. Swift wraps only `main`, and that pool drains when the process exits - which
+        /// for a supervisor is days later, or never. Every Foundation temporary a tick made therefore
+        /// stood for the life of the session: above all the `NSURL`s and the prefetched `_FileCache`
+        /// behind each one from the transcript-directory passes the idle gates run
+        /// (TranscriptFork.swift), 979 bytes per directory entry, about 3.3 passes per tick, 30 ticks
+        /// a minute. Measured on a live supervisor 2026-08-19: 16.5 MB/min against a 169-file project
+        /// directory, matched within 20% on five processes, and 47 GB on the one that had gone
+        /// longest without a self-update exec - which was the only event that ever gave it back,
+        /// because it replaces the process image. Six of those took the machine down.
+        ///
+        /// `leaks(1)` reports nothing here, and that is why it stood for 25 versions: every one of
+        /// those objects is reachable from the pool's own pages, so none of them is leaked in the
+        /// sense that tool means. The oracle is the slope of the footprint, not a leak report
+        /// (tests/supervisor/footprintchecks.swift asserts the slope, and this pool with it).
+        func tick() -> TickOutcome {
+            // WHICH BUILD IS INSTALLED, read ONCE for the three stations that compare against it:
+            // the app-relaunch watch, the standalone self-update and the fold that rides on somebody
+            // else's restart. All three used to take it from their own defaulted
+            // `supervisorBuildVersion()`, which resolves the bundle's plist on every call - so a
+            // Sparkle swap landing between two of those calls inside ONE tick had the three
+            // stations deciding about different worlds: the arming station could see the app
+            // present under the old version while the self-update beside it already read the new
+            // one. One reading per tick makes that impossible rather than unlikely.
+            //
+            // NOT `supervisorVersion`, which is this process's own captured build and must stay
+            // captured (SessionState.swift states why a fresh read there reports the build this
+            // supervisor is about to become). This is the other side of the same comparison: what
+            // is on disk right now.
+            let installedVersion = supervisorBuildVersion()
+            // Before any relaunch decision reads it: every gate below asks the same tracker, and it
+            // only learns anything by being given each tick's reading.
+            // Focus changes the app recorded (FocusEvents.swift) keep a terminal's focus reports
+            // from ending a burst; read only when a stamp is due to be classified.
+            let keyboardSeen = keyboard.observe(stamp: lastKeyboardInput(), now: Date(),
+                                                focusEvents: { readFocusEvents() })
+            // THREE READINGS OF ONE POLICY, and the difference between them is a pin. `fleetPolicy`
+            // is what the app and this project declare; `moving` is that with a pin RELEASED when
+            // the account it names has nothing left (DroughtWatch.swift), which is the reading
+            // everything that moves this session is judged by; and `policy` is `moving` with this
+            // SESSION's own pin over it - a pinned session is not rebalanced, not rescued, and not
+            // re-picked (`sessionPolicy`, SessionSwitch.swift). The last is derived inside
+            // `applySessionDirectives` below rather than here, because that call can create or
+            // release the pin, and every mover after it must read the pin the session has once it
+            // returns. The cap handoff is the one reader that gets `moving` rather than `policy`,
+            // because it is the one move a session pin may not stop (`capReading`).
+            // The APP's own document, read before either overlay: `effectivePolicy` turns a project
+            // account into `manual` and `sessionPolicy` turns a session pin into `manual`, so a
+            // policy read through either can no longer say `off` at all, and the observe-only gate
+            // has to be asked of the file the user set (AutoSteering.swift; `runLaunchDir` asks it
+            // the same way for the shim).
+            let appPolicy = launchPolicy(provider.id)
+            let fleetPolicy = effectivePolicy(appPolicy, project: project)
+            /// What each account's owner keeps for their own browser use, from the same document
+            /// and on the same terms as the policy above: read once here and handed to every mover
+            /// that picks an account, because a reserve read twice in one tick is two answers to
+            /// one file (AccountReserve.swift). Nine readers, one reading - the same argument
+            /// `steering` makes one line down.
+            let reserves = accountReserves()
+            /// Whether UsageBar may choose an account for this session at all, this tick. Read once,
+            /// here, and handed to every mover that would pick one: nine of them, and a gate spelled
+            /// nine times is nine gates that can come to disagree about one file.
+            let steering = supervisorMaySteerAccounts(appMode: appPolicy.mode)
+            // What THIS session is expected to run: its own pin first, then its command line, then
+            // the configured default (`sessionPrimaryModel`, SessionModel.swift). Read by the drift
+            // monitor and the degradation paths. Safe to take before the ACCOUNT pin is folded in
+            // above: that one never touches the model, so both readings answer this identically.
+            var effectivePrimary = sessionPrimaryModel(pin: sessionModelState.pin,
+                                                       launchArgs: launchArgs,
+                                                       providerID: provider.id,
+                                                       policy: fleetPolicy)
+            // WHAT THE ACCOUNT A PIN NAMES IS WORTH, and therefore what that pin is still worth
+            // (DroughtWatch.swift owns the whole rule): naming an account says which one this
+            // conversation belongs on, never that it should sit on an empty one. The reading is
+            // taken at most every 30s because the movers below refuse a pinned session BEFORE they
+            // read the snapshot, which is what keeps a 2s poll free.
+            //
+            // `pinned` IS THE ACCOUNT THE PIN NAMES, NOT THE ONE UNDER THE SESSION, which is the
+            // difference between a release that lasts the drought and a restart loop: judged on the
+            // account it moved TO, the release lapses on the first reading after the move and the
+            // pin switch drags the session straight back (DroughtWatch.swift walks the four steps).
+            // Asked THROUGH `sessionPolicy` rather than by spelling its precedence again here: it
+            // is the one rule for how a session pin lies over the fleet's reading, and a second copy
+            // of that rule is how this station and the movers would come to disagree about which
+            // account a session is pinned to. A `usagebar switch` served later in THIS tick is read on
+            // the next one, two seconds later.
+            drought.observe(provider: provider.id, account: account, primaryModel: effectivePrimary,
+                            pinned: sessionPolicy(fleetPolicy,
+                                                  sessionPin: manualMoves.sessionPin)
+                                .pinnedAccountID,
+                            quarantine: quarantine, reserves: reserves)
+            /// WHICH SCOPE is holding this session on its account, for the two surfaces that show
+            /// it (the status line inside Claude Code, the app's session board). Taken here, where
+            /// the three pins are folded, because this is the only place the fold exists: `manual`
+            /// on the policy below no longer says which of them said so, which is the same reason
+            /// the release one line down is asked the app's own mode. `manualMoves.sessionPin` is
+            /// this tick's pin only after `applySessionDirectives` has run; the publish that reads
+            /// this happens after it, and the value is re-derived there.
+            /// Whether the pins over this session yield this tick, whichever scope set them: the
+            /// account they name is out of quota or under its owner's line (DroughtWatch.swift).
+            let pinYields = pinYieldsToSpentAccount(pinnedSpent: drought.pinnedSpent,
+                pinnedUnderReserve: drought.pinnedUnderReserve && !spendReserve)
+            /// B-1213: under its owner's line with nowhere to go, the session is HELD - nothing
+            /// UsageBar types reaches it - and the hold is written down once per hold.
+            let reserveHeld = reserveHoldsSession(underReserve: drought.underReserve,
+                                                  hasTarget: drought.hasTarget,
+                                                  spendReserve: spendReserve)
+            if reserveHeld, !reserveHoldLogged {
+                appendHandoffLine(reserveHoldLine(pid: supervisorPID, account: account.label,
+                                                  cwd: cwd), to: handoffLog)
+            }
+            reserveHoldLogged = reserveHeld
+            /// The fleet's policy as everything that MOVES this session judges it. The pin switch
+            /// reads it too, which is the half that matters: released, it stands down instead of
+            /// dragging the session straight back onto the account a mover just carried it off.
+            let moving = pinReleasedPolicy(fleetPolicy, yielding: pinYields)
+            var policy = moving
+            // The single relaunch this tick will perform, if any. Reasons fire in priority order
+            // (pin > cap > degradation > fallback) and the FIRST owns the account move; a follow
+            // adoption only folds its model/effort onto that target. Executed once at the tick's
+            // end, so a cap and a Settings Apply landing together kill the child exactly once.
+            var plan: RelaunchPlan?
+            // What the planners below may commit while they plan, read before the first of them
+            // runs. A tick that ends up standing its relaunch down (the unresolved-fork hold at the
+            // bottom) has to hand all of it back, or the work is not deferred but lost: the reload's
+            // served epoch is the case that proved it (StandDown.swift).
+            let committed = TickCommitments(reloadEpoch: reloadEpoch, reloadNotice: reloadNotice,
+                                            followState: followState,
+                                            fallbackApplied: fallbackApplied)
+            // The safeguard restore's handled-record is a FILE, so no value snapshot can give it
+            // back. It is carried from the decision to the execution point instead and written only
+            // if the relaunch happens (SafeguardDrift.swift). Tick-local like the plan it belongs
+            // to: a stand-down drops it by going out of scope, with nothing to undo.
+            var safeguardRecord: PendingSafeguardRecord?
+            /// A served `usagebar switch`, on the same terms: written only if the relaunch happens, so
+            /// a stand-down leaves the request pending (SessionSwitch.swift).
+            var switchRecord: PendingSwitchConsumption?
+            /// A served `usagebar model`, on those same terms (SessionModel.swift).
+            var modelRecord: PendingModelConsumption?
+
+            // Where this conversation is, FIRST, so no gate below has to fall back on the mtime
+            // guess to find out (TranscriptIdentity.swift owns the whole rule).
+            adoptReportedTranscript(watcher: &watcher, sessionKey: supervisorPID,
+                                    child: processStamp(childPID))
+            // Cap recovery has top priority: the transcript is scanned BEFORE any relaunch path
+            // (pin, switch, follow, rescue, fallback), because a relaunch resets the watcher's
+            // `since` and would filter the cap event as old history and lose it (2026-07-24). The
+            // whole rule lives in CapDetection.swift; the window that capped is the one this session
+            // runs, which `effectivePrimary` above already answered.
+            observeCapHit(pendingCap: &pendingCap, quarantine: &quarantine, watcher: &watcher,
+                          account: account, primaryModel: effectivePrimary)
+            // WHAT THIS CONVERSATION HAS BEEN TOLD ABOUT ITS ACCOUNT'S WEEKLY SESSION-LIMIT RESET,
+            // folded into that account's shared record whoever typed the line: UsageBar's own station
+            // below, the panel's button, or somebody's hands (CapLimitReset.swift). Beside the cap
+            // scan because it reads the same tail, and before the handoff because the record it
+            // writes is what the hold one line down consults.
+            observeLimitReset(watcher.lastLimitReset, folded: &limitResetFolded,
+                              accountID: account.id)
+            // AND WHETHER THIS TICK'S HANDOFF MUST STAND DOWN while that reset answers the wall in
+            // place. Here, where the handoff is decided, rather than beside the writers further
+            // down: a hold asked after the handoff has planned its relaunch is a hold that arrives
+            // too late to prevent one. It asks nothing about the composer, which is why it can be
+            // this early; the typing happens beside the other composer writers, under their gates.
+            let limitResetHolds = capLimitResetHold(
+                &capLimitReset, pendingCap: &pendingCap, accountID: account.id,
+                accountLabel: account.label,
+                resetState: { limitResetEffective(readLimitReset(accountID: account.id)) },
+                observed: watcher.lastLimitReset,
+                // The whole snapshot pair, and the row's own freshness with it: a number held over
+                // from a poll that failed, or from an app that stopped publishing, is not what the
+                // weekly floor may spend a once-a-week credit against (`capLimitResetWeekly`).
+                weeklyRemaining: { capLimitResetWeekly(loadSnapshot(), accountID: account.id) },
+                // And what a landed reset falsifies besides the cap: the quarantine this session
+                // wrote when the wall landed, session-local map and shared file both.
+                clearQuarantine: { model in
+                    releaseQuarantine(account.id, model: model, sessionLocal: &quarantine)
+                }, underReserve: drought.underReserve && !spendReserve)
+
+            // Model-drift observation: surface a Fable safeguard fallback and gate the
+            // quota-degradation paths below with `drift.isActive` (DriftMonitor.swift).
+            observeDrift(&drift, watcher: &watcher, primary: effectivePrimary, pid: supervisorPID)
+
+            // Where this session runs and what it runs there: a `usagebar switch` or a panel pin, a
+            // `usagebar model`, and the launch default it follows when told neither. All three
+            // together because the ORDER between them is a rule, and it lives with them in
+            // SessionDirectives.swift. Everything below yields to them by being gated on
+            // `plan == nil`; the two records are committed at the execution point like the
+            // safeguard's.
+            applySessionDirectives(plan: &plan, moves: &manualMoves, switchRecord: &switchRecord,
+                                   model: &sessionModelState, modelRecord: &modelRecord,
+                                   follow: &followState, following: follow, policy: &policy,
+                                   steering: steering,
+                                   account: account, providerID: provider.id,
+                                   launchArgs: launchArgs, primaryModel: &effectivePrimary,
+                                   quarantine: quarantine, reserves: reserves,
+                                   watcher: &watcher,
+                                   childAge: Date().timeIntervalSince(launchedAt),
+                                   keyboardIdle: { keyboard.idle($0) },
+                                   heldElsewhere: { conversationHolders(in: cwd, excluding: supervisorPID)[$0] })
+            // AND AGAIN, because the station above can have folded a SESSION pin in
+            // (`sessionPolicy`), which lands as a fresh `manual` over the reading taken a moment
+            // ago. The release is about the account being empty, which is as true of the session's
+            // own pin as of the project's. Idempotent when nothing was pinned.
+            policy = pinReleasedPolicy(policy, yielding: pinYields)
+
+            // Cap handoff / wait: a pending cap outranks follow, rescue and fallback for the account
+            // MOVE (the pin switch above still wins), and it is the only mover a session pin does
+            // not stop - though a hand-pinned session is first offered the fallback pairing on the
+            // account it is on. CapDetection.swift; rescue/fallback stay gated by `plan == nil`.
+            // `moving` rather than `fleetPolicy`: a pin over an account that is out of quota reads
+            // as `auto` here whichever scope set it, so a cap can carry the session off it
+            // (2026-08-21 for project pins, B-1540 for the app's own). In every other respect it
+            // is the fleet's own reading.
+            applyCapHandoff(plan: &plan, pendingCap: &pendingCap, account: account,
+                            providerID: provider.id, fleet: moving, steering: steering,
+                            sessionPin: manualMoves.sessionPin,
+                            modelPinned: sessionModelState.isPinned, quarantine: quarantine,
+                            fuseAllows: fuse.allows(), reserves: reserves,
+                            heldByLimitReset: limitResetHolds)
+
+            // The session's ACTUAL model is no longer the one it was launched for (claude fell back
+            // server-side - e.g. the flagship weekly ran dry). Two ordered answers, at most one per
+            // tick: move to a sibling that can still serve the model, else accept the configured
+            // fallback pairing here. Both rules, and why they skip a safeguard drift, live in
+            // ModelDegradation.swift.
+            applyDegradationRescue(plan: &plan, watcher: &watcher, driftActive: drift.isActive,
+                                   policy: policy, account: account, providerID: provider.id,
+                                   primaryModel: effectivePrimary, quarantine: quarantine,
+                                   steering: steering, fuseAllows: fuse.allows(),
+                                   reserves: reserves)
+            applyFallbackProfile(plan: &plan, applied: &fallbackApplied, watcher: &watcher,
+                                 driftActive: drift.isActive, policy: policy, account: account,
+                                 primaryModel: effectivePrimary)
+
+            // Safeguard-fallback restore: the API fell this session onto a fallback model and left
+            // it at its own default depth, so put the declared depth back at an idle moment - on
+            // the fallback model, never back on the one that tripped it (SafeguardDrift.swift).
+            applySafeguardRestore(plan: &plan, drift: &drift, record: &safeguardRecord,
+                                  watcher: &watcher, account: account,
+                                  policy: policy, launchArgs: launchArgs,
+                                  fuseAllows: fuse.allows(), pid: supervisorPID,
+                                  keyboardIdle: { keyboard.idle($0) })
+
+            // WHAT THIS SESSION IS DOING, decided before the preventive movers rather than after
+            // them, which is a move this package made (2026-08-20) and the reason is one word:
+            // `blocked`. Both preventive movers and the turn-boundary one below refuse to restart a
+            // session that is waiting on a person, and only this reading can tell them - it is the
+            // notice hook, the open `AskUserQuestion` and the quiet reading folded together
+            // (SessionStateSync.swift), and no cheaper second opinion may stand in for it.
+            //
+            // NOTHING IT READS MOVES BETWEEN HERE AND WHERE IT USED TO STAND: the axes come from a
+            // pin and a command line the directives station has already settled, and the account
+            // and the args are only rewritten at the execution point at the bottom of the tick.
+            //
+            // IT IS NOT A PUBLISHER, which is what the first version of this note called it and was
+            // wrong about (review of e52a436, B2). It takes the watcher `inout` and runs
+            // `quietness`, so it LOCATES - rebinding `file` and `hasUnresolvedFork` - it fills the
+            // open-call scan cache, it unlinks an answered notice, and it posts a state-change
+            // knock. Three things make moving it safe anyway, and they are worth naming because
+            // "publisher" was doing that work by assertion:
+            //
+            //   - THE LOCATE IS NOT THE FIRST OF THE TICK. `observeCapHit` runs `sawCapHit`, whose
+            //     first act is `locateFile()`, above every station here; the directives station and
+            //     the degradation rescue both locate again through `isQuiet`. One more between them
+            //     changes no invariant any of them holds.
+            //   - THE ONE ORDERING RULE IN THIS AREA IS INTERNAL TO THE STATION IT PRECEDES. The
+            //     window repick requires its id and its window reading to be taken as a pair BEFORE
+            //     the `isQuiet` inside `applyProactiveMoves` can relocate under them
+            //     (WindowRepick.swift); that pair is still read first inside that function, and a
+            //     locate before the station leaves both halves describing the same file.
+            //   - THE OTHER TWO EFFECTS ARE POSITION-FREE. Clearing an answered notice is
+            //     idempotent and narrowed to the event it judged, and the knock is an invitation to
+            //     read a file this call has already written.
+            //
+            // WHAT DID CHANGE is the distance to `applySessionInput`, whose whole reason for taking
+            // this value rather than the file is that it wants the state as of THIS tick: there are
+            // now three stations and their file I/O between the reading and that consumer. Same
+            // tick, further apart.
+            //
+            // The model published is the one that ANSWERED the last turn where there is one,
+            // falling back to what the child was launched with (SessionContext.swift states why
+            // those differ); `axes` also feeds the context publish further down.
+            let axes = publishedSessionAxes(pin: sessionModelState.pin, launchArgs: launchArgs,
+                                            observed: watcher.lastModel)
+            let board = syncSessionState(
+                &sessionState, pid: supervisorPID, project: boardProject,
+                accountID: account.id, childPid: Int(childPID),
+                model: (axes.observedModel ?? axes.runningModel ?? axes.pinnedModel)
+                    .map(shortModelName),
+                // The stamp this process was LAUNCHED with, the same `let` the self-update fold
+                // compares against; a fresh read would report the build installed under this
+                // supervisor rather than the one it runs (SessionState.swift states the rule).
+                supervisorVersion: supervisorVersion,
+                watcher: &watcher, keyboardBurstAt: keyboard.lastBurstAt, tracker: &sessionWaits)
+
+            // The two PREVENTIVE movers, lowest priority of the account moves because every block
+            // above is repairing something and neither of these repairs anything: the window repick
+            // (a session that has just cleared its context is empty, so the restart off a dying
+            // account is free) and the idle rebalance (the standing offer for a session nobody
+            // clears). Both gated on the recovery fuse; the order between them is a rule, and it
+            // lives with them in WindowRepick.swift.
+            // WHETHER THIS SESSION'S COMPOSER ALREADY HOLDS SOMETHING, taken ONCE for the three
+            // readers below it, from the two facts this process has: a run of keystrokes since the
+            // last prompt, and nothing typed by this supervisor since (SessionInputDraft.swift). It
+            // is read here, ahead of the preventive movers, because those movers are relaunches and
+            // a relaunch ends the composer and the kill buffer of the child it replaces - the same
+            // invariant the input station holds when a clear lands, at the other end of the same
+            // minute. The transcript was scanned at the top of this tick, so this reading is as
+            // fresh here as it was where it used to be taken, and one reading is what stops the two
+            // ends of the invariant from ever disagreeing about the same instant.
+            // ONE CLOCK FOR EVERY STATEMENT THIS TICK MAKES ABOUT THAT KEYBOARD STAMP (2026-09-02).
+            // The draft question here and the drought audit's `session-busy` and `burst-age` fields
+            // are three readings of one `lastBurstAt`, and the incident that bounded the first of
+            // them is one audit line saying the terminal had been still for two minutes AND that
+            // somebody was typing in it. Defaulted clocks leave that contradiction to luck.
+            let tickNow = Date()
+            let draftSuspected = sessionInputDraftSuspected(burstAt: keyboard.lastBurstAt,
+                                                            userTurnAt: watcher.lastUserTurnAt,
+                                                            injectedAt: lastComposerWrite,
+                                                            childStartedAt: launchedAt,
+                                                            now: tickNow)
+            // THE BOUNDARY THIS SESSION'S CLAUDE CODE LAST REPORTED, read ONCE for the two stations
+            // that consult it: the rebalance below stands down while one is undecided, and the
+            // station further down rules on it (TurnBoundaryMove.swift states why the order between
+            // them has to be bought this way). One read, so the two cannot disagree about which
+            // boundary they are talking about.
+            let boundary = readSessionTurnEnd(pid: supervisorPID)
+            // AND THIS CHILD'S OWN AGENT ROLL CALL, read ONCE for the two movers that consult it and
+            // dropped here if it belongs to the child before this one (AgentRoster.swift: the file
+            // is named for the supervisor, which outlives its children, so a relaunch that ended a
+            // fan-out leaves ids nothing will ever strike off). The rebalance treats a named worker
+            // as a session that has NOT been left alone; the turn-boundary station waits for it.
+            // One read, so the two cannot come to disagree about who is working.
+            let roster = currentGenerationRoster(pid: supervisorPID, childStartedAt: launchedAt)
+            let agentsWorking = rosterReportsWorking(roster)
+            let backgroundWorking = rosterReportsBackgroundWork(roster)
+            applyProactiveMoves(plan: &plan, repick: &windowRepick, watcher: &watcher,
+                                keyboardIdle: { keyboard.idle($0) },
+                                draftSuspected: draftSuspected, provider: provider.id,
+                                account: account, primaryModel: effectivePrimary,
+                                mode: policy.mode, steering: steering,
+                                blocked: board.waitingOnPerson, agentsWorking: agentsWorking,
+                                launchArgs: launchArgs,
+                                fuseAllows: fuse.allows(),
+                                turnBoundaryPending: turnBoundaryPending(turnBoundary,
+                                                                        event: boundary),
+                                quarantine: quarantine, reserves: reserves)
+
+            // The app updated and Sparkle did not start it again (AppRelaunch.swift). Handed the
+            // tick's ONE reading of the installed build rather than taking its own, which is what
+            // keeps this station and the two self-update ones below deciding about the same world.
+            applyAppRelaunch(&appRelaunch, installed: installedVersion)
+            // The app updated under this supervisor, so it now runs stale logic and stamps a stale
+            // version into its child: replace THIS process with the new build (SelfUpdate.swift).
+            // An upgrade on its own is a restart the session was not otherwise paying for, so it
+            // waits for a real idle moment; it plans that restart like any other reason and the
+            // block below performs the exec, so there is exactly one place the process is replaced.
+            // Ahead of the reload check because an upgrade restarts the child too, so a pending
+            // reload request is satisfied by the same act instead of costing a second restart.
+            // A pending cap does NOT hold it back: that wait lasts as long as the sibling accounts
+            // stay dry, so deferring to it never ended, and the capped session was the one session
+            // on the machine that could not take a fix (2026-08-06, SelfUpdate.swift). The state
+            // rides across the exec instead - `carriedCap` below is what the argv carries. It does
+            // wait for background work the restart would kill, up to `selfUpdateBackgroundHoldLimit`.
+            let childAge = Date().timeIntervalSince(launchedAt)
+            if selfUpdateDue(
+                   captured: supervisorVersion, attempted: selfUpdateAttempted,
+                   isQuiet: reloadQuiet(transcriptQuiet: watcher.isQuiet(followIdleSeconds),
+                                        hasTranscript: watcher.file != nil, childAge: childAge,
+                                        bar: followIdleSeconds,
+                                        keyboardQuiet: keyboard.idle(followIdleSeconds)),
+                   relaunchPlanned: plan != nil || appRelaunch.isArmed,
+                   uptime: childAge, home: account.launchHome,
+                   installed: installedVersion) != nil {
+                let now = Date()
+                let heldBefore = selfUpdateHeldSince
+                selfUpdateHeldSince = nextSelfUpdateHeldSince(current: heldBefore,
+                                                              working: backgroundWorking, now: now)
+                // The raw roster is read only on the ticks that write a line, not on every held one.
+                func logHold(_ event: String, heldSince: Date?) {
+                    let rawRoster = readSessionAgents(pid: supervisorPID)
+                    appendHandoffLine(selfUpdateHoldLine(
+                        pid: supervisorPID, event: event, background: rosterBackgroundCount(roster),
+                        heldSince: heldSince,
+                        roster: selfUpdateRosterState(rawRoster, childStartedAt: launchedAt),
+                        rosterAt: rawRoster?.updatedAt), to: handoffLog)
+                }
+                if heldBefore == nil, let held = selfUpdateHeldSince { logHold("held", heldSince: held) }
+                if !selfUpdateHeldByBackground(working: backgroundWorking,
+                                               heldSince: selfUpdateHeldSince, now: now) {
+                    plan = RelaunchPlan(target: account, reason: "self-update", countsFuse: false)
+                    logHold(backgroundWorking ? "expired" : "released",
+                            heldSince: selfUpdateHeldSince ?? heldBefore)
+                }
+            }
+
+            // `usagebar reload`: adopt a pending request, or note that it is waiting for this session
+            // to go idle. The whole rule, and why it comes last, lives in Reload.swift.
+            // `repick`: a reload restart is a free ride off a nearly-dry account, so it offers the
+            // same move the block above would make later. Asked lazily, inside the branch that
+            // actually restarts, because answering takes this account's one claim for the drought.
+            // UNLESS THE ACCOUNT IS SPENT, where the rebalance asks for no claim at all and this
+            // ride inherits that for free, through the shared `rebalanceMove` rather than through a
+            // path of its own (Rebalance.swift). That is the 2026-08-20 incident's own shape: a
+            // reload restarted nine sessions while another session held the drought's claim, so
+            // three of them were re-placed onto the very account they were leaving.
+            // `isQuiet: true` is not a bypass: the only caller of this closure is the branch reload
+            // reaches when its OWN idle gate has already said yes.
+            //
+            // `carryable` is read HERE and captured, never inside the closure. `watcher` is passed
+            // inout to the call the closure belongs to, so `watcher.file` read from within it is a
+            // simultaneous access: measured 2026-08-02, that compiles without a word and traps at
+            // runtime ("Simultaneous accesses ... modification requires exclusive access"). The
+            // locate this reads is the tick's own, run unconditionally by `watcher.sawCapHit()` at
+            // the top; reload can locate again inside, so the two can only disagree in the safe
+            // direction (this says no, the session stays, the rebalance moves it later).
+            let carryable = carryableSession(launchArgs: launchArgs,
+                                             sessionLocated: watcher.file != nil)
+            // The fleet-wide request and this session's own `usagebar reload --self`, folded into the
+            // one request the decision below acts on (ReloadSelf.swift). The own one promises the
+            // same account, so while it is pending the restart is not offered to the rebalance.
+            let reload = effectiveReloadRequest(
+                fleet: readReloadRequest(),
+                own: readReloadRequest(from: reloadSelfFile(sessionKey: supervisorPID)),
+                served: reloadEpoch)
+            applyReloadRequest(plan: &plan, epoch: &reloadEpoch, notice: &reloadNotice,
+                               account: account, watcher: &watcher,
+                               childAge: Date().timeIntervalSince(launchedAt),
+                               keyboardIdle: { keyboard.idle($0) },
+                               keyboardBurstAt: keyboard.lastBurstAt,
+                               keyboardStampAt: keyboard.lastStamp,
+                               carryable: reload.carryable(carryable), request: reload.request,
+                               repick: {
+                                   rebalanceMove(provider: provider.id, account: account,
+                                                 primaryModel: effectivePrimary, mode: policy.mode,
+                                                 steering: steering,
+                                                 // NOT THIS CALLER'S GATE TO HOLD, on the same
+                                                 // terms as `isQuiet: true` beside it: the child is
+                                                 // being restarted by the reload whatever this
+                                                 // answers, so the prompt a blocked session is
+                                                 // holding is lost either way. All this closure
+                                                 // decides is WHICH ACCOUNT that restart lands on.
+                                                 blocked: false,
+                                                 // NOR THIS ONE, for the same reason: the restart
+                                                 // is the reload's and it ends whatever is running
+                                                 // whichever account it lands on.
+                                                 agentsWorking: false,
+                                                 isQuiet: true, carryable: carryable,
+                                                 fuseAllows: fuse.allows(),
+                                                 quarantine: quarantine, reserves: reserves)
+                               })
+            // While a reload waits, every stamp the tracker classified and why (KeyboardTrace.swift).
+            if keyboardTrace.record(keyboardSeen, queuedEpoch: reloadNotice.epoch) {
+                keyboardTrace.write(pid: supervisorPID)
+            }
+            // How much context a resume of this conversation would reload, and which conversation
+            // it is, for the surfaces outside this terminal (SessionContext.swift). `axes` is the
+            // reading taken above, beside the board it also feeds.
+            // The conversation this supervisor is watching, from the file the tick just tailed:
+            // the witness that lets a prompt hook tell this session from another one running in
+            // the same directory (SessionContext.swift). Read here rather than remembered, so a
+            // `/clear` or a fork republishes the new transcript with everything else.
+            sessionContext.sync(tokens: watcher.lastContextTokens, accountID: account.id,
+                                pin: manualMoves.sessionPin,
+                                pinScope: sessionPinScope(
+                                    appMode: appPolicy.mode,
+                                    appPinnedAccountID: appPolicy.pinnedAccountID,
+                                    projectAccountID: project.accountID,
+                                    sessionPin: manualMoves.sessionPin),
+                                pinAway: pinAwayAccount(fleetPolicy, sessionPin: manualMoves.sessionPin, on: account.id),
+                                axes: axes,
+                                transcript: watcher.transcriptSessionID, pid: supervisorPID)
+            // AND THE SAME ANSWER FILED BY DIRECTORY, which is what the NEXT launch here reads
+            // instead of guessing which account's private pointer to believe (LaunchResume.swift).
+            // Fed from the same value on the same tick rather than from a reading of its own, so the
+            // record and the publish above cannot come to name different conversations.
+            lastConversation.sync(watcher.transcriptSessionID, cwd: cwd)
+            // Which list this conversation writes, for a supervisor that resumes it after this one
+            // is gone (TaskListPin.swift).
+            taskListRecord.sync(watcher.transcriptSessionID, pin: taskList)
+            // The one thing this session is WAITING to do, for the status line: a deferral must
+            // not be printed onto the terminal the child draws into (PendingNotice.swift).
+            syncPendingNotice(&pendingNotice, pid: supervisorPID,
+                              manualMove: manualMoves.badge, sessionModel: sessionModelState.badge,
+                              reload: reloadNotice.pending,
+                              followDeadEnd: followState.deadEnd, followQueued: followState.queuedNotice,
+                              policy: policy, capReason: pendingCap?.reason)
+            // THE TWO QUESTIONS ASKED BY EVERYTHING THAT WRITES INTO THIS COMPOSER OR RESTARTS THE
+            // CHILD UNDER IT, taken once: two spellings of the same gate are two gates that can
+            // come to disagree about the same instant. `turnOver` is a closure rather than a value
+            // because it reads a file and a transcript tail, and only a tick that has something to
+            // do with the answer has any use for it.
+            let composerIdle = keyboard.idle(sessionInputKeyboardQuietSeconds)
+            let turnOver = { sessionTurnEnded(pid: supervisorPID, watcher: watcher) }
+            // THE THIRD PREVENTIVE MOVER, and the only one that reaches a session which never goes
+            // idle: the turn Claude Code has just reported over is the gap a cross-account move
+            // fits into without cutting anything, which is what the 120s rebalance and the `/clear`
+            // repick can never offer a busy conversation (TurnBoundaryMove.swift owns every gate,
+            // the subagent roster among them). HERE rather than beside the other two because it
+            // needs the blocked reading the board decided one line above; the claim all three share
+            // is kept in the intended order by the one-tick stand-down `turnBoundaryPending` gives
+            // the rebalance up there.
+            applyTurnBoundaryMove(plan: &plan, state: &turnBoundary, event: boundary,
+                                  steering: steering, provider: provider.id, account: account,
+                                  primaryModel: effectivePrimary, mode: policy.mode,
+                                  blocked: board.waitingOnPerson, keyboardIdle: composerIdle,
+                                  draftSuspected: draftSuspected, carryable: carryable,
+                                  fuseAllows: fuse.allows(),
+                                  agents: { turnBoundaryAgents(roster, boundary: $0, now: $1) },
+                                  turnEnded: turnOver(),
+                                  toolCallOpen: turnBoundaryToolCallOpen(watcher.file),
+                                  forecast: {
+                                      burnCache.forecast($0, primaryModel: effectivePrimary,
+                                                         reserves: reserves, now: tickNow)
+                                  },
+                                  sessionsOnCurrent: { liveSessionCount(onAccount: account.id) },
+                                  log: handoffLog,
+                                  quarantine: quarantine, reserves: reserves)
+            // AND THE ONE LINE A DROUGHT NOBODY COULD MOVE THIS SESSION OUT OF LEAVES BEHIND
+            // (DroughtWatch.swift): once per window cycle, naming the gates that refused. HERE
+            // because this is the first point in the tick where every gate all three movers hold
+            // has been decided, and it stands down when a relaunch IS planned - that tick moved the
+            // session, and the handoff log records the move itself.
+            applyDroughtAudit(&drought, relaunchPlanned: plan != nil, account: account.label,
+                              sessionID: watcher.transcriptSessionID, pid: supervisorPID, cwd: cwd,
+                              steering: steering, mode: policy.mode,
+                              blocked: board.waitingOnPerson, agentsWorking: agentsWorking,
+                              isQuiet: watcher.isQuiet(followIdleSeconds)
+                                  && keyboard.idle(followIdleSeconds, now: tickNow),
+                              draftSuspected: draftSuspected,
+                              burstAt: keyboard.lastBurstAt, carryable: carryable,
+                              fuseAllows: fuse.allows(), now: tickNow, log: handoffLog)
+            // `usagebar session send`: type a pending request into this terminal, if the reading just
+            // taken allows it. THE READING RATHER THAN THE WORD, because this is the one consumer
+            // for which "working" is two different answers: a conversation mid-turn is not typed
+            // into, one whose dispatched agents are writing is (SessionQuiet.swift argues it).
+            // NOT a relaunch reason - it plans nothing, terminates nothing, and
+            // is gated on this tick's own reading rather than on the published file
+            // (SessionInput.swift owns every rule, the stall it costs included). It is told whether
+            // this tick is ABOUT to terminate the child, which is a fact only the loop holds and the
+            // state cannot show: an idle session with a plan against it is the very case where
+            // typing would be lost and reported as delivered.
+            // The tick's last look, and the one answer both readers below need: a PLANNED relaunch
+            // is not a relaunch, because the fork hold can stand it down and leave this child
+            // running (StandDown.swift carries the whole reasoning, the regression included).
+            var replacingChild = relaunchIsHappening(plan: plan, watcher: &watcher)
+            // THE USER'S PRE-SPAWN CHECK belongs to that same answer (StandDown.swift,
+            // `preSpawnAdmits`), against the home the plan moves TO and before anything reads it: a
+            // rejection hands the plan back now and the tick goes on as one with nothing planned,
+            // so the child keeps the session and its readers keep typing into it.
+            if replacingChild, let planned = plan,
+               !preSpawnAdmits(planned, provider: provider, from: account, hold: &preSpawnHold,
+                               pid: supervisorPID) {
+                committed.restore(reloadEpoch: &reloadEpoch, reloadNotice: &reloadNotice,
+                                  followState: &followState, fallbackApplied: &fallbackApplied)
+                plan = nil
+                replacingChild = false
+            }
+            // What it TYPED arms the window repick above: a `/clear` that reached the composer is
+            // this session's window closing, and the next tick asks Claude Code itself whether it
+            // really did (WindowRepick.swift).
+            // And whether Claude Code has SAID this turn is over, which is the difference between
+            // typing at the end of a turn and typing 30 seconds after it (SessionTurnEnd.swift):
+            // both readings are `composerIdle` and `turnOver`, taken above the mover that needs
+            // them first.
+            // And, for a `usagebar session clear` only, the account question a window about to be
+            // emptied makes free: the repick's own decision, asked at the landing rather than after
+            // it (SessionClear.swift). A plain send never reaches it.
+            let action = applySessionInput(
+                &sessionInput, session: board.state, quiet: board.quiet, turnEnded: turnOver,
+                keyboardIdle: composerIdle, relaunchPlanned: replacingChild,
+                // A dialog KNOWN open (the registry included) is typed into key by key, never stashed;
+                // this line may answer it, so it is not handed the automatic writers' hold.
+                draftSuspected: draftSuspected, waitingOnPerson: board.dialogOpen, seen: board.seen,
+                // …and a line sent `--composer-only` is refused on a dialog that MAY be open, an
+                // unreadable registry included: its caller asked never to answer one.
+                composerOnlyDialog: board.dialogPossible,
+                clearBoundary: {
+                    guard let target = windowRepickMove(provider: provider.id, account: account,
+                                                        primaryModel: effectivePrimary,
+                                                        mode: policy.mode, steering: steering,
+                                                        carryable: carryable,
+                                                        fuseAllows: fuse.allows(),
+                                                        quarantine: quarantine, reserves: reserves)
+                    else { return nil }
+                    // Asked BEFORE the caller is told its window moved: a move the pre-spawn check
+                    // refuses clears on this account instead (StandDown.swift, `preSpawnAdmits`).
+                    let move = RelaunchPlan(target: target, reason: clearBoundaryReason,
+                                            countsFuse: true, fresh: true)
+                    return preSpawnAdmits(move, provider: provider, from: account,
+                                          hold: &preSpawnHold, pid: supervisorPID) ? target : nil
+                },
+                reopen: { clearReopenTarget(current: provider.id, cwd: cwd, spendReserve: spendReserve) })
+            // A reopen as the project's default provider ends this supervisor: the child goes now,
+            // the shared teardown below runs, and then this process execs `usagebar <provider>`.
+            if let next = action.reopenAs {
+                endChildTree(&child, sweepDetached: false)   // a clear keeps detached jobs
+                reopenAs = next
+                return .childReplaced
+            }
+            // `action.repick` RATHER THAN `action.typed`, which is not a rename: the repick is a
+            // relaunch, and a session that may be holding an unsent draft is not restarted away from
+            // it - the rule `sessionClearMovesAccounts` states about the synchronous move, applied
+            // to the one that happens a minute later. Its three answers include CANCELLING an arm an
+            // earlier clear left, which is the half that "do not arm" could not say
+            // (SessionInputTick.swift, `SessionInputRepick`).
+            windowRepick.apply(action.repick, transcript: watcher.transcriptSessionID)
+            // What this tick typed is also what the NEXT tick's draft reading has to discount: the
+            // child reads those bytes off the terminal and stamps it doing so, and a supervisor that
+            // read its own footprints as somebody's draft would paste a stale kill buffer into their
+            // composer (SessionInputDraft.swift states the case).
+            if action.typed != nil { lastComposerWrite = Date() }
+            // A move decided at the landing becomes THIS tick's relaunch, built next door so the
+            // rule and its sentence live with the verb (SessionClear.swift). `plan` is nil by
+            // construction here: the gate that answered the request refuses every tick that has one
+            // (`relaunchPlanned`).
+            if let moved = clearBoundaryPlan(action.moveTo, from: account,
+                                             primaryModel: effectivePrimary) {
+                plan = moved
+                // AND THE TICK'S OWN ANSWER MOVES WITH IT. `replacingChild` was taken before this
+                // decision existed, when nothing was planned, and both the execution block below
+                // and the knock beside it branch on it: left at false, the block would read this
+                // plan as one an unresolved fork had stood down, restore, log a hold that is not
+                // there and `continue` - having already told the caller its window was moved.
+                // A stand-down cannot apply to this plan in any case: what stands one down is an
+                // unresolved fork, and a session with one never reaches this landing (that reading
+                // is `busy`, so the gate holds the line as the session's own turn).
+                replacingChild = true
+            }
+            // AND THE LINE THAT ANSWERS A 5-HOUR WALL WITHOUT LEAVING THE ACCOUNT
+            // (CapLimitReset.swift): the hold decided up beside the handoff kept this tick's move
+            // standing down for it, and this is where the command is actually typed - beside the
+            // other writers, under the gates they all hold. FIRST of the four that nobody asked
+            // for, which is the priority it earns: the other three tell the conversation something,
+            // this one stops it being restarted onto another account.
+            let resetTyped = applyCapLimitReset(
+                &capLimitReset, pendingCap: pendingCap, pid: supervisorPID,
+                accountLabel: account.label, holding: limitResetHolds,
+                // A reserve hold spends this composer's turn for every writer below: nothing UsageBar
+                // types may land on an account under its owner's line with nowhere to go.
+                typedAlready: action.typed != nil || reserveHeld, session: board.state,
+                quiet: board.quiet,
+                turnEnded: turnOver, keyboardIdle: composerIdle,
+                relaunchPlanned: replacingChild, draftSuspected: draftSuspected,
+                waitingOnPerson: board.dialogPossible, seen: board.seen)
+            // On the same terms as the writers around it: what this tick typed is what the next
+            // tick's draft reading has to discount.
+            if resetTyped != nil { lastComposerWrite = Date() }
+            // AND THE LINE THAT PICKS UP WHERE A WALL CUT THIS CONVERSATION OFF (CapResume.swift):
+            // a cap handoff has moved it and the work that 429 interrupted is sitting in the
+            // resumed window with nobody to ask for it. Same door and the same gates as the two
+            // writers either side of it, plus one of its own - a session waiting on a person is not
+            // typed at.
+            // BETWEEN THE TWO, which is the priority these three composer writers have: a line
+            // somebody ASKED for outranks it, and it outranks news about an account, because work
+            // this session lost is the more urgent of the two things nobody asked for.
+            let resumed = applyCapResume(&capResume, pid: supervisorPID,
+                                         typedAlready: action.typed != nil || resetTyped != nil
+                                             || reserveHeld,
+                                         session: board.state,
+                                         quiet: board.quiet, turnEnded: turnOver,
+                                         keyboardIdle: composerIdle,
+                                         relaunchPlanned: replacingChild,
+                                         draftSuspected: draftSuspected,
+                                         waitingOnPerson: board.dialogPossible, seen: board.seen,
+                                         // Whether that reading covers the whole file yet: a
+                                         // prompt past a bounded catch-up is not in it.
+                                         caughtUp: watcher.caughtUp,
+                                         userTurnAt: watcher.lastUserTurnAt,
+                                         // WHICH conversation is in this window right now, which is
+                                         // what says the offer still belongs to it: a relaunch that
+                                         // started a different one leaves the offer standing, and
+                                         // only this reading can tell (CapResume.swift).
+                                         conversation: watcher.transcriptSessionID)
+            // On the same terms as the two beside it: what this tick typed is what the next tick's
+            // draft reading has to discount.
+            if resumed != nil { lastComposerWrite = Date() }
+            // AND THE LINE THAT WAKES A SESSION WHOSE BACKGROUND WORK A RESTART KILLED
+            // (RestartWake.swift): after the cap resume, which already wakes a child it owns.
+            let stopped = watcher.lastStoppedTasks
+            let woke = applyRestartWake(
+                &restartWake, pid: supervisorPID,
+                candidate: restartWakeOffer(
+                    state: restartWake, spawnedByUsageBar: spawnedByUsageBar,
+                    resumesConversation: resumesConversation, note: childNote,
+                    launchedAt: launchedAt, notice: stopped,
+                    answeredAt: watcher.lastMainChainEventAt, userTurnAt: watcher.lastUserTurnAt,
+                    conversation: watcher.transcriptSessionID, caughtUp: watcher.caughtUp,
+                    capOwnsChild: capResume.isArmed
+                        || capResume.nudgedAt.map { $0 >= launchedAt } == true,
+                    now: tickNow),
+                source: stopped == nil ? "roster" : "notice", launchedAt: launchedAt,
+                noticeUUID: stopped?.uuid, answeredAt: watcher.lastMainChainEventAt,
+                typedAlready: action.typed != nil || resetTyped != nil || resumed != nil
+                    || reserveHeld,
+                session: board.state, quiet: board.quiet, turnEnded: turnOver,
+                keyboardIdle: composerIdle, relaunchPlanned: replacingChild,
+                draftSuspected: draftSuspected, waitingOnPerson: board.dialogPossible,
+                seen: board.seen, caughtUp: watcher.caughtUp,
+                userTurnAt: watcher.lastUserTurnAt, conversation: watcher.transcriptSessionID)
+            if woke != nil { lastComposerWrite = Date() }
+            // AND THE ONE LINE NOBODY ASKED FOR: the account under this session is running out, and
+            // the movers above cannot help a session that is busy (QuotaKnock.swift). Same door and
+            // the same gates, after the request station rather than beside it - a tick that has just
+            // typed somebody's line has spent this composer's turn, and so has one that has just
+            // typed the resume above.
+            let knocked = applyQuotaKnock(&quotaKnock, pid: supervisorPID, provider: provider.id,
+                                          account: account, primaryModel: effectivePrimary,
+                                          typedAlready: action.typed != nil || resumed != nil
+                                              || resetTyped != nil || woke != nil || reserveHeld,
+                                          session: board.state,
+                                          quiet: board.quiet,
+                                          turnEnded: turnOver, keyboardIdle: composerIdle,
+                                          relaunchPlanned: replacingChild,
+                                          draftSuspected: draftSuspected,
+                                          waitingOnPerson: board.dialogPossible, seen: board.seen,
+                                          quarantine: quarantine,
+                                          reserves: reserves,
+                                          // The reading taken when THIS child was launched, not one
+                                          // taken now: a settings.json edited since says nothing
+                                          // about the hooks the running process holds.
+                                          filing: { quotaKnockFiling })
+            // The third writer into this composer, recorded on the same terms as the two above it:
+            // what makes the next tick's draft reading right is that EVERY one of them says when it
+            // typed, since a supervisor that read its own footprints as somebody's draft would
+            // decline the preventive move for the rest of that session's life.
+            if knocked != nil { lastComposerWrite = Date() }
+            // AND THE ONE LINE THAT IS NOT ABOUT THIS SESSION AT ALL: the machine underneath it is
+            // out of memory or out of cores, which the app sampled and published and nothing else
+            // here can see (HostHealthKnock.swift). Last of the four writers into this composer,
+            // which is the priority it earns: it is the least urgent thing nobody asked for, and a
+            // tick that has already typed has spent this terminal's turn, so it waits for the next
+            // one. Against a one-minute sample that delay is nothing.
+            let hostKnocked = applyHostHealthKnock(
+                &hostHealthKnock, pid: supervisorPID,
+                typedAlready: action.typed != nil || resumed != nil || knocked != nil
+                    || resetTyped != nil || woke != nil || reserveHeld,
+                session: board.state, quiet: board.quiet, turnEnded: turnOver,
+                keyboardIdle: composerIdle, relaunchPlanned: replacingChild,
+                draftSuspected: draftSuspected, waitingOnPerson: board.dialogPossible,
+                seen: board.seen,
+                // The reading taken when THIS child was launched, for the reason the knock beside
+                // it states: a settings.json edited since says nothing about the hooks the running
+                // process holds.
+                filing: { quotaKnockFiling })
+            // Recorded on the same terms as the three above it: every writer into this composer has
+            // to say when it typed, or the next tick's draft reading treats its own footprints as
+            // somebody's half-written prompt.
+            if hostKnocked != nil { lastComposerWrite = Date() }
+
+            // Execute the tick's one relaunch: terminate the child once, then apply any
+            // model/effort/extra flags this plan carries on top of the resumed args. A pending app
+            // update rides along on THIS restart instead of waiting for an idle moment that only
+            // starts counting again after it (a cap handoff at 06:34 and the self-update it
+            // deferred at 06:36, session c80ebeb2, 2026-07-26). Decided before anything is
+            // terminated, and against the account the plan moves TO, so the new build resumes the
+            // conversation where this handoff is about to put it rather than on the old account.
+            if let plan {
+                if !replacingChild {
+                    // Hand back what planning committed, so the next tick plans it again rather
+                    // than believing it is already done (StandDown.swift).
+                    committed.restore(reloadEpoch: &reloadEpoch, reloadNotice: &reloadNotice,
+                                      followState: &followState, fallbackApplied: &fallbackApplied)
+                    if !unresolvedHoldWarned {
+                        // To the log, never the terminal: this tick relaunches NOTHING (it
+                        // `continue`s), so the child is drawing over whatever is written here
+                        // (PendingNotice.swift states the rule).
+                        appendHandoffLine(unresolvedForkHoldLine(pid: supervisorPID, cwd: cwd),
+                                          to: handoffLog)
+                        unresolvedHoldWarned = true
+                    }
+                    return .keepPolling   // the child keeps running; the next tick decides afresh
+                }
+                // Past the hold, so this relaunch is happening: the safeguard restore's record can
+                // be written now, before the child goes, which is what the supervisor behind the
+                // relaunch reads to know the event was corrected (SafeguardDrift.swift).
+                safeguardRecord?.commit()
+                switchRecord?.commit(&manualMoves)
+                modelRecord?.commit(&sessionModelState)
+                carriedCap = capCarriedAcrossRelaunch(pendingCap, reason: plan.reason)
+                let upgrade = appRelaunch.isArmed ? nil : selfUpdateFold(
+                    captured: supervisorVersion, attempted: selfUpdateAttempted,
+                    home: plan.target.launchHome, installed: installedVersion)
+                // Read before the move, because the sentence one line down names it: which account
+                // this conversation is LEAVING is the half of that news that explains why its turn
+                // died, and after the handoff there is nothing left holding it.
+                let leaving = account
+                performHandoff(to: plan.target, reason: plan.reason, countingFuse: plan.countsFuse,
+                               fresh: plan.fresh)
+                // Whether the child just ended had work this restart took (RestartWake.swift), read
+                // once for both the cap resume below and the restart note.
+                let owedReading = restartOwed(roster: roster,
+                                              ranTurn: watcher.lastMainChainEventAt != nil,
+                                              caughtUp: watcher.caughtUp,
+                                              live: watcher.liveWork, now: Date())
+                appendHandoffLine(restartOwedLine(pid: supervisorPID, reason: plan.reason,
+                                                  reading: owedReading), to: handoffLog)
+                // AND WHETHER THE NEXT CHILD IS OWED A LINE ASKING IT TO CARRY ON (CapResume.swift
+                // owns every gate): a cap handoff whose wall cut a turn short leaves work sitting in
+                // a conversation nobody is going to resume by itself. Raised HERE rather than at the
+                // plan, because `performHandoff` has just relocated the transcript with a forced
+                // fork check, so this is the first point in the tick where the id being resumed is
+                // the one the conversation is really in. It only ever RAISES an arm; whether that
+                // line is ever typed is decided tick by tick against the child that follows.
+                // `plan.fresh || secondHead`, on the same terms the publish below reads them: an
+                // empty window or a fork is a different conversation, and an offer to carry on
+                // with work the wall interrupted belongs to the one that holds it.
+                let personTurn = lastPersonTurn(watcher.recentUserTurns,
+                                                automatic: automaticInputLedger)
+                armCapResume(&capResume, pid: supervisorPID, reason: plan.reason,
+                             fresh: plan.fresh || secondHead,
+                             cappedAt: pendingCap?.cappedAt,
+                             answeredAt: watcher.lastMainChainEventAt,
+                             conversation: watcher.transcriptSessionID,
+                             from: leaving, to: plan.target,
+                             personTurnAt: personTurn,
+                             // The old child's reading covers its whole transcript, or no arm.
+                             caughtUp: watcher.caughtUp, owed: owedReading.owed)
+                // AND THE SAME OFFER FOR A MOVE THIS CONVERSATION ASKED FOR ITSELF: a `usagebar
+                // account` its own agent ran mid-work leaves that work sitting in the resumed window
+                // exactly as a wall does (SelfSwitchResume.swift decides which moves those are).
+                armSwitchResume(&capResume, pid: supervisorPID, reason: plan.reason,
+                                fresh: plan.fresh || secondHead, served: switchRecord,
+                                tail: { watcher.file.flatMap {
+                                    transcriptTail(of: $0, bytes: selfSwitchTailBytes)
+                                } },
+                                conversation: watcher.transcriptSessionID,
+                                from: leaving, to: plan.target,
+                                userTurnAt: watcher.lastUserTurnAt, personTurnAt: personTurn,
+                                caughtUp: watcher.caughtUp)
+                // AND WHAT THE NEXT CHILD NEEDS TO WAKE ITSELF IF THIS KILLED BACKGROUND WORK
+                // (RestartWake.swift): the reason, the roster's count, and whether it is owed.
+                restartNote = restartNoteForHandoff(reason: plan.reason,
+                                                    fresh: plan.fresh || secondHead, roster: roster,
+                                                    owed: owedReading.owed)
+                // B-1091: a relaunch naming no pair of its own runs what this directory and the
+                // app declare NOW (FollowAdoption.swift), so it is the only restart that lands it.
+                var plan = plan
+                foldEffectiveFollow(&plan, state: &followState, project: &project,
+                                    following: follow.gated(by: !sessionModelState.isPinned),
+                                    providerID: provider.id, launchArgs: launchArgs)
+                launchArgs = planLaunchArgs(launchArgs, plan: plan,
+                                            sessionPin: sessionModelState.pin)
+                // Republish the account this conversation now runs on, and the pair the next child
+                // will run, rather than leaving either to a later tick that reads a token figure: a
+                // `usagebar switch` or a `usagebar model` from a shell outside this session has only that
+                // file to go on (SessionContext.swift). AFTER the args are rewritten above, because
+                // what it publishes is what the child about to be spawned actually runs - before
+                // it, this would republish the pair the session is leaving.
+                // No observation to carry across: the child that produced the old one is gone, and
+                // the one about to start has served nothing. Publishing the dead child's reading
+                // here would name a model this session is provably no longer on - the same mistake
+                // one restart later.
+                //
+                // A FRESH RELAUNCH HAS NOTHING TO REPUBLISH, because what it starts is a different
+                // conversation: the reading is retired here rather than moved. The watcher standing
+                // beside this line still holds the id and the size of the window that was just
+                // closed, so republishing them under the new account attributes a dead conversation
+                // to it - a context the panel paints for a window nobody is in, and an id every hook
+                // matches its events against, dropping the new conversation's notifications, its
+                // agent roll call and its turn-end fact for as long as it stands (HookNotify.swift,
+                // HookAgents.swift). Nothing corrects it soon either: the next child's watcher starts
+                // with no token reading at all, and `sync` publishes nothing until that conversation
+                // writes its first turn with usage in it (codex review of a599a06).
+                // A FORK IS A FRESH WINDOW BY EVERY MEASURE THIS PUBLISH TAKES (a new id), which is
+                // why it is read here rather than only where it was decided: what the watcher still
+                // holds is the id and the size of a conversation this session is no longer in, and
+                // republishing them under the new account is what makes every hook match its events
+                // against a window nobody is in (the paragraph below states the whole cost).
+                if plan.fresh || secondHead {
+                    sessionContext.conversationEnded(pid: supervisorPID)
+                } else {
+                    let nextAxes = publishedSessionAxes(pin: sessionModelState.pin,
+                                                        launchArgs: launchArgs, observed: nil)
+                    sessionContext.accountChanged(to: account.id, pin: manualMoves.sessionPin,
+                                                  pinScope: sessionPinScope(
+                                                      appMode: appPolicy.mode,
+                                                      appPinnedAccountID: appPolicy.pinnedAccountID,
+                                                      projectAccountID: project.accountID,
+                                                      sessionPin: manualMoves.sessionPin),
+                                                  pinAway: pinAwayAccount(fleetPolicy, sessionPin: manualMoves.sessionPin, on: account.id),
+                                                  axes: nextAxes,
+                                                  transcript: watcher.transcriptSessionID,
+                                                  pid: supervisorPID)
+                }
+                // THE ACCOUNT SIDECAR MOVES IN THE SAME BREATH, so the two documents naming this
+                // session's account can never describe different moments. Left to the spawn below,
+                // it would name the account the session has just left for the whole tear-down; and
+                // the reading beside it cannot be relied on to lead instead, because a publish that
+                // fails is silent while the writer's in-memory copy moves on regardless - after
+                // which the delta suppresses the retry and the file keeps the old account for as
+                // long as the session idles (codex review of ff5b2a0). Written here rather than
+                // only at the spawn, so neither document has to be the fresher one.
+                writeSupervisorAccount(account.id, pid: supervisorPID)
+                // Last, so an exec that fails falls through to the respawn below with this plan
+                // fully applied: a failed upgrade can cost the new build, never the account switch.
+                execPlannedSelfUpdate(upgrade, attempted: &selfUpdateAttempted, target: plan.target,
+                                      follow: follow, recoveries: fuse.carried(),
+                                      sessionPin: manualMoves.sessionPin,
+                                      pinOverride: manualMoves.overriddenPin,
+                                      pendingCap: carriedCap,
+                                      sessionModel: sessionModelState.pin,
+                                      lastConversation: lastConversation.published,
+                                      capResume: capResume, taskList: taskList,
+                                      restartNote: restartNote, spendReserve: spendReserve,
+                                      args: launchArgs)
+                return .childReplaced
+            }
+            maybeSpawnEventDeliverer(now: Date(), last: &lastDeliverySpawn)
+            return .keepPolling
+        }
+
+        child.poll()
+        while child.isRunning {
+            usleep(2_000_000)
+            child.poll()
+            guard child.isRunning else { break }
+            if forwardSupervisorTermination(to: child) { break }   // SupervisorTermination.swift
+            // The pool the whole tick runs in, and the one line this loop exists to hold: what it
+            // reclaims is every Foundation temporary the tick made, which had nowhere else to go.
+            if autoreleasepool(invoking: tick) == .childReplaced { break }
+        }
+
+        // A hand-off relaunches; a signalled supervisor takes the exit path instead.
+        if handoff, supervisorTerminationSignal == 0 { continue }
+        let status = child.wait()   // no relaunch pending: the child exited on its own, so do we
+        removeSupervisorState(pid: supervisorPID)
+        clearPendingNotice(pid: supervisorPID)
+        clearSessionContext(pid: supervisorPID)
+        clearSessionState(pid: supervisorPID)
+        clearUserNotice(pid: supervisorPID)
+        // A SESSION ENDING IS A STATE CHANGE, and the one nothing else can announce. Every other
+        // knock is posted by the writer when it publishes; this session publishes nothing more, so
+        // without this the board hears nothing until some OTHER supervisor happens to move. For a
+        // session that was BLOCKED that is not a stale row, it is a red dot in the menu bar for a
+        // conversation that no longer exists, standing until an unrelated session changes state.
+        for event in sessionWaits.finish(now: Date(), reason: supervisorEndReason(status)) { appendSessionWaitEvent(event) }
+        maybeSpawnEventDeliverer(now: Date(), last: &lastDeliverySpawn, force: true)
+        postSessionStateChanged(pid: supervisorPID)
+        if let reopenAs {
+            drainTerminalInput()   // what the dead child left queued is not the new window's
+            execProviderReopen(reopenAs, current: provider.id, spendReserve: spendReserve)
+        }
+        exit(supervisorExitCode(childStatus: status))
+    }
+}

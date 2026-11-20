@@ -1,0 +1,474 @@
+import Foundation
+
+// Which account a launch, a follow adoption, a cap handoff or a prediction lands on: the burn-rate
+// scoring and every pick built on it, split out of Snapshot.swift for file size. The snapshot model
+// and the launch plumbing stay there; nothing here reads a file or touches the environment.
+//
+// Every pick below is the same number read differently: `smartScore`, the rate of the account's
+// tightest window. They differ only in the field they start from, the gate they apply to it, and
+// how hard a challenger has to push to take the lead.
+//
+// EVERY PICK ALSO TAKES `reserves`, which is how much of each account its owner keeps for their own
+// use (AccountReserve.swift). A call site that passes the fleet's reserves is saying "UsageBar chose
+// this"; one that passes `.none` is saying "a person named this account", and there is no third
+// answer - so the parameter is the audit trail for the one rule the feature has.
+
+/// Proven headroom: the tightest of the windows the account actually reports. Any window at 0
+/// means the account is capped right now regardless of the others. The flagship window only
+/// binds when the declared primary model IS that tier: a sonnet primary does not drain the fable
+/// window, so a fable window at 0 must not report the account as capped (same rule as
+/// `ratedWindows`, which the score already follows - eligibility was the one place still counting
+/// the flagship window unconditionally). No declared primary keeps it flagship-first, the app's
+/// display philosophy, and matches the historical behavior for callers that pass nil.
+func headroom(_ account: Snapshot.Account, primaryModel: String? = nil) -> Double {
+    var windows = [account.sessionRemaining, account.weeklyRemaining].compactMap { $0 }
+    let windowModel = account.modelWindowName?.lowercased()
+    let primary = primaryModel?.lowercased()
+    let modelWindowCounts = primary == nil || windowModel == nil
+        || windowModel!.contains(primary!) || primary!.contains(windowModel!)
+    if modelWindowCounts, let model = account.modelRemaining { windows.append(model) }
+    return windows.min() ?? -1
+}
+
+/// Whether an account can be launched or moved onto AT ALL. Deliberately reserve-blind: what a
+/// reserve says is "spend somewhere else if you can", not "this account does not exist", and the
+/// difference is the whole of how `usagebar claude` still starts when the fleet is under water
+/// (`best`). The reserve is applied by the gate one step later.
+///
+/// `lastRefreshFailed` joins the badge and the error here for the reason `accountIsSpent` gives
+/// about its own copy of the test: a failed poll republishes the last good numbers, so a row held
+/// over from before the failure is spelled exactly like one fetched a moment ago, and every reading
+/// built on it - eligible, comfortable, spent - is a judgement about a moment that has passed. nil
+/// (a snapshot from an app that predates the flag) is "cannot tell" and keeps the account, which is
+/// what the badge and the error are still here for.
+func eligible(_ account: Snapshot.Account, primaryModel: String? = nil) -> Bool {
+    account.launchHome != nil && account.error == nil && !account.isStale
+        && account.lastRefreshFailed != true
+        && headroom(account, primaryModel: primaryModel) > 0
+}
+
+/// What a hand-written name resolved to.
+///
+/// Three answers, because `nil` used to carry two of them and they are opposite instructions to the
+/// person who just typed the name: "there is no such account" sends them to `usagebar status`, while
+/// "several answer to that" means type more of one. Collapsing them into one silence left every
+/// caller saying the first sentence for both.
+enum AccountMatch: Equatable {
+    /// Exactly one account answers to the name.
+    case one(Snapshot.Account)
+    /// Nothing does.
+    case none
+    /// Several do, in the order the snapshot lists them. Never acted on: acting on the first of
+    /// these is the failure this type exists to make impossible.
+    case several([Snapshot.Account])
+}
+
+/// The account a hand-written NAME picks out. Only launchable accounts are candidates - naming a
+/// signed-out one is not a way to launch it.
+///
+/// THREE STAGES, most exact first, and the order is the whole point:
+///
+///   1. an EXACT hit on either name (the label, case-insensitively, or the config-dir name), when
+///      exactly one account has one
+///   2. a substring of either name, when exactly one account contains it
+///   3. anything else that hit: refuse, and hand back the candidates
+///
+/// The two names share one stage rather than being tried in turn, and that is not a tidy-up. A label
+/// is free text the user can edit, so account A's label can be exactly account B's directory name -
+/// and then a label-first order answers A for an input that points just as exactly at B. Trying them
+/// together makes that what it is: one input, two exact readings, no answer.
+///
+/// It used to be stage 3 alone, answering with the FIRST hit, which is wrong on the fleet this repo
+/// is written for. Accounts labelled "Claude", "Claude 2", "Claude 3", "Claude 4" all contain
+/// "Claude", so typing the full, exact, unambiguous name of the first one resolved to whichever of
+/// the four the snapshot happened to list first: `usagebar switch Claude` moved the session to
+/// "Claude 2" and reported success. Substring matching is still the convenience it was added to be
+/// (`--account claude2` finds "Claude 2" and `~/.claude2`); it is now the LAST thing tried rather
+/// than the only thing, and it no longer guesses when it is ambiguous.
+///
+/// REFUSING IS THE SAFE SIDE HERE, which is worth stating because it usually is not. This matcher
+/// serves exactly one moment: a person has just typed a name and is waiting. The alternative to
+/// refusing is silently acting on an account they did not name - a live conversation moved, or a
+/// project pinned, somewhere else - and unlike a refusal, that failure is invisible until much
+/// later. Nothing else comes through here: a project profile stores the RESOLVED id
+/// (ProjectPolicy.swift), so a launch carrying an existing pin never re-runs this.
+///
+/// One matcher for `usagebar claude --account`, `usagebar switch` and `usagebar project set --account`,
+/// because the last stores what the first would have launched: a name that resolves one way when it
+/// is written down and another way when it is used is a pin that lands somewhere nobody asked for.
+func accountMatching(_ name: String, provider: String, in snapshot: Snapshot?) -> AccountMatch {
+    let query = name.lowercased()
+    // The config-dir name is derived once per account: every stage below reads it.
+    let candidates = (snapshot?.accounts ?? []).compactMap {
+        account -> (account: Snapshot.Account, dir: String)? in
+        guard account.provider == provider, let home = account.launchHome else { return nil }
+        return (account, URL(fileURLWithPath: home).lastPathComponent.lowercased())
+    }
+    // Uniqueness is required even of an exact hit, and it is required ACROSS both names. Two
+    // accounts carrying the same label are indistinguishable by it; an account whose label is
+    // another's directory name is exactly as indistinguishable, in a way no ordering can break -
+    // whichever name is tried first wins, and both readings were exact. Filtering over the
+    // per-account rows above is also what deduplicates: an account matching on both of its own
+    // names is still one candidate, not two.
+    let exact = candidates.filter { $0.account.label.lowercased() == query || $0.dir == query }
+    if exact.count == 1 { return .one(exact[0].account) }
+    let hits = candidates.filter {
+        $0.account.label.lowercased().contains(query) || $0.dir.contains(query)
+    }
+    if hits.count == 1 { return .one(hits[0].account) }
+    return hits.isEmpty ? .none : .several(hits.map(\.account))
+}
+
+/// How every surface names the accounts an ambiguous query hit: the label, with the config-dir name
+/// beside it.
+///
+/// Both, for two reasons. The label alone cannot always tell them apart - two accounts may carry the
+/// same one, and the directory is then the only name that resolves - and both are things the matcher
+/// accepts, so the list doubles as the set of answers to retype.
+func accountMatchCandidates(_ accounts: [Snapshot.Account]) -> String {
+    accounts.map { account in
+        guard let home = account.launchHome else { return account.label }
+        return "\(account.label) (\(URL(fileURLWithPath: home).lastPathComponent))"
+    }.joined(separator: ", ")
+}
+
+/// The whole sentence a `.several` becomes, so the three surfaces that resolve a typed name cannot
+/// describe the same refusal differently - which they had already started to do within one change.
+/// Each still adds its own tail (`; nothing was changed` for a write, a note for the switch), which
+/// is the part that really is per-surface; the count, the candidates and the instruction are not.
+func accountMatchAmbiguity(_ name: String, provider: String,
+                           candidates: [Snapshot.Account]) -> String {
+    "\"\(name)\" matches \(candidates.count) \(provider) accounts "
+        + "(\(accountMatchCandidates(candidates))) - name one of them exactly"
+}
+
+// MARK: The manual pin, resolved
+
+/// Whether UsageBar KNOWS the pinned account's login is gone: the snapshot LISTS that account and
+/// gives it no launch home, which is the app publishing "this one is dormant" (a signed-out home is
+/// kept out of the launch map on purpose - UsageStore publishes `launchableHome`, not `launchHome`).
+///
+/// Deliberately different from "not in the snapshot at all", which says only that UsageBar has not seen
+/// the account this round: a refresh mid-flight, a provider switched off, an app that has not run
+/// yet. That case keeps the denormalized fallback below; this one must not.
+func pinnedAccountIsSignedOut(_ snapshot: Snapshot?, policy: LaunchPolicy) -> Bool {
+    guard policy.mode == "manual", let pinnedID = policy.pinnedAccountID,
+          let listed = snapshot?.accounts.first(where: { $0.id == pinnedID }) else { return false }
+    return listed.launchHome == nil
+}
+
+/// The home a manual pin launches, or nil when the pin cannot be launched right now (and the caller
+/// should fall through to the headroom pick).
+///
+/// Two sources in order: the pinned account in the snapshot, then the home the app denormalized into
+/// the policy file - the fallback that exists so a pin still works while its account is briefly
+/// missing from the snapshot. That fallback is the one that needed a rule. It asks nothing about the
+/// account, so a pin left behind on an account that later signed OUT kept exec'ing a logged-out
+/// config dir long after the panel stopped offering it (2026-08-03). The app clears the home too
+/// (`LaunchPolicyStore.releasePinnedHome`); both halves, because either alone still leaves a
+/// version of the pair that launches a dormant home.
+///
+/// One function for every surface that resolves a pin - launch, `best-dir`, `launch-dir` and the
+/// status report - so a prediction cannot disagree with what launching does.
+func pinnedLaunchHome(_ snapshot: Snapshot?, policy: LaunchPolicy) -> String? {
+    guard policy.mode == "manual" else { return nil }
+    if let home = snapshot?.accounts.first(where: { $0.id == policy.pinnedAccountID })?.launchHome {
+        return home
+    }
+    return pinnedAccountIsSignedOut(snapshot, policy: policy) ? nil : policy.pinnedHome
+}
+
+/// Whether a pinned row says, on a reading UsageBar may act on, that it has nothing left for this
+/// model: the window `headroom` reads at zero, behind the trust guards `accountIsSpent` applies.
+///
+/// THE COMPLEMENT OF THE BAR THE PIN SWITCH TAKES A SESSION HOME ON (`eligible`: headroom above
+/// zero), which is the reason it exists beside `accountIsSpent` rather than inside it (B-1540).
+/// `accountIsSpent` reads a window minutes from resetting as full (`imminentResetGrace`), so a
+/// release keyed on it alone lapsed up to ten minutes before the pinned account could take the
+/// session back, and in that window nothing could move the session at all. A row with no counted
+/// window (`headroom` answers -1) is evidence of nothing and reads false.
+func pinnedOutOfQuota(_ row: Snapshot.Account, primaryModel: String?) -> Bool {
+    guard row.lastRefreshFailed != true, row.error == nil, !row.isStale else { return false }
+    return headroom(row, primaryModel: primaryModel) == 0
+}
+
+/// The pinned row a NEW launch steps aside from, or nil to launch the pin as it always has (B-1540,
+/// Albert 2026-10-12: a pin is a preference, not the only account a session may run on).
+///
+/// While the account the pin names is out of quota or has just capped for this model, the launch
+/// takes the smart pick instead, and a supervised session is carried home by the pin switch once
+/// that account refills. The pin keeps the launch in four cells: a reading UsageBar cannot trust, an
+/// account under its owner's line (that launch is REFUSED, B-1213, and the refusal has to stay the
+/// answer), no other account the smart pick could land on (stepping aside into nothing launches
+/// bare), and a policy that is not a pin at all.
+func pinStepAsideRow(_ snapshot: Snapshot?, policy: LaunchPolicy, primaryModel: String?,
+                     quarantined: Set<String>, reserves: AccountReserves, spendReserve: Bool,
+                     now: Date = Date()) -> Snapshot.Account? {
+    guard policy.mode == "manual", let snapshot,
+          let row = snapshot.accounts.first(where: {
+              $0.id == policy.pinnedAccountID && $0.launchHome != nil
+          }),
+          pinnedOutOfQuota(row, primaryModel: primaryModel) || quarantined.contains(row.id),
+          spendReserve || aboveReserve(row, primaryModel: primaryModel, reserves: reserves, now: now)
+    else { return nil }
+    guard best(providerID: row.provider, in: snapshot, primaryModel: primaryModel,
+               excluding: quarantined.union([row.id]),
+               reserves: spendReserve ? .none : reserves, now: now) != nil else { return nil }
+    return row
+}
+
+/// What a launch that stepped aside says, on every surface that launches (`usagebar claude`'s stderr,
+/// the shim's script).
+func pinStepAsideNotice(_ row: Snapshot.Account, pinnedBy: String) -> String {
+    "\(row.label) is out of quota - launching on Smart until it refills (\(pinnedBy))"
+}
+
+/// One usage window with its sustainable burn rate: how much quota per hour it can spend until
+/// it refreshes. A window about to reset stops being a constraint (its rate soars, and its
+/// leftover quota would evaporate unused) - the "burn the dying quota first" intuition; a window
+/// with days to go binds hard.
+///
+/// A MISSING RESET TIME IS READ IN ONE OF TWO WAYS, and which one applies turns on whether the
+/// window has been spent at all. The provider assigns each account a FIXED weekly reset moment that
+/// does not move with use (support.claude.com, "What is the Max plan"), but it only publishes that
+/// moment once usage opens the window: an account that has never run a request reports 100% and a
+/// null reset on every window it has (measured 2026-08-19). So, after a reported reset and the
+/// borrowed one below (a flagship window taking the weekly reset, still a reading), the fallback:
+///
+///   - SPENT, reset unread (below 100%): assume the full window. That is the conservative
+///     degradation rather than a reading, it denies such an account a phantom advantage, and old
+///     snapshots (a v1 file, an account the app has not polled) degrade to plain headroom ordering.
+///   - UNTOUCHED (still at 100%) AND ON A FIXED CYCLE: the window was never opened, so its PHASE is
+///     unknown rather than late, and the expected distance to a reset drawn uniformly across the
+///     window is half of it. Here the full window is the WORST case rather than a neutral one, and
+///     assuming it deadlocks: a brand new account rated 100/168 = 0.60 %/h loses to a working
+///     account holding 16% of its week with a reset a day out (0.67 %/h), so it is never launched,
+///     so it never earns a reset to be rated by. Broken by hand with `usagebar account` on 2026-08-19.
+///
+/// THE SESSION WINDOW IS THE EXCEPTION to that second reading, because its phase is not unknown:
+/// the 5h session clock starts on the first message rather than on a schedule the provider fixes
+/// (MetricRowView.swift says the same to the user), so an untouched session window has its whole
+/// 5h still ahead of it. Halving it would double the rate of every idle account's session window
+/// (100/2.5 = 40 %/h against the true 100/5 = 20 %/h) and let an untouched account outrank the
+/// field on a window nobody has started.
+///
+/// Both inferences ride in `anchor` and never in `resetsAt`, so no sentence quotes them.
+struct RatedWindow {
+    let name: String
+    let remaining: Double
+    /// What the PROVIDER reported for this window, and nil when it reported nothing. This is the
+    /// reading a human-facing sentence may quote (`pickReason`) and the one identity-like readers
+    /// key on (the rebalance cycle key, the cap recovery deadline): never inferred, so nothing
+    /// outside this file can quote a time nobody published.
+    let resetsAt: Date?
+    /// The reset this window's RATE is measured against: its own when it has one, and otherwise an
+    /// inferred anchor (below). Kept apart from `resetsAt` precisely because it can be inferred -
+    /// a number good enough to rank two accounts by is not automatically good enough to print.
+    let anchor: Date?
+    /// Percentage points of this window its owner reserved for themselves, carried so the gate one
+    /// step downstream weighs the same window this rate was measured on (`comfortWindow`). Zero
+    /// unless the caller handed reserves in - AND zero on every window but the three the account
+    /// shares with the user's browser (the weekly all-models one, the 5h session one and the
+    /// flagship model's) whatever they handed in, which is where the reserve's scope is applied for
+    /// the whole product (`AccountRoles.carriesReserve`).
+    var reserve: Double = 0
+    /// How fast the part of this window UsageBar may spend can be spent: the EFFECTIVE remaining over
+    /// the hours until the anchor. Reserve-aware because ranking is where "spend somewhere else if
+    /// you can" has to bite - a floor alone would leave a personal account at 90% out-ranking a
+    /// sibling at 70% right up until it crossed the line, which is the opposite of the instruction.
+    let rate: Double
+}
+
+/// `reserves` defaults to none so that every caller that has not been taught about them - the
+/// prediction surfaces, the tests, the app - keeps the behaviour it had. The picks that ARE UsageBar's
+/// own choice pass the fleet's.
+func ratedWindows(_ account: Snapshot.Account, primaryModel: String?,
+                  reserves: AccountReserves = .none, now: Date = Date()) -> [RatedWindow] {
+    let reserve = reserves.reserve(for: account)
+    /// `fixedCycle` marks a window that turns over on a moment the account does not set: the weekly
+    /// one, and the flagship window riding on it. Only those get the midpoint reading, because only
+    /// their phase is unknown while untouched. The session window is not one of them (above).
+    func window(_ name: String, _ remaining: Double?, _ resetsAt: Date?,
+                inferredAnchor: Date? = nil, fullWindowHours: Double,
+                fixedCycle: Bool = false, reserved: Bool = false,
+                isModelWindow: Bool = false) -> RatedWindow? {
+        guard let remaining else { return nil }
+        // An untouched fixed-cycle window has published no reset because nothing has opened it yet,
+        // so it is rated against the midpoint of its own length rather than its far edge (above). A
+        // spent one whose reset nobody has read keeps the full-window assumption below, and so does
+        // an untouched session window, whose clock has not started rather than started unseen.
+        let untouchedAnchor = fixedCycle && remaining >= 100
+            ? now.addingTimeInterval(fullWindowHours / 2 * 3600) : nil
+        let anchor = resetsAt ?? inferredAnchor ?? untouchedAnchor
+        let hours = anchor.map { max($0.timeIntervalSince(now) / 3600, 0.05) } ?? fullWindowHours
+        // THE RESERVE REACHES THE THREE WINDOWS A BROWSER SHARES WITH USAGEBAR: the weekly all-models
+        // one, the 5h session one and the flagship model's (AccountReserve.swift states the
+        // ruling). Applied here, at the one place a window is built, so the score below and every
+        // gate downstream of it inherit the scope rather than each restating it. BOTH conditions,
+        // so this fails closed in either direction: the call site has to opt in AND the ruling has
+        // to allow the window - and the flagship one is recognised by SHAPE rather than by name,
+        // because the name is whatever the provider decided to call that tier.
+        let held = reserved && AccountRoles.carriesReserve(window: name,
+                                                           isModelWindow: isModelWindow)
+            ? reserve : 0
+        return RatedWindow(name: name, remaining: remaining, resetsAt: resetsAt, anchor: anchor,
+                           reserve: held, rate: (remaining - held) / hours)
+    }
+    var windows = [
+        window(AccountRoles.sessionWindowName, account.sessionRemaining, account.sessionResetsAt,
+               fullWindowHours: 5, reserved: true),
+        window(AccountRoles.weeklyWindowName, account.weeklyRemaining, account.weeklyResetsAt,
+               fullWindowHours: 168, fixedCycle: true, reserved: true),
+    ].compactMap { $0 }
+    // The flagship window only constrains the pick when the declared primary model IS that tier
+    // (a sonnet primary doesn't drain the fable window, so a drained fable window must not veto
+    // the account). No declared primary = flagship-first, the app's display philosophy.
+    let windowModel = account.modelWindowName?.lowercased()
+    let primary = primaryModel?.lowercased()
+    let modelWindowCounts = primary == nil || windowModel == nil
+        || windowModel!.contains(primary!) || primary!.contains(windowModel!)
+    // THE FLAGSHIP WINDOW BORROWS THE WEEKLY RESET WHEN IT REPORTS NONE OF ITS OWN. Both turn over
+    // on the account's one fixed weekly moment (above): measured 2026-08-12 across the live fleet,
+    // every account that has opened its week reports `modelResetsAt` EQUAL to `weeklyResetsAt`. So
+    // a null flagship reset is the provider declining to repeat itself rather than a window on some
+    // other cycle, and the 168h fallback understated its rate by up to a week - which reads as
+    // "this account is the scarce one" exactly when it is not. Inferred, so it rides in the anchor;
+    // with no weekly reset to borrow, both stay nil and the full-window assumption stands.
+    if modelWindowCounts,
+       let model = window(account.modelWindowName ?? "model", account.modelRemaining,
+                          account.modelResetsAt, inferredAnchor: account.weeklyResetsAt,
+                          fullWindowHours: 168, fixedCycle: true, reserved: true,
+                          isModelWindow: true) {
+        windows.append(model)
+    }
+    return windows
+}
+
+/// An account's score is its TIGHTEST window's rate - the binding constraint. `best()` then ranks
+/// accounts by how loose that constraint is, so a window that refills in minutes does not hold an
+/// account back, while one hoarding a bigger but slower-refreshing allowance does. Accounts within
+/// the tie margin of the top score are then ordered by their earliest published weekly reset.
+func smartScore(_ account: Snapshot.Account, primaryModel: String?,
+                reserves: AccountReserves = .none, now: Date = Date()) -> Double {
+    ratedWindows(account, primaryModel: primaryModel, reserves: reserves, now: now)
+        .map(\.rate).min() ?? -1
+}
+
+/// The human reason behind a pick: its binding window, e.g. "weekly 32% · resets 2d".
+///
+/// The window whose RATE binds, which is the question a pick asks (how hard can this account be
+/// pushed), and deliberately not the one `bindingWindow` names (how close is the wall).
+///
+/// Reserve-blind, and it takes no `reserves` to be so: this is a sentence for a person, the rate is
+/// only being used to choose WHICH window to quote, and the percentage it prints is the provider's
+/// (`windowReason` states that rule). A reserve can shift which window binds; it can never make a
+/// reader's line disagree with `usagebar status`.
+func pickReason(_ account: Snapshot.Account, primaryModel: String?, now: Date = Date()) -> String {
+    guard let binding = ratedWindows(account, primaryModel: primaryModel, now: now)
+        .min(by: { $0.rate < $1.rate }) else { return "no usage windows" }
+    return windowReason(binding, now: now)
+}
+
+/// The same binding window as `pickReason`, worded for someone who has never read a quota number:
+/// "71% of the week left". The line `usagebar claude` prints on launch uses this one; the reasons in
+/// hand-off and repick sentences keep `pickReason`'s compact form.
+func pickLeftText(_ account: Snapshot.Account, primaryModel: String?, now: Date = Date()) -> String {
+    guard let binding = ratedWindows(account, primaryModel: primaryModel, now: now)
+        .min(by: { $0.rate < $1.rate }) else { return "no usage windows" }
+    let percent = Int(binding.remaining.rounded())
+    switch binding.name {
+    case AccountRoles.weeklyWindowName: return "\(percent)% of the week left"
+    case AccountRoles.sessionWindowName: return "\(percent)% of the 5-hour session left"
+    default: return "\(percent)% of \(binding.name) left"
+    }
+}
+
+// The tie rule (margin, minimum gain, the earliest-published-reset tie-break) lives in
+// `smartPickLeader`, AccountComfort.swift, shared with the panel badge.
+
+/// The provider's accounts eligible for the model, minus `excluding`: the field `best`,
+/// `incumbentSeededBest` and `launchPick` start from.
+func pickField(providerID: String, in snapshot: Snapshot, primaryModel: String?,
+               excluding: Set<String>) -> [Snapshot.Account] {
+    snapshot.accounts.filter {
+        $0.provider == providerID && eligible($0, primaryModel: primaryModel)
+            && !excluding.contains($0.id)
+    }
+}
+
+///
+/// AN ACCOUNT UNDER ITS RESERVE NEVER ENTERS THE FIELD (B-1213, a hard line): when that empties it,
+/// this answers nil and `reserveHoldout` says why and when the first account is back. A launch that
+/// passes `--spend-reserve` hands in `.none` to get the old ranking. On a fleet with no reserves set
+/// nothing changes: an eligible account has every window above zero, so it is above a reserve of zero.
+///
+/// A THIN, CROWDED ACCOUNT TAKES NO LAUNCH WHILE A SIBLING CAN: after the
+/// nearly-dry gate, an account whose binding window is at or under `runwayPercent` and that already
+/// carries `clearanceMaxSessions` live sessions leaves the field whenever anybody else is left
+/// (`preferringUncrowded`). Its rate assumed one conversation spending the window; nine spending it
+/// wall together. A fleet that is thin and crowded everywhere ranks exactly as before.
+func best(providerID: String, in snapshot: Snapshot, primaryModel: String? = nil,
+          excluding: Set<String> = [], reserves: AccountReserves = .none,
+          skipWeeklyBelow: Double = 0, now: Date = Date()) -> Snapshot.Account? {
+    // The nearly-dry gate runs first (AccountComfort.swift): a rate cannot tell "healthy" from
+    // "1% left with a close reset", so accounts that are actually dry leave before the ordering.
+    let eligibleAccounts = pickField(providerID: providerID, in: snapshot,
+                                     primaryModel: primaryModel, excluding: excluding)
+    // Anybody above their line leaves the accounts under it out of the field (B-1213): ranked in,
+    // an under-line account's negative rate could sit in the tie band.
+    let above = aboveReserve(eligibleAccounts, primaryModel: primaryModel, reserves: reserves,
+                             now: now)
+    let comfortable = preferringComfortable(above, primaryModel: primaryModel, reserves: reserves,
+                                            now: now)
+    // The load gate (AccountComfort.swift, #4): a thin account already carrying two live
+    // conversations takes no third while somebody else can. After the comfort gate, never before.
+    let uncrowded = preferringUncrowded(comfortable, primaryModel: primaryModel,
+                                        reserves: reserves, now: now)
+    // The Routing pane's weekly floor (RoutingSettings): a preference, so a fleet that is under it
+    // everywhere still launches. An account that reports no weekly window is never skipped by it.
+    let candidates = preferringWeekly(uncrowded, floor: skipWeeklyBelow)
+    return smartPickLeader(candidates,
+        score: { smartScore($0, primaryModel: primaryModel, reserves: reserves, now: now) },
+        weeklyResetsAt: { $0.weeklyResetsAt },
+        resetCredits: { $0.resetCreditsAvailable ?? 0 })?.leader
+}
+
+/// The accounts whose weekly window keeps at least `floor` percent, or all of them when none does.
+func preferringWeekly(_ accounts: [Snapshot.Account], floor: Double) -> [Snapshot.Account] {
+    guard floor > 0 else { return accounts }
+    let kept = accounts.filter { ($0.weeklyRemaining ?? 100) >= floor }
+    return kept.isEmpty ? accounts : kept
+}
+
+/// The account an automatic launch would actually land on: `best` with the live cap quarantine
+/// applied, falling back to the unfiltered pick when quarantine empties the field (launching on
+/// an account that just capped still beats refusing to launch).
+///
+/// Every surface that PREDICTS the launch goes through here rather than calling `best` directly,
+/// because a prediction that skips an exclusion the launcher applies is simply wrong: on
+/// 2026-07-25 the app's smart-pick badge named a quarantined account, and the reader concluded
+/// the picker was broken rather than that the badge was. One function, so a display cannot
+/// contradict what launching does.
+///
+/// `emptyConversation` is a launch that opens a NEW conversation, and only that one lets a
+/// clearance account (leftovers about to be lost to a reset, AccountComfort.swift) take it ahead of
+/// the ranking: a resumed conversation would sit on that account until the wall. Default false, so a
+/// caller that cannot tell (the shim, `usagebar status`) never clears; `settleLaunch` decides it. Not
+/// inside `best`: the follow re-pick (`incumbentSeededBest`) falls back to `best`, and that moves a
+/// live conversation.
+func launchPick(providerID: String, in snapshot: Snapshot, primaryModel: String?,
+                quarantined: Set<String>, reserves: AccountReserves = .none,
+                emptyConversation: Bool = false, skipWeeklyBelow: Double = 0,
+                now: Date = Date()) -> Snapshot.Account? {
+    let field = pickField(providerID: providerID, in: snapshot, primaryModel: primaryModel,
+                          excluding: quarantined)
+    if emptyConversation, let clearance = clearancePick(aboveReserve(field, primaryModel: primaryModel,
+                                                  reserves: reserves, now: now),
+                                     primaryModel: primaryModel, reserves: reserves, now: now) {
+        return clearance
+    }
+    return best(providerID: providerID, in: snapshot, primaryModel: primaryModel,
+         excluding: quarantined, reserves: reserves, skipWeeklyBelow: skipWeeklyBelow, now: now)
+        ?? best(providerID: providerID, in: snapshot, primaryModel: primaryModel,
+                reserves: reserves, skipWeeklyBelow: skipWeeklyBelow, now: now)
+}

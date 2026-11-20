@@ -1,0 +1,379 @@
+import Foundation
+
+// What is written down between evaluations, and what the Settings row reads off it
+// (UsageBar/Core/EarlyStartState.swift, and the folds in EarlyStartLogic).
+//
+// Two properties carry most of the weight here. The day's usagebar ACCUMULATES, so every fold has to
+// say whether it adds, replaces or leaves alone; and the persisted payload has to READ whatever an
+// older build wrote, because the store treats a decode failure as "nothing was ever sent" and would
+// send it all again.
+
+func runStateChecks() {
+    // 14. THE SWITCH MOVING WRITES NOTHING DOWN, which is what makes "armed means started" true and
+    //     is also what protects the one guarantee this feature makes about cost. There is no fold
+    //     for it to call: the only state the feature keeps is the marks, and both answers about them
+    //     have to hold at once - an account that has had nothing is started at once, and an account
+    //     that has had its message keeps its floor across the switch.
+    do {
+        let flipped = at("2026-08-24 10:00")
+        expect(EarlyStartLogic.pass(candidate("a"), state: EarlyStartState(), quietHours: loud,
+                                    now: flipped, calendar: taipei) == nil,
+               "a closed window in front of a freshly armed schedule is started at once")
+
+        // THE OTHER HALF, AND THE ONE A REWRITE COULD LOSE: the marks are what bounds the cost, so
+        // nothing about the switch may drop them. Turning the feature off and on again used to wipe
+        // them, which was safe only because a stamp took over the suppression in the same breath;
+        // with no stamp, wiping them would let a second message out minutes after the first.
+        var served = EarlyStartState()
+        served.marks["a"] = EarlyStartMark(attemptedAt: at("2026-08-24 09:50"))
+        expect(EarlyStartLogic.pass(candidate("a"), state: served, quietHours: loud, now: flipped,
+                                    calendar: taipei) == .alreadyStarted,
+               "…while an account served ten minutes ago still owes its five hours across the switch")
+        expect(EarlyStartLogic.pass(candidate("a"), state: served, quietHours: loud,
+                                    now: at("2026-08-24 14:50"), calendar: taipei) == nil,
+               "…and is started again when that floor ages out, not before")
+    }
+
+    // 15. RECORDING: marks and the prune.
+    do {
+        let now = at("2026-08-24 09:00")
+        let plan = EarlyStartLogic.plan(candidates: [candidate("a"), candidate("b"),
+                                                     candidate("c", windowOpen: true)],
+                                        state: EarlyStartState(), quietHours: loud, now: now,
+                                        calendar: taipei)
+        var before = EarlyStartState()
+        // Two marks that can no longer change an answer: one aged past the retry interval, one with no
+        // floor at all (the shape an older payload's arming-era mark decodes to).
+        before.marks["ancient"] = EarlyStartMark(attemptedAt: at("2026-08-24 03:00"))
+        before.marks["floating"] = EarlyStartMark(attemptedAt: nil)
+
+        let after = EarlyStartLogic.recording(before, plan: plan, attempted: ["a", "b"], failed: [],
+                                              now: now, calendar: taipei)
+        expect(after.marks["a"]?.attemptedAt == now && after.marks["b"]?.attemptedAt == now,
+               "every attempted account is marked with the moment of the attempt")
+        // The account that was merely working keeps NO mark: nothing was spent on it, so there is
+        // nothing to bound, and a fleet of accounts quietly working would otherwise each carry an
+        // entry for the life of the install. The behaviour that costs is asserted straight after,
+        // because "the record is absent" is only acceptable if the answer is unchanged.
+        expect(after.marks["c"] == nil,
+               "an account that was merely working is not written down")
+        expect(EarlyStartLogic.pass(candidate("c"), state: after, quietHours: loud,
+                                    now: at("2026-08-24 14:00"), calendar: taipei) == nil,
+               "…and that account is started the moment its window closes all the same")
+        expect(after.marks["ancient"] == nil,
+               "a mark older than the retry interval is pruned: it suppresses nothing")
+        expect(after.marks["floating"] == nil,
+               "…and so is one with no attempt behind it at all")
+        expect(after.marks.count == 2, "…so what is left is the two accounts a message went out for")
+    }
+
+    // 16. TODAY'S USAGEBAR: what the Settings row reads. It accumulates across the day, counts accounts
+    //     rather than passes for the skipped column, and rolls over at midnight.
+    do {
+        let morning = at("2026-08-24 09:00")
+        let plan = EarlyStartLogic.plan(candidates: [candidate("a"), candidate("b"),
+                                                     candidate("busy", windowOpen: true),
+                                                     candidate("gone", home: nil)],
+                                        state: EarlyStartState(), quietHours: loud, now: morning,
+                                        calendar: taipei)
+        var state = EarlyStartLogic.recording(EarlyStartState(), plan: plan, attempted: ["a", "b"],
+                                              failed: [], now: morning, calendar: taipei)
+        expect(state.today?.day == "2026-08-24" && state.today?.started == 2,
+               "the usagebar names its day and counts what went out")
+        expect(state.today?.skipped == ["gone"],
+               "…lists the account that could not be reached, and not the one that was merely working")
+        expect(state.today?.lastAttemptAt == morning, "…and remembers when the last message went")
+
+        // Later the same day: the counts add up rather than replacing each other, and the same blocked
+        // account is not counted twice.
+        let noon = at("2026-08-24 13:00")
+        let second = EarlyStartLogic.plan(candidates: [candidate("a"), candidate("gone", home: nil)],
+                                          state: EarlyStartState(), quietHours: loud, now: noon,
+                                          calendar: taipei)
+        state = EarlyStartLogic.recording(state, plan: second, attempted: ["a"], failed: [], now: noon,
+                                          calendar: taipei)
+        expect(state.today?.started == 3, "a later relay adds to the day rather than replacing it")
+        expect(state.today?.skipped == ["gone"] && state.today?.skippedCount == 1,
+               "…and the same blocked account is counted once, not once per refresh")
+        expect(state.today?.lastAttemptAt == noon, "…while the last-message time moves forward")
+
+        // An evaluation that starts nothing and blocks on nothing must not touch the record.
+        let quietPlan = EarlyStartLogic.plan(candidates: [candidate("a", windowOpen: true)],
+                                             state: EarlyStartState(), quietHours: loud,
+                                             now: at("2026-08-24 13:05"), calendar: taipei)
+        let untouched = EarlyStartLogic.recording(state, plan: quietPlan, attempted: [], failed: [],
+                                                  now: at("2026-08-24 13:05"), calendar: taipei)
+        expect(untouched.today == state.today,
+               "an evaluation with nothing to report leaves the day's record exactly as it was")
+
+        // Midnight: a new day starts from zero rather than adding to yesterday.
+        let tomorrow = at("2026-08-25 09:00")
+        let fresh = EarlyStartLogic.recording(state, plan: second, attempted: ["a"], failed: [],
+                                              now: tomorrow, calendar: taipei)
+        expect(fresh.today?.day == "2026-08-25" && fresh.today?.started == 1,
+               "a new day's usagebar starts from zero")
+        expect(fresh.today?.skipped == ["gone"],
+               "…and rebuilds its own skipped list rather than inheriting yesterday's counts")
+
+        // No CLI on the machine: nothing was attempted, so nothing is marked, and the row says the
+        // accounts could not be started rather than that they were skipped. NAMED, not counted, for
+        // the reason asserted three assertions down.
+        let blockedIDs = plan.start.map(\.accountID)
+        let missing = EarlyStartLogic.recording(EarlyStartState(), plan: plan, attempted: [],
+                                                failed: [], couldNotStart: blockedIDs, now: morning,
+                                                calendar: taipei)
+        expect(missing.today?.started == 0 && missing.today?.couldNotStartTotal == 2,
+               "a missing CLI records two that could not start")
+        expect(missing.today?.couldNotStart == ["a", "b"] && missing.today?.failed == 0,
+               "…by name, and not as attempts that were made and answered")
+        expect(missing.today?.lastAttemptAt == nil,
+               "…and names no time, because no message was sent")
+        expect(missing.marks["a"] == nil && missing.marks["b"] == nil,
+               "…and marks neither of them, so an install that lands later is served at once")
+
+        // THE SAME EVALUATION AGAIN, which is exactly what the line above buys and pays for. Nothing
+        // was marked, so the next refresh chooses the same two accounts, and so does the one after
+        // it: at the shipping interval of one minute that is 1,440 evaluations a day describing two
+        // accounts that were never once tried. The set holds at two.
+        var repeated = missing
+        for minute in 1...5 {
+            repeated = EarlyStartLogic.recording(
+                repeated, plan: plan, attempted: [], failed: [], couldNotStart: blockedIDs,
+                now: morning.addingTimeInterval(Double(minute) * 60), calendar: taipei)
+        }
+        expect(repeated.today?.couldNotStartTotal == 2,
+               "…and five more refreshes with the CLI still missing leave it at two, not seven")
+
+        // A real spawn failure is the other half of the same number and DOES accumulate: it counts
+        // attempts, and one was made each time.
+        let answered = EarlyStartLogic.recording(EarlyStartState(), plan: plan, attempted: ["a"],
+                                                 failed: ["a"], now: morning, calendar: taipei)
+        expect(answered.today?.failed == 1 && answered.today?.couldNotStart == [],
+               "an attempt that failed is counted rather than named: it happened once")
+        expect(answered.today?.attemptFailed == ["a"],
+               "…and named as well, because the row's number is a count of ACCOUNTS")
+
+        // THE TWO LISTS OVERLAP WHILE THE ACCOUNT STILL HAS NOTHING, and the row must not add them.
+        // This is the day the first fix's own shape would have got wrong: blocked all morning with
+        // no CLI, then attempted once one arrived, and the attempt failed. Two accounts, nothing
+        // achieved, and adding a count to a set said four.
+        let installed = EarlyStartLogic.recording(missing, plan: plan, attempted: ["a", "b"],
+                                                  failed: ["a", "b"], now: noon, calendar: taipei)
+        expect(installed.today?.couldNotStart == ["a", "b"]
+                 && installed.today?.attemptFailed == ["a", "b"],
+               "an account with nothing yet is on both lists: blocked this morning, failed this noon")
+        expect(installed.today?.failed == 2,
+               "…and the message count says two, because two messages really were tried")
+        expect(installed.today?.couldNotStartTotal == 2,
+               "…while the ROW says two, not four: it counts accounts, and there are two")
+
+        // …AND THE OTHER HALF OF THAT DAY, IN THE ORDER PRODUCTION PLAYS IT. The store writes the
+        // attempt BEFORE the spawn and hands `recording` an empty `failed` (EarlyStartStore.swift
+        // says why: an auto-update relaunch inside the two minutes a CLI gets would otherwise
+        // resend everything), so `installed` above measures a call shape only a test can make. What
+        // the machine really does is these two folds, and the first of them is the crash window.
+        let spawnWritten = EarlyStartLogic.recording(missing, plan: plan, attempted: ["a", "b"],
+                                                     failed: [], now: noon, calendar: taipei)
+        expect(spawnWritten.today?.started == 2,
+               "the attempts are counted at once, which is what bounds the cost of a relaunch")
+        // THE CRASH WINDOW IS THAT STATE, asserted rather than assumed: an app replaced between the
+        // write and the answers never runs the fold below, so what it leaves behind has to be the
+        // SAFE reading. Clearing the lists in `recording` made that leftover "both accounts have
+        // their message" for a batch that may have sent nothing at all.
+        expect(spawnWritten.today?.couldNotStart == ["a", "b"]
+                 && spawnWritten.today?.couldNotStartTotal == 2,
+               "…while nothing leaves the lists yet: an app dying here still reports them unserved")
+
+        // The answers land: both went through, so both leave the lists and the row is empty of
+        // them. As pure unions the sets only grew, and this read "2 could not start" on a machine
+        // holding two accounts that were both working, until midnight.
+        let recovered = EarlyStartLogic.correcting(spawnWritten, attempted: ["a", "b"], failed: [],
+                                                   now: at("2026-08-24 13:02"), calendar: taipei)
+        expect(recovered.today?.started == 2 && recovered.today?.couldNotStartTotal == 0,
+               "two accounts blocked all morning and served at noon: two started, none left blocked")
+        expect(recovered.today?.couldNotStart == [] && recovered.today?.attemptFailed == [],
+               "…by leaving both lists, which is what naming rather than counting them buys")
+
+        // …and the same day with the answers coming back the other way, which is the production
+        // shape of `installed`: three folds, and the row still says two rather than four.
+        let landed = EarlyStartLogic.correcting(spawnWritten, attempted: ["a", "b"],
+                                                failed: ["a", "b"], now: at("2026-08-24 13:02"),
+                                                calendar: taipei)
+        expect(landed.today?.started == 0 && landed.today?.couldNotStartTotal == 2,
+               "…and a batch that failed keeps both accounts on the row: two accounts, not four")
+        expect(landed.today?.failed == 2,
+               "…with two messages counted, because two were sent for and lost")
+
+        // ONE ACCOUNT, ONE DAY, both halves: a machine holding a single account is where the row's
+        // number is read most literally, and where a list that only grew was most obviously wrong.
+        let solo = EarlyStartLogic.plan(candidates: [candidate("a")], state: EarlyStartState(),
+                                        quietHours: loud, now: morning, calendar: taipei)
+        let soloMorning = EarlyStartLogic.correcting(
+            EarlyStartLogic.recording(EarlyStartState(), plan: solo, attempted: ["a"], failed: [],
+                                      now: morning, calendar: taipei),
+            attempted: ["a"], failed: ["a"], now: at("2026-08-24 09:02"), calendar: taipei)
+        expect(soloMorning.today?.started == 0 && soloMorning.today?.couldNotStartTotal == 1,
+               "the lone account's morning message failed: nothing started, one could not start")
+        let soloAfternoon = EarlyStartLogic.correcting(
+            EarlyStartLogic.recording(soloMorning, plan: solo, attempted: ["a"], failed: [],
+                                      now: at("2026-08-24 14:00"), calendar: taipei),
+            attempted: ["a"], failed: [], now: at("2026-08-24 14:02"), calendar: taipei)
+        expect(soloAfternoon.today?.started == 1 && soloAfternoon.today?.couldNotStartTotal == 0,
+               "…and the afternoon's went through: one started, and nothing is still waiting")
+        expect(soloAfternoon.today?.failed == 1,
+               "…while the message counter keeps the failure, which really did happen")
+
+        // A single missed poll leaves no trace on the day it recovers in, while a sustained failure
+        // is what the skipped column is for.
+        let flaky = EarlyStartLogic.plan(candidates: [candidate("blinked", readable: false),
+                                                      candidate("failing", readable: false,
+                                                                keepsFailing: true)],
+                                         state: EarlyStartState(), quietHours: loud, now: morning,
+                                         calendar: taipei)
+        let flakyRecorded = EarlyStartLogic.recording(EarlyStartState(), plan: flaky, attempted: [],
+                                                      failed: [], now: morning, calendar: taipei)
+        expect(flakyRecorded.today?.skipped == ["failing"],
+               "one missed poll is not written to a list that stands until midnight")
+        expect(flakyRecorded.marks.isEmpty,
+               "…and an evaluation that sent nothing leaves no mark on anybody")
+    }
+
+    // 17. THE CORRECTION, once the CLIs have answered. The usagebar is written optimistically before the
+    //     spawn (an auto-update relaunch inside the two minutes a CLI gets would otherwise resend
+    //     everything), so the answers arrive minutes later and move failures out of the started column.
+    do {
+        let now = at("2026-08-24 09:00")
+        let plan = EarlyStartLogic.plan(candidates: [candidate("a"), candidate("b")],
+                                        state: EarlyStartState(), quietHours: loud, now: now,
+                                        calendar: taipei)
+        let optimistic = EarlyStartLogic.recording(EarlyStartState(), plan: plan,
+                                                   attempted: ["a", "b"], failed: [], now: now,
+                                                   calendar: taipei)
+        expect(optimistic.today?.started == 2, "both attempts are counted before the answers land")
+
+        let answered = EarlyStartLogic.correcting(optimistic, attempted: ["a", "b"], failed: ["a"],
+                                                  now: at("2026-08-24 09:02"), calendar: taipei)
+        expect(answered.today?.started == 1 && answered.today?.failed == 1,
+               "one failure of two moves one account out of the started column")
+        expect(answered.today?.attemptFailed == ["a"],
+               "…and the one that went through is not on the list beside the one that did not")
+        expect(answered.marks == optimistic.marks,
+               "…and the marks are untouched: an attempt costs its five hours whatever the CLI said")
+
+        expect(EarlyStartLogic.correcting(optimistic, attempted: [], failed: [], now: now,
+                                          calendar: taipei) == optimistic,
+               "an answer about no accounts at all corrects nothing")
+        // A batch that started before midnight and answered after it would otherwise describe messages
+        // the new day never sent.
+        expect(EarlyStartLogic.correcting(optimistic, attempted: ["a", "b"], failed: ["a"],
+                                          now: at("2026-08-25 00:01"), calendar: taipei) == optimistic,
+               "an answer that lands on the next day leaves both days alone")
+        expect(EarlyStartLogic.correcting(EarlyStartState(), attempted: ["a"], failed: ["a"], now: now,
+                                          calendar: taipei) == EarlyStartState(),
+               "…and a correction with no usagebar to correct is a no-op rather than a crash")
+        // A double correction cannot drive the column negative.
+        let twice = EarlyStartLogic.correcting(
+            EarlyStartLogic.correcting(optimistic, attempted: ["a", "b"], failed: ["a", "b"],
+                                       now: now, calendar: taipei),
+            attempted: ["a", "b"], failed: ["a", "b"], now: now, calendar: taipei)
+        expect(twice.today?.started == 0, "the started column never goes below zero")
+        // …and the ROW does not double either, which the counter beside it does: the same two
+        // accounts corrected twice are still two accounts that got nothing, whatever the message
+        // count says about how many sends were tallied.
+        expect(twice.today?.failed == 4 && twice.today?.couldNotStartTotal == 2,
+               "…and the account total holds at two while the message counter adds up")
+    }
+
+    // 18. THE PERSISTED STATE READS BACK, including payloads written before a field existed and by the
+    //     build before this one. The store treats a decode failure as "no state at all", which would
+    //     re-send every message already sent, so a throwing decoder is the expensive kind of wrong.
+    do {
+        var state = EarlyStartState()
+        state.marks = ["a": EarlyStartMark(attemptedAt: at("2026-08-24 09:00"))]
+        state.today = EarlyStartToday(day: "2026-08-24", started: 2, failed: 1,
+                                      attemptFailed: ["a"], couldNotStart: ["nocli"],
+                                      skipped: ["gone"],
+                                      lastAttemptAt: at("2026-08-24 09:00"))
+        let data = try! JSONEncoder().encode(state)
+        expect((try? JSONDecoder().decode(EarlyStartState.self, from: data)) == state,
+               "the state round-trips")
+
+        let emptiest = Data("{}".utf8)
+        expect((try? JSONDecoder().decode(EarlyStartState.self, from: emptiest)) == EarlyStartState(),
+               "an empty payload reads as an empty state rather than throwing")
+
+        // THE PAYLOAD THE MORNING SCHEDULE WROTE. Every key in it is gone, and it still has to read:
+        // a throw here would be read as "nothing was ever sent" by a build that has just changed the
+        // rules about when it sends.
+        let morningEra = Data(#"""
+            {"startedDays":{"a":"2026-08-24"},"suppressedDay":"2026-08-24",
+             "lastRun":{"at":776415600,"started":2,"skipped":1,"failed":0}}
+            """#.utf8)
+        let migrated = try? JSONDecoder().decode(EarlyStartState.self, from: morningEra)
+        expect(migrated == EarlyStartState(),
+               "a payload from the morning schedule reads as an empty relay state, not a throw")
+
+        // THE PAYLOAD THE ARMING SUPPRESSION WROTE, which is what every machine running the build
+        // before this one has on disk right now. Both of its removed keys are simply not read: a
+        // decoder that names its keys ignores the rest, and the state it produces is the one that
+        // starts a closed window at the next refresh rather than holding it for five hours.
+        //
+        // THE FIXTURE IS THE SHAPE ARMING ACTUALLY LEFT, which the first version of this was not
+        // (codex review of 4a46750). It carried marks with attempt stamps beside `armedAt`, and
+        // that pairing is one the old build could not write: `arming()` EMPTIED the marks as it
+        // stamped, so what a machine has on disk right now is an empty map beside a stamp. The old
+        // fixture therefore tested a payload nobody has, and the migration's actual edge - a state
+        // whose only content is a key this build ignores - was never read at all.
+        //
+        // WHAT IT ASSERTS IS THE ACCEPTED EDGE, written down rather than left to be rediscovered:
+        // upgrading inside the five hours after a message went out reads as a state that never
+        // sent one, so that account can be sent to a second time in that window. The information
+        // that would prevent it was destroyed by the writer that made this payload (`armedAt` is a
+        // batch stamp, not a per-account one), so every fix is either too wide or too narrow; it
+        // costs one extra haiku, once, on the upgrade itself. Ruled acceptable 2026-09-01.
+        let armedEra = Data(#"""
+            {"marks":{},"armedAt":776412000}
+            """#.utf8)
+        let decodedArmed = try? JSONDecoder().decode(EarlyStartState.self, from: armedEra)
+        expect(decodedArmed == EarlyStartState(),
+               "the payload arming really wrote reads as an empty relay state, not a throw")
+        // AND THE BEHAVIOUR THAT FOLLOWS FROM IT, which is the half a decode check cannot state: an
+        // account whose window has just closed is started AT ONCE on the first refresh after the
+        // upgrade, because nothing in what survived says it was ever attempted.
+        let afterUpgrade = EarlyStartLogic.plan(
+            candidates: [candidate("a", windowOpen: false)],
+            state: decodedArmed ?? EarlyStartState(), quietHours: loud,
+            now: at("2026-08-24 07:30"), calendar: taipei)
+        expect(afterUpgrade.start.map(\.accountID) == ["a"],
+               "…so the first refresh after the upgrade starts a closed window at once")
+        // The floor that DOES survive an upgrade, for contrast: a mark carrying an attempt stamp is
+        // what holds an account for five hours, and that is the one thing the migration keeps when
+        // there is one to keep.
+        let attempted = Data(#"{"marks":{"a":{"attemptedAt":776415600}}}"#.utf8)
+        let decodedAttempt = try? JSONDecoder().decode(EarlyStartState.self, from: attempted)
+        expect(decodedAttempt?.marks["a"]?.attemptedAt
+                 == Date(timeIntervalSinceReferenceDate: 776415600),
+               "…while a mark that carries an attempt keeps the one thing that bounds cost")
+
+        let partialDay = Data(#"{"day":"2026-08-24","started":2}"#.utf8)
+        let decodedDay = try? JSONDecoder().decode(EarlyStartToday.self, from: partialDay)
+        expect(decodedDay?.failed == 0 && decodedDay?.skipped == [] && decodedDay?.lastAttemptAt == nil
+                 && decodedDay?.couldNotStart == [],
+               "a usagebar written before the later columns reads them as empty")
+
+        // THE PAYLOAD THE BUILD BEFORE THIS ONE WROTE, where the row's number was a counter: it has
+        // to READ rather than throw, which is the whole fields-are-only-added rule, and its counts
+        // have to survive as the counts they are.
+        let counterEra = Data(#"{"day":"2026-08-24","started":1,"failed":2,"skipped":["gone"]}"#.utf8)
+        let decodedCounter = try? JSONDecoder().decode(EarlyStartToday.self, from: counterEra)
+        expect(decodedCounter?.failed == 2 && decodedCounter?.skipped == ["gone"],
+               "a usagebar from before the account lists reads its counters unchanged")
+        // …AND THE ROW UNDER-REPORTS FOR THE REST OF THAT DAY, stated rather than papered over. The
+        // number is a set of accounts now and that payload names none, so it answers zero until the
+        // next failure names one or midnight replaces the usagebar. Reconstructing accounts from a
+        // count is not possible, and guessing one per failure would print the very over-count the
+        // union exists to prevent.
+        expect(decodedCounter?.attemptFailed == [] && decodedCounter?.couldNotStartTotal == 0,
+               "…and names no accounts, so the row waits for the next one rather than inventing them")
+    }
+}

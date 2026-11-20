@@ -1,0 +1,381 @@
+name: UsageBar
+options:
+  bundleIdPrefix: app.usagebar
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: true
+  # xcodegen 2.46.0 also hangs the shared UsageBar/Core groups under the project root
+  # (Core, Harness, Keychain, TokenStats get two parents). This keeps the project
+  # valid for every xcodegen version.
+  createIntermediateGroups: true
+  developmentLanguage: en
+  localizations:
+    - en
+    - zh-Hant
+    - zh-Hans
+    - ja
+    - ko
+    - tr
+
+packages:
+  # In-app auto-updates (appcast + EdDSA-signed downloads). Pinned exactly because the generated
+  # xcodeproj (and its Package.resolved) is gitignored - a version range would resolve differently
+  # per machine. 2.9.4 also fixes the update window opening behind other apps for menu-bar
+  # (dockless) apps (sparkle-project/Sparkle#2889).
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.9.4
+
+schemes:
+  UsageBar:
+    build:
+      targets:
+        UsageBar: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    archive:
+      config: Release
+  UsageBarCLI:
+    build:
+      targets:
+        UsageBarCLI: all
+    run:
+      config: Release
+
+targets:
+  # `usagebar` - the account-picking launcher CLI (reads ~/.usagebar/snapshot.json, execs claude/codex).
+  UsageBarCLI:
+    type: tool
+    platform: macOS
+    configFiles:
+      Debug: Config/Overlay.xcconfig
+      Release: Config/Overlay.xcconfig
+    sources:
+      - UsageBarCLI
+      # UniFFI bindings of the Rust core: `usagebar reap` and the worktree removal step call them.
+      - path: rust/generated/swift/usagebar_ffi.swift
+      # UsageBar's identity on disk and on the system (state directory, CLI name, env prefix,
+      # notification names) and the BrimFeatures gates: the app and the CLI compile the one copy.
+      - path: UsageBar/Core/BrandPaths.swift
+      - path: UsageBar/Core/SessionMonitoring.swift
+      # The one file the Chrome-gap hook and the app share: the signal the app turns into a
+      # notification when the account set for Claude in Chrome is itself not connected.
+      - path: UsageBar/Core/ChromeSettingSignal.swift
+      - path: UsageBar/Core/CodexSessionHooks.swift
+      # The names an earlier build left on disk, spelled once: the CLI answers the old hook verb
+      # through it, and the Harness inventory recognises the old registration by it.
+      - path: UsageBar/Core/LegacyIdentifierMigration.swift
+      - path: UsageBar/Core/Harness
+      # `usagebar add` has to tell a logged-in config home from a free slot, and a Claude Code login
+      # now lives in the Keychain rather than in a credentials file. It asks the same probe, under
+      # the same derived service name, that the app's discovery does - one implementation, because
+      # a drifted second copy of the hash rule would find nothing and read as "not logged in".
+      - path: UsageBar/Core/Keychain/KeychainReader.swift
+      - path: UsageBar/Core/Keychain/ClaudeKeychainService.swift
+      # Same reason for the other asymmetric Claude Code path: `usagebar add` seeds folder trust into
+      # a config dir's state file while the app reads that file for the account's plan and email,
+      # so both targets compile the one rule for where the default home keeps it (one level up).
+      - path: UsageBar/Core/ClaudeStatePath.swift
+      # Adding an account is one act with two surfaces: `usagebar add` in a terminal and the Settings
+      # "Add account" flow in the app. These four files are the act itself - which numbered home
+      # is next, what gets symlinked into it from the main account, the folder trust carried over,
+      # and the note saying Claude Code's first-run wizard is done - so both targets compile the
+      # one implementation. A drifted second copy would put the CLI and the app on different
+      # account numbers, or share a set one of them does not. The last one is why the CLI needs it
+      # at all: `usagebar add` sweeps the markers of logins that landed while UsageBar.app was closed,
+      # and the sweep that takes a marker away is the only surface left to leave that note.
+      - path: UsageBar/Core/AddAccount.swift
+      - path: UsageBar/Core/SharedHarness.swift
+      # And the question underneath the share: WHICH object a path arrives at, so that a home
+      # reached through an alias is that home and a link written any of the ways POSIX allows is
+      # still the link we wrote. Both targets compile the one copy because both undo a share -
+      # `usagebar add --no-share` and the Settings row - and a second spelling of "the same place" is
+      # precisely how this comparison went wrong four times in three days.
+      - path: UsageBar/Core/PathIdentity.swift
+      # Whether a held-over window has been overtaken by its reset: `usagebar status` and the panel
+      # ask the one judge, so the two cannot print different answers for one snapshot row.
+      - path: UsageBar/Core/HeldOverReset.swift
+      # And its other half: `usagebar share` puts an account that ALREADY EXISTS on that same set of
+      # links, which the Settings "Shared harness" row does too. One engine for both surfaces, for
+      # the reason above - a second copy is how one of them starts backing a file up where the
+      # other overwrites it.
+      - path: UsageBar/Core/ShareExisting.swift
+      - path: UsageBar/Core/TrustSeed.swift
+      - path: UsageBar/Core/ClaudeOnboarding.swift
+      # Where a torn-down worktree came from: `usagebar worktree remove` writes the note and the app's
+      # token attribution reads it back, so both targets compile the one record. A drifted second
+      # spelling would silently stop the app from finding what the CLI wrote, and the symptom (a
+      # removed worktree's history pooling into Other) only appears on a later full rescan.
+      - path: UsageBar/Core/WorktreeOrigins.swift
+      # The cost snapshot's contract and its one aggregation: the app writes ~/.usagebar/project-cost.json
+      # and `usagebar cost` reads it, so both print figures from the same code.
+      - path: UsageBar/Core/TokenStats/CostReport.swift
+      # The names a launch axis may take. `usagebar model` validates an effort against the same list
+      # the app's picker offers and suggests the same model aliases, so both targets compile the
+      # one copy: a drifted second list would let the CLI write an `--effort` value the child does
+      # not recognise (a session that will not start) while the app's picker still refused it.
+      - path: UsageBar/Core/LaunchAxisNames.swift
+      # Which scope pinned a session's account, and the mark that says so. The supervisor decides
+      # it and publishes it into the session sidecar, the status line renders it inside Claude Code
+      # and the app's board draws it beside the account name, so all three compile the one
+      # precedence: by the time the three pins are folded into one policy, `manual` no longer says
+      # which of them said so, and a second spelling of that order is how the terminal and the
+      # board would come to name different scopes for one session.
+      - path: UsageBar/Core/SessionPinScope.swift
+      # The prompt hook to MCP tool contract: the variables the app substitutes into a hook's
+      # `input` block and the keys the CLI reads them back under, plus the server and tool names
+      # the app registers and the CLI answers to. Both targets compile the one copy because a
+      # drifted spelling fails SILENTLY here: Claude Code substitutes an unknown variable with the
+      # empty string, which is indistinguishable from a command typed with no arguments.
+      - path: UsageBar/Core/PromptHookInput.swift
+      # The native picker's IPC contract: the request the CLI writes under `~/.usagebar/pick`,
+      # the claim and the answer the app writes back, and the row shape the panel draws. Both
+      # targets compile the one copy for the reason the two above give, sharpened by the
+      # channel: these are separate processes speaking through files, so a drifted field name
+      # is a picker that opens and can never be answered.
+      - path: UsageBar/Core/PickContract.swift
+      # Which program a claude launch actually execs: the installer's app bundle when it is proven
+      # to be the current version, so macOS permissions survive updates (B-565). The app spawns
+      # through the same rule (CLIRunner, RenewLoginRunner, EffortLevels).
+      - path: UsageBar/Core/ClaudeStableExecutable.swift
+      # The personal account and its reserve: the rules over the `accounts` block of
+      # ~/.usagebar/state.json. Same reason as the contracts above, and the sharpest instance of it - the app writes
+      # that block from a Settings row and this binary is what ACTS on it, so a rule spelled twice is
+      # quota held back on an account whose Settings row shows none, or a water line the launcher
+      # walks straight through. Only the rules are here; who reads which document stays on each side
+      # (LaunchPolicyStore owns it, UsageBarCLI/AccountReserveReader.swift reads it back).
+      - path: UsageBar/Core/AccountReserve.swift
+      # The machine's own health: the app SAMPLES it and writes ~/.usagebar/host-health.json, while
+      # `usagebar status` prints it and the supervisor turns an alarm into one sentence for the
+      # session under it. Two processes speaking through one file, so both targets compile the one
+      # record and the one set of thresholds - a drifted second copy would have `usagebar status`
+      # printing a limit the app never alarmed on. Only the record and the pure rules are here;
+      # the syscalls and the notification stay in the app (HostHealthReaders/Monitor.swift).
+      # Which project settings file replaces UsageBar's status line in a session's folder, and the one
+      # spelling of the command UsageBar registers: the app counts the overridden folders in
+      # Settings, `usagebar status --json` names the file per session.
+      - path: UsageBar/Core/ProjectStatusLine.swift
+      - path: UsageBar/Core/HostHealthLogic.swift
+      - path: UsageBar/Core/HostHealthCPU.swift
+      - path: UsageBar/Core/HostHealthStatus.swift
+      # The minute-by-minute load history: the app WRITES one line a minute and `usagebar status
+      # --history` READS it back, so both targets compile the one line format and the one rate
+      # arithmetic (a second copy of either is a reader that miscounts what the writer wrote).
+      - path: UsageBar/Core/HostLoadHistory.swift
+      - path: UsageBar/Core/HostLoadStats.swift
+      # And the one rule for what may go on a terminal's input queue, which that sentence and the
+      # quota knock's account names are both repaired through (KeystrokeText.swift). Compiled by
+      # both targets because the string is BUILT in the app's half and TYPED in this one: a second
+      # spelling of "what a terminal reads as a keystroke" is one refusal and one repair that can
+      # come to disagree, silently.
+      - path: UsageBar/Core/KeystrokeText.swift
+      # Claude's own once-a-week session-limit reset: the state machine, the sentences Claude Code
+      # prints, and the per-account record under `~/.usagebar/limit-reset/`. Both targets compile it
+      # for the reason every file above is shared: the SUPERVISOR observes (it is the only process
+      # tailing a transcript, and the only one that can see what `/limit-reset` printed) while the
+      # APP draws the state and spends the credit through the panel's button. A second spelling of
+      # those sentences would be a panel that shows nothing while every session observes correctly,
+      # and a second spelling of the record would be a button that reads a file nobody writes.
+      - path: UsageBar/Core/LimitReset.swift
+      # Reading one variable out of another process's environment, which both targets do for their
+      # own question and neither can do from a dictionary: the app asks a supervisor's child which
+      # build stamped it (the board's staleness badge), and a handoff asks a stray process which
+      # supervisor started it, because a job whose shell has exited is reachable by no walk of the
+      # tree (HandoffKill.swift). One copy of the `KERN_PROCARGS2` walk because the argument count
+      # is the only thing separating a command line from an environment in that buffer, and a
+      # second spelling of that boundary reads `env FOO=1 cmd` as a process launched with FOO set.
+      - path: UsageBar/Core/SupervisorVersionStamp.swift
+      # A private overlay linked at ./overlay; absent in the public tree.
+      - path: overlay/Shared
+        optional: true
+      - path: overlay/UsageBarCLI
+        optional: true
+    # The Rust core (rust/crates/ffi, see scripts/build-rust-core.sh) reads each live transcript line off
+    # its bytes for the supervisor's scan (TranscriptLineRust.swift); the app target links it too.
+    # Built for every architecture in $ARCHS before Swift compiles; cargo's own cache makes an unchanged tree a
+    # sub-second no-op, and Xcode cannot see cargo's dependency graph to decide that itself.
+    preBuildScripts:
+      - name: Build Rust core
+        script: |
+          "${SRCROOT}/scripts/build-rust-core.sh"
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(BUILT_PRODUCTS_DIR)/libusagebar_ffi.a
+    settings:
+      base:
+        # UsageBar: the CLI ships as `usagebar` (UsageBar/Core/BrandPaths.swift, cliName).
+        PRODUCT_NAME: usagebar
+        # Rust core: the module map and header live in rust/include, the merged static library
+        # (libusagebar_ffi.a) in BUILT_PRODUCTS_DIR (written by the pre-build script above). USAGEBAR_RUST_REQUIRED turns a
+        # missing module into a compile error (UsageBarCLI/TranscriptLineRust.swift). The script
+        # writes rust/target inside the source tree, hence no script sandboxing.
+        SWIFT_INCLUDE_PATHS: $(inherited) $(SRCROOT)/rust/include
+        LIBRARY_SEARCH_PATHS: $(inherited) $(BUILT_PRODUCTS_DIR)
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) USAGEBAR_RUST_REQUIRED
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        PRODUCT_BUNDLE_IDENTIFIER: app.usagebar.UsageBar.cli
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        # UsageBar has no signing team yet: ad-hoc signing, so any machine can build it.
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: ""
+        SWIFT_STRICT_CONCURRENCY: complete
+
+  UsageBar:
+    type: application
+    platform: macOS
+    configFiles:
+      Debug: Config/Overlay.xcconfig
+      Release: Config/Overlay.xcconfig
+    sources:
+      - UsageBar
+      # Ship the license in the app bundle.
+      - path: LICENSE
+        buildPhase: resources
+      # UniFFI bindings of the Rust core (token statistics, UsageBar/Core/TokenStats). Generated by
+      # scripts/gen-uniffi.sh and committed, never edited by hand; they live outside UsageBar/ so they
+      # are listed here.
+      - path: rust/generated/swift/usagebar_ffi.swift
+      # The usage advisor's pure math lives in the CLI folder (so the CLI target compiles it too);
+      # the app shares those files rather than duplicating the calculation. Two of them only because
+      # of the 500-line rule - they are one unit and must be listed together.
+      - path: UsageBarCLI/UsageAdvisor.swift
+      - path: UsageBarCLI/UsageAdvisorMath.swift
+      # The reload request file and the live-supervisor registry: the Settings row and `usagebar
+      # reload` must write the same file the same way, so both targets compile the one writer.
+      - path: UsageBarCLI/ReloadRequest.swift
+      # The redeem request channel: `usagebar redeem` writes a request and the installed app claims and
+      # answers it, so both targets compile the one file format and the one claim rule.
+      - path: UsageBarCLI/RedeemRequest.swift
+      # When keyboard focus changed hands: the app records it and every supervisor reads it to tell a
+      # terminal's focus reports from typing, so both targets compile the one file format.
+      - path: UsageBarCLI/FocusEvents.swift
+      # The nearly-dry gate in front of every account pick: the panel's smart-pick badge must
+      # predict what `usagebar` launches, so both targets run the one implementation.
+      - path: UsageBarCLI/AccountComfort.swift
+      # Same reason, the other exclusion the launcher applies: the badge has to skip accounts the
+      # cap quarantine is holding out, so it reads the same records the CLI writes.
+      - path: UsageBarCLI/Quarantine.swift
+      # The session status board's record: what each supervised session is doing, published by the
+      # supervisor (the only process that can decide it) and read by the panel. Both targets
+      # compile the one shape for the reason PickContract.swift gives about its own: these are
+      # separate processes speaking through files, so a drifted field name is a board that draws
+      # nothing while every session reports correctly. Only the record and its reader are here -
+      # everything that DECIDES a state stays in the CLI (SessionStateSync.swift).
+      - path: UsageBarCLI/SessionState.swift
+      - path: UsageBarCLI/CodexStartupScreenRecord.swift
+      # The same division one reading over: how many subagents a session has working, written by
+      # the hooks Claude Code fires and read by the card that draws the count. Both targets compile
+      # the one record for the reason above - separate processes speaking through a file - and the
+      # rules for folding an event into a roster come with it, because they are pure arithmetic on
+      # a set and the app has to be able to say what the document it just read MEANS.
+      - path: UsageBarCLI/AgentRoster.swift
+      # The advisory knock's hook channel, in the same division: the app registers
+      # `usagebar hook-knock <event>` in every Claude account's settings.json and the CLI answers to it,
+      # so both targets compile the one spelling of the events, the command and the marker. A
+      # drifted second copy fails silently in both directions (QuotaKnockHookContract.swift states
+      # them).
+      - path: UsageBarCLI/QuotaKnockHookContract.swift
+      # The status line's rate-limit facts: `usagebar statusline claude` writes them, the poller reads
+      # them to show fresher session and weekly numbers and to probe live accounts less often.
+      - path: UsageBarCLI/LiveRates.swift
+      # A private overlay linked at ./overlay; absent in the public tree.
+      - path: overlay/Shared
+        optional: true
+      - path: overlay/UsageBar
+        optional: true
+    dependencies:
+      - target: UsageBarCLI
+        embed: false
+      - package: Sparkle
+    # UsageBarCLI builds the shared Rust library before this dependent app links.
+    # An overlay linked at ./overlay may add files to the built app; absent in the public tree.
+    postBuildScripts:
+      - name: Embed UsageBar CLI
+        script: |
+          mkdir -p "${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Helpers"
+          cp "${BUILT_PRODUCTS_DIR}/usagebar" "${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Helpers/usagebar"
+        basedOnDependencyAnalysis: false
+      # Debug: a fixed main-executable UUID, so a rebuilt UsageBar Dev.app keeps its local network
+      # grant (Apple TN3179). Release: asserts the linker's UUID is untouched.
+      - name: Pin dev UUID
+        script: |
+          "${SRCROOT}/scripts/pin-dev-uuid.sh"
+        basedOnDependencyAnalysis: false
+      - name: Overlay post-build
+        script: |
+          if [ -x "${SRCROOT}/overlay/postbuild.sh" ]; then "${SRCROOT}/overlay/postbuild.sh"; fi
+        basedOnDependencyAnalysis: false
+    settings:
+      base:
+        # Rust core: module map and headers in rust/include, libusagebar_ffi.a in BUILT_PRODUCTS_DIR.
+        SWIFT_INCLUDE_PATHS: $(inherited) $(SRCROOT)/rust/include
+        LIBRARY_SEARCH_PATHS: $(inherited) $(BUILT_PRODUCTS_DIR)
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        CODE_SIGN_ENTITLEMENTS: UsageBar/Resources/UsageBar.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: app.usagebar.UsageBar
+        MARKETING_VERSION: "0.86.0"
+        CURRENT_PROJECT_VERSION: "1671"
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        # UsageBar has no signing team yet: ad-hoc signing, so any machine can build it.
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: ""
+        PRODUCT_NAME: UsageBar
+        PRODUCT_MODULE_NAME: UsageBar
+        SWIFT_STRICT_CONCURRENCY: complete
+        ENABLE_HARDENED_RUNTIME: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Sparkle wiring. Both values flow into Info.plist via variable substitution; while either
+        # is empty (every Debug build substitutes an empty feed) UpdaterController stays dormant and
+        # the Settings row hides - dev builds never poll a feed. The private half of this key lives
+        # in the release Mac's login keychain (Sparkle generate_keys --account usagebar).
+        # The Release feed URL comes from Config/Overlay.xcconfig, where an overlay can override it;
+        # a target-level value here would win over any xcconfig.
+        SPARKLE_PUBLIC_ED_KEY: "65niMssPU0Cv6bycvGsMFp689EP8U1vT52YUMPPanOo="
+      configs:
+        Debug:
+          # The dev flavour's identity comes from Config/Overlay.xcconfig, so an overlay can give its
+          # Debug builds their own name and id and run next to the public dev build instead of
+          # closing it. Release never reads these.
+          PRODUCT_BUNDLE_IDENTIFIER: $(USAGEBAR_DEV_BUNDLE_IDENTIFIER)
+          PRODUCT_NAME: $(USAGEBAR_DEV_PRODUCT_NAME)
+          SPARKLE_FEED_URL: ""
+          # Ad-hoc signed (no team): library validation under the hardened runtime would refuse the
+          # embedded frameworks, which carry no Team ID either.
+          ENABLE_HARDENED_RUNTIME: NO
+    info:
+      path: UsageBar/Resources/Info.plist
+      properties:
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        SUFeedURL: "$(SPARKLE_FEED_URL)"
+        SUPublicEDKey: "$(SPARKLE_PUBLIC_ED_KEY)"
+        # Sparkle's own scheduler stays off; UpdaterController polls the feed itself (see below).
+        SUEnableAutomaticChecks: false
+        SUScheduledCheckInterval: 3600
+        # Sparkle otherwise ties "may install automatically" to "checks on a schedule", and UsageBar
+        # turns the latter off for good at launch: its scheduler stops permanently at the first
+        # release it finds, so UsageBar watches the feed itself and calls Sparkle when it is time to
+        # install (UpdaterController.start). Without this key that switch would be stuck off and
+        # the unattended install would never run.
+        SUAllowsAutomaticUpdates: false
+        CFBundleName: UsageBar
+        CFBundleDisplayName: "$(PRODUCT_NAME)"
+        LSUIElement: true
+        LSMinimumSystemVersion: "14.0"
+        # The default banner style disappears after a few seconds; alerts (CPU running hot, a pool
+        # about to run dry) stay on screen until dismissed, so they are not missed.
+        NSUserNotificationAlertStyle: alert
+        # Set by a private overlay; empty in the public build, which never reaches the local network.
+        NSLocalNetworkUsageDescription: "$(USAGEBAR_LOCAL_NETWORK_USAGE)"
+        # A background "Renew login" that does not complete falls back to a real Terminal window,
+        # opened through osascript. Apple events are a user-granted permission and macOS reads the
+        # reason from the RESPONSIBLE app (this one, not the osascript it spawns), so without this
+        # key it has nothing to ask with.
+        NSAppleEventsUsageDescription: "UsageBar brings a session's own terminal window to the front when you click it in the session list, and opens a Terminal window to run a provider's own login command when you renew an account's login."

@@ -1,0 +1,5 @@
+[package]
+name = "usagebar_sys"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true

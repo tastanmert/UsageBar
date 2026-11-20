@@ -1,0 +1,506 @@
+import Foundation
+import Observation
+
+/// Everything UsageBar installs OUTSIDE its own bundle - tracked, visible, and one-click reversible.
+///
+/// Two components today:
+/// - `cliTool`: the `/usr/local/bin/usagebar` symlink onto the bundled CLI (the VS Code
+///   "install 'code' command" pattern), in IntegrationsCLITool.swift - the one integration whose
+///   path is shared with the rest of the machine, so whose file is there has to be asked.
+/// - `codexShim`: a `codex` interposer at `~/.usagebar/bin/codex` plus a marked PATH block in
+///   `~/.zshenv`, so bare `codex` invocations follow the app's launch policy, in
+///   IntegrationsShim.swift - which is where the `Shim` type itself is declared as well.
+///
+/// Rules: installs are explicit buttons (never silent), every touched path is recorded in
+/// `~/.usagebar/manifest.json`, and shell-file edits live inside `# >>> usagebar integration >>>`
+/// markers so removal is a mechanical block strip that can never eat a user's own lines.
+@MainActor
+@Observable
+final class IntegrationsStore {
+    static let shared = IntegrationsStore()
+
+    /// The settings-file watcher behind the prompt-hook self-heal (IntegrationsSelfHeal.swift).
+    /// Stored here because an extension cannot hold one, and ignored by observation because nothing
+    /// renders it: its whole output is a repair and the refresh that follows one.
+    @ObservationIgnored var settingsWatcher: AccountDirWatcher?
+    /// What that watcher is currently pointed at, so a manifest change can tell whether the stream
+    /// has to be rebuilt or left alone (`settingsWatcherNeedsRestart`).
+    @ObservationIgnored var settingsWatcherRoots: [URL] = []
+    /// What the files the heal reads looked like when it last ran (`healGate`), when it last read the
+    /// state files, and the one deferred re-check a throttled state change leaves behind.
+    @ObservationIgnored var healFingerprint: HealFingerprint?
+    @ObservationIgnored var lastStateCheck: Date?
+    @ObservationIgnored var stateRecheckTask: Task<Void, Never>?
+    /// The tab completion install still in flight, HELD so a Remove can cancel it. It outlives the
+    /// press that started it because it waits on two child processes, and an unheld task is one
+    /// nothing can call off (IntegrationsCompletion.swift).
+    @ObservationIgnored var completionTask: Task<Void, Never>?
+    /// The administrator-privileged CLI link/unlink in flight (IntegrationsCLITool.swift). Non-nil
+    /// while the system password window may be up, so a second press cannot raise a second one.
+    @ObservationIgnored var cliElevationTask: Task<Void, Never>?
+    /// The banner text a failed CLI install wrote, so `refresh()` can take back exactly that text
+    /// once the link exists (the user ran the banner's command in Terminal) and nothing else.
+    @ObservationIgnored var cliInstallErrorText: String?
+    @ObservationIgnored var elevationProbeTask: Task<Void, Never>?
+
+    enum Status: Equatable {
+        case installed
+        case notInstalled
+        /// Present but wrong (dangling symlink, missing PATH block, stale shim) - fix = reinstall.
+        case broken(String)
+
+        /// Whether the row offers to put it in place: everything that is not already correct,
+        /// with the button reading Install or Reinstall accordingly.
+        var offersInstall: Bool { self != .installed }
+
+        /// Whether the row offers to take it back out. ANYTHING THE APP KNOWS IS ON DISK, a broken
+        /// one included, and that half is a fix rather than a nicety: broken is exactly the state
+        /// a registration reaches when it cannot be fully accounted for - an account signed out
+        /// since install, a settings.json that will not parse - and the manifest holding those
+        /// paths is a RETRY LIST whose only press is Remove (IntegrationsNotificationHook.swift).
+        /// A row offering Reinstall alone there could never run the pass that clears it.
+        var offersRemoval: Bool { self != .notInstalled }
+    }
+
+    // MARK: Paths
+
+    nonisolated static let binDirURL = UsageSnapshot.directory.appendingPathComponent("bin", isDirectory: true)
+    nonisolated static let cliSymlinkURL = URL(fileURLWithPath: "/usr/local/bin/\(BrandPaths.cliName)")
+    /// The manifest component the symlink is recorded under. A constant because it is read as
+    /// PROVENANCE as well as written as bookkeeping: the completion install asks it whether the
+    /// `usagebar` on the PATH is one of ours (`cliToolIsOurs`), and a second spelling of the key would
+    /// answer no for every install this app ever made.
+    nonisolated static let cliToolManifest = "cliTool"
+    nonisolated static let manifestURL = UsageSnapshot.directory.appendingPathComponent("manifest.json")
+    nonisolated static let zshenvURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".zshenv")
+
+    nonisolated static let blockBegin = "# >>> \(BrandPaths.shellBlockName) integration >>>"
+    nonisolated static let blockEnd = "# <<< \(BrandPaths.shellBlockName) integration <<<"
+
+    private(set) var cliToolStatus: Status = .notInstalled
+    /// What that status word was made from, kept beside it because the row needs the half the word
+    /// throws away: whether the thing at that path is UsageBar's to take away (`CLIToolPresence`).
+    private(set) var cliToolPresence: CLIToolPresence = .absent
+    /// Whether pressing Install would end in the system password window (`/usr/local/bin` not
+    /// writable by this user). Probed off the main thread on every refresh (B-4195).
+    private(set) var cliNeedsAdministrator = false
+    private(set) var shimStatuses: [Shim: Status] = [:]
+    private(set) var statusLineStatus: Status = .notInstalled
+    /// The `Notification` hook behind the panel's session board (IntegrationsNotificationHook.swift).
+    private(set) var codexSessionHookStatus: Status = .notInstalled
+    private(set) var notificationHookStatus: Status = .notInstalled
+    /// The three subagent hooks behind the session card's agent count (IntegrationsAgentHook.swift).
+    private(set) var agentHookStatus: Status = .notInstalled
+    /// The two hooks that carry the advisory quota knock into a session's own context
+    /// (IntegrationsKnockHook.swift), instead of it being typed into their terminal.
+    private(set) var knockHookStatus: Status = .notInstalled
+    private(set) var skillStatus: Status = .notInstalled
+    /// No Claude / no Codex account on this Mac, read off the same lists `refresh()` hands the detects
+    /// (no scan of its own), so the page can say Install all skips those rows without touching disk or
+    /// the Keychain on every redraw (B-4196).
+    private(set) var noClaudeAccount = false
+    private(set) var noCodexAccount = false
+    /// Whether the other accounts run on the main account's harness (IntegrationsSharedHarness).
+    /// Optional because a one-account machine has no row here at all, rather than an empty one.
+    private(set) var sharedHarnessStatus: Status?
+    /// Whether zsh tab completion for `usagebar` is present (IntegrationsCompletion.swift). Not a
+    /// `Status` and not a row of its own: it has no install button, because it goes in with the
+    /// command line tool. False while that tool IS installed is what the row's extra sentence is
+    /// for. Setter internal (not private): the completion extension file writes it too.
+    var completionInstalled = false
+    /// Set when an install/remove fails (e.g. /usr/local/bin not writable); shown inline.
+    /// Setter internal (not private): the skill extension file writes it too.
+    var lastError: String?
+    /// Integrations this app installed on its own, on a machine that had already authorized the file
+    /// they go in, and which nobody has been told about yet (IntegrationsAutoFollow.swift). Setter
+    /// internal (not private): that extension file writes it, and `private` is file-scoped.
+    var autoFollowNotices: [String] = []
+
+    /// Seeded before the first refresh, so the pane's first frame already carries what a previous
+    /// launch installed and nobody has read yet.
+    private init() {
+        autoFollowNotices = Self.storedAutoFollowNotices()
+        refresh()
+    }
+
+    // MARK: Status
+
+    func refresh() {
+        cliToolPresence = Self.detectCLIToolPresence()
+        cliToolStatus = Self.detectCLITool(cliToolPresence)
+        shimStatuses = Dictionary(uniqueKeysWithValues: Shim.allCases.map { ($0, Self.detectShim($0)) })
+        let cli = Self.integrationCLIDeliverable()
+        // One scan of the accounts for all four Claude detects, one for the Codex one.
+        let claudeFiles = Self.claudeSettingsFiles()
+        let codexHomes = Self.codexSessionHomes()
+        noClaudeAccount = claudeFiles.isEmpty
+        noCodexAccount = codexHomes.isEmpty
+        statusLineStatus = Self.requiringCLI(Self.detectStatusLine(files: claudeFiles), cliDeliverable: cli)
+        notificationHookStatus = Self.requiringCLI(Self.detectNotificationHook(discovered: claudeFiles), cliDeliverable: cli)
+        codexSessionHookStatus = Self.requiringCLI(Self.detectCodexSessionHooks(homes: codexHomes), cliDeliverable: cli)
+        agentHookStatus = Self.requiringCLI(Self.detectAgentHooks(discovered: claudeFiles), cliDeliverable: cli)
+        knockHookStatus = Self.requiringCLI(Self.detectKnockHooks(discovered: claudeFiles), cliDeliverable: cli)
+        skillStatus = Self.detectSkill()
+        sharedHarnessStatus = Self.detectSharedHarness()
+        completionInstalled = Self.detectCompletion()
+        // The link now exists, so a failure banner telling the user to make it is stale (B-4197).
+        (lastError, cliInstallErrorText) = Self.settledCLIError(
+            lastError: lastError, cliErrorText: cliInstallErrorText, cliInstalled: cliToolStatus == .installed)
+        elevationProbeTask?.cancel()
+        elevationProbeTask = Task {
+            let needs = await Task.detached { Self.expectedLinkBlock() != nil }.value
+            if !Task.isCancelled { cliNeedsAdministrator = needs }
+        }
+    }
+
+    /// Once the link exists the banner that told the user to make it is stale: takes back exactly
+    /// that text, and nothing else. Pure for the suite.
+    nonisolated static func settledCLIError(lastError: String?, cliErrorText: String?, cliInstalled: Bool)
+        -> (lastError: String?, cliErrorText: String?) {
+        guard let text = cliErrorText, cliInstalled else { return (lastError, cliErrorText) }
+        return (lastError == text ? nil : lastError, nil)
+    }
+
+    // MARK: Install / remove
+
+    /// The dev variant never mutates shared system state (the /usr/local/bin link, shell
+    /// profiles, claude settings): those integrations belong to the installed release app.
+    /// UI-level disabling backs this up; this is the hard gate.
+    /// Internal (not private): the skill extension file uses it too.
+    func guardNotDev() -> Bool {
+        // BRIM-GATE: the user's press, from an installed copy only (BuildVariant.ownsIntegrations).
+        guard BrimFeatures.integrationInstall else { return false }
+        guard !BuildVariant.ownsIntegrations else { return true }
+        lastError = Self.buildFolderMessage
+        return false
+    }
+
+    /// What a copy running from a build folder says instead of installing.
+    nonisolated static var buildFolderMessage: String {
+        L("Move UsageBar to the Applications folder first. Integrations are not installed from a build folder.")
+    }
+
+    /// The hooks and the status line name a program, so with nothing runnable there every one of
+    /// them fails on every event. A press is refused rather than writing a
+    /// registration that cannot run. Read live rather than off `cliToolStatus`, so "Install all"
+    /// sees the link it just made.
+    func guardCLIDeliverable() -> Bool {
+        guard !Self.integrationCLIDeliverable() else { return true }
+        lastError = L("Install the command line tool first.")
+        return false
+    }
+
+    /// Whether a registration written now would run: the public link, or failing that the CLI
+    /// inside this app bundle (`integrationCLIPath`).
+    static func integrationCLIDeliverable() -> Bool {
+        quotaKnockCLIDeliverable() || FileManager.default.isExecutableFile(atPath: bundledCLIURL.path)
+    }
+
+    /// The program the hooks, the status line and the Codex hooks are registered with: the public
+    /// link while it runs (it survives the app moving), else the CLI inside this app bundle, quoted
+    /// as one shell word. Detection reads the command's last words, so either spelling is ours.
+    static func integrationCLIPath() -> String {
+        (quotaKnockCLIDeliverable() || !FileManager.default.isExecutableFile(atPath: bundledCLIURL.path))
+            ? quotaKnockHookCLIPath : shellWord(bundledCLIURL.path)
+    }
+
+    /// A registration whose command cannot run is not installed: it reads as broken, so the row
+    /// says why instead of "Installed". Pure for the suite.
+    static func requiringCLI(_ status: Status, cliDeliverable: Bool) -> Status {
+        status == .notInstalled || cliDeliverable
+            ? status : .broken(L("Install the command line tool first."))
+    }
+
+    // MARK: Claude status line - "account · model" at the bottom of every claude session
+
+    /// The registered command (provenance marker too: removal only touches an entry that IS
+    /// this string). Depends on the CLI tool integration for the stable public path.
+    nonisolated static let statusLineCommand = ProjectStatusLine.ourCommand
+
+    /// Every discovered claude config home, NOT deduplicated - the population, as opposed to the
+    /// physical-file lists below it.
+    ///
+    /// Deduplication is right when the question is "which FILE do I write", and wrong when it is
+    /// "whose file is this". Homes that share one settings.json, or one skills tree, still have
+    /// their own commands folder: asking about the survivor of a dedup and answering for all of
+    /// them is how a home's own `/usagebar` gets taken over (IntegrationsSwitchCommand.swift).
+    nonisolated static func claudeHomes() -> [URL] {
+        ClaudeAccounts.discover().compactMap { $0.launchHome.map { URL(fileURLWithPath: $0) } }
+    }
+
+    /// The folder inside `<home>/skills` the skill lives in.
+    ///
+    /// THE FOLDER NAME IS A REGISTRATION, not a detail of where a file sits. Claude Code keys its
+    /// slash-command menu on the folder, so a skill folder called `usagebar` took the `/usagebar` COMMAND
+    /// off that menu: 0.44.0 installed both, and the command was on every machine and offered on
+    /// none of them, while the menu listed the skill under the name its frontmatter carries. So the
+    /// folder is spelled the way the frontmatter is, and the two namespaces no longer collide. What
+    /// carries an install already on disk across to it is IntegrationsSkillFolderMove.swift.
+    nonisolated static let skillFolderName = "\(BrandPaths.slug)-quota"
+
+    /// Where the skill lives inside one config home. (`claudeSkillFiles()` builds the same path for
+    /// the discovered homes through this one spelling.)
+    nonisolated static func claudeSkillFile(inHome home: URL) -> URL {
+        home.appendingPathComponent("skills/\(skillFolderName)/SKILL.md")
+    }
+
+    /// One settings.json per discovered claude home, deduplicated by physical file (shared
+    /// setups symlink the same settings everywhere - one edit must not be counted N times).
+    /// Internal (not private): the skill's prompt hook is registered in the same files.
+    static func claudeSettingsFiles() -> [URL] {
+        var seen = Set<String>()
+        return ClaudeAccounts.discover().compactMap { account -> URL? in
+            guard let home = account.launchHome else { return nil }
+            let url = URL(fileURLWithPath: home).appendingPathComponent("settings.json")
+            return seen.insert(url.resolvingSymlinksInPath().path).inserted ? url : nil
+        }
+    }
+
+    private static func detectStatusLine(files: [URL]) -> Status {
+        guard !files.isEmpty else { return .notInstalled }
+        var ours = 0
+        for file in files {
+            let settings = (try? JSONSerialization.jsonObject(
+                with: (try? Data(contentsOf: file)) ?? Data())) as? [String: Any]
+            let command = (settings?["statusLine"] as? [String: Any])?["command"] as? String
+            if command.map(ProjectStatusLine.isOurs) == true { ours += 1 }
+        }
+        if ours == 0 { return .notInstalled }
+        return ours == files.count ? .installed : .broken(L("Not installed for every account"))
+    }
+
+    func installStatusLine() {
+        guard guardNotDev(), guardCLIDeliverable() else { return }
+        lastError = nil
+        do {
+            let files = Self.claudeSettingsFiles()
+            let command = ProjectStatusLine.command(at: Self.integrationCLIPath())
+            for file in files {
+                _ = try Self.upsertStatusLine(in: file, command: command)
+            }
+            recordManifest("claudeStatusLine", paths: files.isEmpty ? nil : files.map(\.path))
+        } catch {
+            lastError = error.localizedDescription
+        }
+        refresh()
+    }
+
+    func removeStatusLine() {
+        guard guardNotDev() else { return }
+        lastError = nil
+        do {
+            for file in Self.claudeSettingsFiles() {
+                try Self.removeStatusLine(in: file, command: Self.statusLineCommand)
+            }
+            recordManifest("claudeStatusLine", paths: nil)
+        } catch {
+            lastError = error.localizedDescription
+        }
+        refresh()
+    }
+
+    /// Reads settings.json, applies `edit`, and writes it back atomically. Returns true when the
+    /// file changed; an edit that returns nil is a no-op, which is how idempotence is expressed.
+    ///
+    /// The refusal is the point, and it is why every write into this file goes through here: a file
+    /// that EXISTS and does not parse is left exactly as it is and reported. Reading it as an empty
+    /// document instead (a `try?` and a `?? [:]`) would replace a user's whole harness
+    /// configuration with the one key being registered, and the file it would eat is precisely the
+    /// one already in trouble. Internal for the unit tests - a mis-write here eats user
+    /// configuration. Written in the file's own layout (claudeJSONData): keys keep their order and
+    /// untouched parts keep their bytes, so a dotfiles repository sees only the entry that changed.
+    ///
+    /// It writes to the PHYSICAL file, which is not always the path it was handed: this machine's
+    /// multi-account setup symlinks `~/.claudeN/settings.json` at the main account's file so one
+    /// configuration serves every account. An atomic write replaces the path it is given, so
+    /// writing to the link would replace the link with a regular file - severing exactly the
+    /// sharing the user set up, silently, and leaving the other accounts on a copy that stops
+    /// following their edits.
+    static func editSettings(_ file: URL,
+                             _ edit: ([String: Any]) -> [String: Any]?) throws -> Bool {
+        let target = file.resolvingSymlinksInPath()
+        /// The one refusal, reached through two doors: bytes that cannot be read, and bytes that
+        /// do not parse. Both mean the same thing here, and cost the same thing if ignored.
+        func unreadable() -> Error {
+            NSError(domain: BrandPaths.cliName, code: 5, userInfo: [
+                NSLocalizedDescriptionKey: L("Could not read settings.json, so it was left untouched"),
+            ])
+        }
+        var settings: [String: Any] = [:]
+        var original: Data?
+        // Present and unreadable is NOT absent. A permissions failure reaching the `?? [:]` path
+        // would rewrite a file whose contents were never seen.
+        if FileManager.default.fileExists(atPath: target.path) {
+            guard let data = try? Data(contentsOf: target) else { throw unreadable() }
+            original = data
+            guard let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { throw unreadable() }
+            settings = parsed
+        }
+        if let hooks = settings["hooks"] {
+            guard let events = hooks as? [String: Any],
+                  events.values.allSatisfy({ value in
+                      guard let entries = value as? [[String: Any]] else { return false }
+                      return entries.allSatisfy { $0["hooks"] is [[String: Any]] }
+                  }) else { throw unreadable() }
+        }
+        guard let merged = edit(settings) else { return false }
+        if original != nil { try IntegrationsBackup.save(target) }
+        let out = try claudeJSONData(merged, replacing: original)
+        try FileManager.default.createDirectory(at: target.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try out.write(to: target, options: .atomic)
+        return true
+    }
+
+    /// Registers UsageBar's statusLine in one settings.json. A user's OWN status line is never
+    /// clobbered: its command is carried inside ours as base64 (`--wrap <b64>` - no shell
+    /// quoting minefield, exactly restorable), the CLI keeps running it and appends the
+    /// account. Returns true when the file changed.
+    static func upsertStatusLine(in file: URL, command: String) throws -> Bool {
+        try editSettings(file) { settings in
+            let existing = (settings["statusLine"] as? [String: Any])?["command"] as? String
+            if existing?.hasPrefix(command) == true { return nil }   // already ours - idempotent
+            var registered = command
+            if let existing, ProjectStatusLine.isOurs(existing) {
+                // Ours through another program (the link appeared, or the app moved): the same
+                // tail, the current program.
+                registered += ProjectStatusLine.program(of: existing).map {
+                    String($0.rest.dropFirst("statusline claude".count))
+                } ?? ""
+            } else if let existing, !existing.isEmpty {
+                // Self-healing: if the usagebar binary ever disappears WITHOUT a clean remove (app
+                // dragged to the trash), the shell fallback decodes and runs the user's original
+                // status line directly - their setup survives UsageBar's death untouched.
+                let b64 = Data(existing.utf8).base64EncodedString()
+                registered += " --wrap \(b64) 2>/dev/null || printf %s \(b64) | base64 -D | /bin/sh"
+            }
+            var merged = settings
+            // The user's other statusLine keys (padding, ...) ride along; only these two change.
+            var line = settings["statusLine"] as? [String: Any] ?? [:]
+            line["type"] = "command"
+            line["command"] = registered
+            merged["statusLine"] = line
+            return merged
+        }
+    }
+
+    /// Reverses `upsertStatusLine` exactly: a wrapped registration restores the user's original
+    /// command; a plain one removes the entry. Anything not ours is left untouched.
+    ///
+    /// Through `editSettings` like every other write into this file, which is what makes removal
+    /// symlink-safe: it used to write the path it was handed, so uninstalling from a shared setup
+    /// severed the link the install had just been careful to keep. Returns true when the file
+    /// changed; a file that cannot be read now throws here as it does on install, rather than
+    /// reporting a removal that never happened.
+    @discardableResult
+    static func removeStatusLine(in file: URL, command: String) throws -> Bool {
+        try editSettings(file) { settings in
+            guard let registered = (settings["statusLine"] as? [String: Any])?["command"] as? String,
+                  ProjectStatusLine.isOurs(registered) else { return nil }
+            var merged = settings
+            let marker = " --wrap "
+            if let range = registered.range(of: marker),
+               let token = registered[range.upperBound...].split(separator: " ").first,
+               let data = Data(base64Encoded: String(token)),
+               let original = String(data: data, encoding: .utf8) {
+                var line = settings["statusLine"] as? [String: Any] ?? [:]
+                line["type"] = "command"
+                line["command"] = original
+                merged["statusLine"] = line
+            } else {
+                merged.removeValue(forKey: "statusLine")
+            }
+            return merged
+        }
+    }
+
+    // MARK: Marked shell-file block
+
+    /// Replace (or append) the usagebar block. Anything outside the markers is preserved
+    /// byte-for-byte. Internal (not private) so the block surgery is unit-testable - a mis-strip
+    /// eats user config.
+    static func upsertBlock(in file: URL, body: String) throws {
+        let existing = try existingText(of: file) ?? ""
+        let block = "\(blockBegin)\n\(body)\n\(blockEnd)"
+        var content = try stripped(existing)
+        if !content.isEmpty, !content.hasSuffix("\n") { content += "\n" }
+        content += block + "\n"
+        try writeShellFile(file, content, replacing: existing)
+    }
+
+    static func stripBlock(in file: URL) throws {
+        guard let existing = try existingText(of: file) else { return }
+        try writeShellFile(file, try stripped(existing), replacing: existing)
+    }
+
+    /// Throws when the shell file holds a half-open block, writing nothing: the install computes
+    /// every new text before it touches a file, so a refusal leaves no half-installed state.
+    static func validateShimShellFiles(zshenv: URL) throws {
+        if let text = try existingText(of: zshenv) { _ = try stripped(text) }
+    }
+
+    /// nil when the file is absent; throws when it is there and cannot be read, so a profile this
+    /// process cannot see is never replaced by an empty one.
+    private static func existingText(of file: URL) throws -> String? {
+        guard FileManager.default.fileExists(atPath: file.path) else { return nil }
+        return try String(contentsOf: file, encoding: .utf8)
+    }
+
+    /// Backed up first, written only when the text changed.
+    private static func writeShellFile(_ file: URL, _ content: String, replacing existing: String) throws {
+        guard content != existing else { return }
+        try IntegrationsBackup.save(file)
+        try content.write(to: file.resolvingSymlinksInPath(), atomically: true, encoding: .utf8)
+    }
+
+    /// Content with every marker block of ours removed. Throws if a block is half-open (never
+    /// guess - a mis-strip could eat user lines).
+    private static func stripped(_ content: String) throws -> String {
+        var lines = content.components(separatedBy: "\n")
+        while let begin = lines.firstIndex(of: blockBegin) {
+            guard let end = lines[begin...].firstIndex(of: blockEnd) else {
+                throw NSError(domain: BrandPaths.cliName, code: 2, userInfo: [
+                    NSLocalizedDescriptionKey: L("Unclosed UsageBar block in shell profile"),
+                ])
+            }
+            lines.removeSubrange(begin ... end)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: Manifest - provenance of everything installed outside the bundle
+
+    /// Internal (not private): the skill extension file uses it too.
+    func recordManifest(_ component: String, paths: [String]?) {
+        do {
+            var manifest: [String: Any] = [:]
+            if FileManager.default.fileExists(atPath: Self.manifestURL.path) {
+                let data = try Data(contentsOf: Self.manifestURL)
+                guard let document = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                manifest = document
+            }
+            if let paths {
+                manifest[component] = [
+                    "paths": paths,
+                    "installedAt": ISO8601DateFormatter().string(from: Date()),
+                    "appVersion": BuildVariant.version ?? "dev",
+                ]
+            } else {
+                manifest.removeValue(forKey: component)
+            }
+            let data = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
+            try FileManager.default.createDirectory(at: UsageSnapshot.directory, withIntermediateDirectories: true)
+            // One copy per process: the first state seen. save() would add a UUID-named copy on every call.
+            if !FileManager.default.fileExists(atPath: IntegrationsBackup.copyURL(for: Self.manifestURL).path) {
+                try IntegrationsBackup.save(Self.manifestURL)
+            }
+            try data.write(to: Self.manifestURL, options: .atomic)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+}

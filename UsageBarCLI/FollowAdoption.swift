@@ -1,0 +1,245 @@
+import Foundation
+
+// Following the launch default: changing "Default model & effort" in Settings re-points a RUNNING
+// session at the next quiet moment.
+//
+// Lifted out of the poll loop (Supervisor.swift is at the repo's file-size cap) in the shape the
+// tick's other deferred decisions already use: the state it owns comes in as one `inout` value, the
+// plan it may write comes in as another, and everything else it consults is injected, so the whole
+// decision is reachable in a test without spawning a child. `applyReloadRequest` (Reload.swift) and
+// `applySafeguardRestore` (SafeguardDrift.swift) are the same shape.
+//
+// One structural gain from being a function rather than a labeled block: the dead-end path leaves
+// the adoption with a plain `return`, and the loop-skipping statement that once caused a real defect
+// here cannot compile outside a loop at all (2026-07-25: a session waiting on an unservable model
+// never even acknowledged a `usagebar reload`). That invariant used to rest on a label being used
+// correctly; a test still asserts it, by a word search that cannot tell prose from code, which is
+// why the statement is described rather than named anywhere in this file.
+
+/// Follow debounce: a short floor now that Settings writes the model+effort pair atomically on
+/// Apply (it used to arrive as two writes seconds apart, needing a 10s window to coalesce). The
+/// floor only guards against adopting a transient mid-write; the atomic write means one Apply is
+/// one relaunch regardless.
+let followDebounce: TimeInterval = 2
+
+/// Everything the follow adoption remembers between ticks. Held by the supervisor across relaunches
+/// (like the fuse and the quarantine), because the question "has the configured default changed
+/// since this session adopted one" outlives any single child.
+struct FollowState {
+    /// The launch-default pair (model, effort) this session currently runs on. A Settings change
+    /// is adopted only when the desired pair differs from this one, and this updates on adopt, so
+    /// each change fires exactly once and an unchanged policy never churns. The fallback profile
+    /// rewrites launchArgs without touching these, so a fallback in effect does not retrigger.
+    var followedModel: String?
+    var followedEffort: String?
+    var pendingModel: String?
+    var pendingEffort: String?
+    var pendingSince: Date?
+    /// True once the "will adopt when idle" note has been shown for the current pending pair, so a
+    /// session that is being used does not repeat it every tick.
+    var queuedNotice = false
+    /// True while a follow adoption has nowhere to land (no account can serve the new model), so
+    /// the "waiting" note is shown once, not every tick. Cleared when an account frees up.
+    var deadEnd = false
+
+    /// Seeded from the command line this session launched with: a hand-typed `--model` IS the pair
+    /// the session runs, so a Settings default that already matches it is not a change to adopt.
+    init(launchArgs: [String]) {
+        followedModel = flagValue(launchArgs, "--model")?.lowercased()
+        followedEffort = flagValue(launchArgs, "--effort")?.lowercased()
+    }
+
+    /// This session now runs `model`/`effort`, whoever decided that: re-point the baseline and drop
+    /// any adoption that was queued against the old one.
+    ///
+    /// Its own method because a SECOND writer appeared (`applySessionModel`, SessionModel.swift) and
+    /// the three fields have to move together: a baseline updated without clearing `pendingSince`
+    /// leaves a debounce running for a pair nobody is waiting for any more, and the queued note
+    /// beside it would go on describing it.
+    mutating func adopt(model: String?, effort: String?) {
+        followedModel = model?.lowercased()
+        followedEffort = effort?.lowercased()
+        pendingSince = nil
+        queuedNotice = false
+    }
+}
+
+/// The pair a session should run once its following axes take the policy's value. A held axis (a
+/// typed flag, #14) keeps what the args carry, so a pair built from it never moves that axis.
+private func followTarget(_ axes: FollowAxes, policy: LaunchPolicy,
+                          launchArgs: [String]) -> (model: String?, effort: String?) {
+    (axes.model ? policy.model : flagValue(launchArgs, "--model"),
+     axes.effort ? policy.effort : flagValue(launchArgs, "--effort"))
+}
+
+/// Whether the policy moved on an axis that is FOLLOWING. A held axis is excluded: `followTarget`
+/// fills it from the args, so comparing it against the baseline would read a fallback or restore
+/// rewrite (which leaves the baseline alone on purpose) as a Settings change and undo it (#14).
+private func followMoved(_ axes: FollowAxes, desired: (String?, String?), state: FollowState) -> Bool {
+    (axes.model && desired.0 != state.followedModel) || (axes.effort && desired.1 != state.followedEffort)
+}
+
+/// One tick's follow decision. Deliberate, so no fuse. Adoption waits until the desired pair holds
+/// steady for `followDebounce` (model and effort are picked one after the other), UNLESS a relaunch
+/// is already planned this tick - then it folds in for free (one SIGTERM). In auto mode the session
+/// re-picks its account for the NEW model (incumbent-seeded, so a still-serviceable account never
+/// churns; the 02:22 storm relaunched onto an account with no room for the new model).
+/// Manual/pinned never switches account, and a dead end (no account can serve the new model) waits
+/// instead of relaunching onto a wall.
+///
+/// `following` names the axes that follow the default: a typed `--model` or `--effort` holds its own
+/// axis at the typed value, and `--no-follow` holds both. With no axis following there is no default
+/// to follow, and the state is left untouched.
+/// `snapshot` is injected for the same reason the keyboard is: the auto-mode re-pick is the one
+/// branch that reads the fleet, and a test that cannot decide what the fleet looks like cannot reach
+/// the dead end deliberately. It defaults to the real read, so the tick calls this unchanged.
+func applyFollowAdoption(plan: inout RelaunchPlan?, state: inout FollowState, following: FollowAxes,
+                         policy: LaunchPolicy, account: Snapshot.Account, providerID: String,
+                         steering: Bool, launchArgs: [String],
+                         quarantine: [String: (model: String?, until: Date)],
+                         reserves: AccountReserves = .none,
+                         watcher: inout TranscriptWatcher,
+                         keyboardIdle: (TimeInterval) -> Bool,
+                         snapshot loadSnapshotting: () -> (Snapshot?, String?) = loadSnapshot) {
+    guard following.any else { return }
+    let target = followTarget(following, policy: policy, launchArgs: launchArgs)
+    let desired = (target.model?.lowercased(), target.effort?.lowercased())
+    // Nothing to adopt: the pair follow last set, or one that another rewrite already
+    // put on the command line while leaving this baseline stale (the reasoning lives
+    // with `followAlreadySatisfied` in SupervisorRuntime.swift). Re-point the baseline
+    // and say nothing - queueing here promises a relaunch that would change nothing.
+    if !followMoved(following, desired: desired, state: state)
+        || followAlreadySatisfied(desiredModel: desired.0, desiredEffort: desired.1,
+                                  launchArgs: launchArgs) {
+        state.adopt(model: desired.0, effort: desired.1)
+    } else if state.pendingSince == nil || desired != (state.pendingModel, state.pendingEffort) {
+        (state.pendingModel, state.pendingEffort) = desired
+        state.pendingSince = Date()
+        state.queuedNotice = false
+    } else if let since = state.pendingSince,
+              // A relaunch already planned this tick carries the new pair for free, so
+              // it never waits: the SIGTERM is happening either way. A follow standing
+              // on its own is the only one that interrupts, so it waits for genuine
+              // idleness: file AND keyboard, since a typed prompt reaches neither yet.
+              plan != nil || (Date().timeIntervalSince(since) >= followDebounce
+                              && watcher.isQuiet(followIdleSeconds)
+                              && keyboardIdle(followIdleSeconds)) {
+        if var existing = plan, !existing.followFolded {
+            // A held axis keeps what the plan names or the args carry: the rewrite below strips
+            // both flags, so leaving it nil would drop the typed one.
+            existing.model = following.model ? target.model : existing.model ?? target.model
+            existing.effort = following.effort ? target.effort : existing.effort ?? target.effort
+            existing.followFolded = true
+            plan = existing
+            warn("also adopting launch default \(target.model ?? "default")/" +
+                 "\(target.effort ?? "default")")
+            state.adopt(model: desired.0, effort: desired.1)
+        } else if plan == nil {
+            let repick: Snapshot.Account?
+            // A FLEET SET TO OBSERVE ONLY READS EXACTLY LIKE A PIN HERE, and that is the whole of
+            // what `off` does to this station: the Settings change is still adopted, on the account
+            // this session is already on, because the change is the user's instruction and only the
+            // account re-pick is UsageBar's own choice (AutoSteering.swift). Folded into this branch
+            // rather than added as a refusal above, because "adopt without moving" is a behaviour
+            // this file already has and a dead end here would silently do nothing - the defect this
+            // file exists to have fixed.
+            if !steering || policy.mode == "manual" {
+                repick = account
+            } else {
+                let (snapshot, problem) = loadSnapshotting()
+                let excluded = quarantinedAccounts(forPrimary: target.model,
+                                                   sessionLocal: quarantine)
+                // Numbers too old to trust move nobody, the rule the cap handoff and the idle
+                // rebalance both follow: a pick made on hours-old quota is how a session lands
+                // somewhere worse than it started. Staying is not the same as refusing, though -
+                // the adoption still happens, on this account, because a Settings change that
+                // silently does nothing is the defect this file exists to have fixed.
+                repick = problem == nil
+                    ? snapshot.flatMap {
+                        incumbentSeededBest(providerID: providerID, in: $0,
+                                            incumbentID: account.id, primaryModel: target.model,
+                                            excluding: excluded, reserves: reserves)
+                    }
+                    : account
+            }
+            guard let repick else {
+                state.deadEnd = true
+                return
+            }
+            state.deadEnd = false
+            warn("launch default changed to \(target.model ?? "default")/" +
+                 "\(target.effort ?? "default") → adopting it" +
+                 (repick.id != account.id ? " on \(repick.label)" : ""))
+            plan = RelaunchPlan(target: repick, reason: "follow", countsFuse: false,
+                                model: target.model, effort: target.effort)
+            state.adopt(model: desired.0, effort: desired.1)
+        }
+    } else {
+        // Queued behind an in-use session: the badge carries it, so the change never
+        // looks lost and nothing is printed over the prompt being typed.
+        state.queuedNotice = true
+    }
+}
+
+/// A relaunch that names no model or effort of its own runs the pair this session is following
+/// NOW, rather than the pair the previous child happened to be started with (B-1091). Every
+/// relaunch reason (a cap handoff, a switch, a reload, a self-update) used to carry the old child's
+/// args forward untouched, so a profile changed since the launch only landed if a SECOND restart,
+/// the follow's own, came after it. Folding here makes the restart already happening the only one.
+///
+/// Judged against the follow's own baseline, not against the args: the fallback profile and the
+/// safeguard restore rewrite the args on purpose without moving that baseline, and a relaunch must
+/// not quietly undo them. A plan that already names a pair (a `usagebar model`, a fallback, a rescue)
+/// or releases one (`clearsAxes`) is more specific and is left alone, and so is a session that is
+/// not following at all (`--no-follow`, or a live model pin, which the caller folds into
+/// `following`). A hand-typed flag holds its own axis only: the fold keeps that value and moves the
+/// other axis (#14). Returns whether it folded.
+@discardableResult
+func foldFollowIntoRelaunch(_ plan: inout RelaunchPlan, state: inout FollowState,
+                            following: FollowAxes, policy: LaunchPolicy,
+                            launchArgs: [String]) -> Bool {
+    guard following.any, plan.model == nil, plan.effort == nil, !plan.clearsAxes, !plan.followFolded
+    else { return false }
+    let target = followTarget(following, policy: policy, launchArgs: launchArgs)
+    let desired = (target.model?.lowercased(), target.effort?.lowercased())
+    if !followMoved(following, desired: desired, state: state) { return false }
+    if followAlreadySatisfied(desiredModel: desired.0, desiredEffort: desired.1,
+                              launchArgs: launchArgs) {
+        state.adopt(model: desired.0, effort: desired.1)
+        return false
+    }
+    plan.model = target.model
+    plan.effort = target.effort
+    // A nil axis means REMOVE the flag: the effective setting declares none, so the child must not
+    // keep one the old args carried.
+    plan.clearsAxes = true
+    plan.followFolded = true
+    state.adopt(model: desired.0, effort: desired.1)
+    return true
+}
+
+/// The relaunch point's half of the fold, kept here so the poll loop calls it in one line. The
+/// profile's model and effort are re-read first, into the loop's own copy, so every tick after this
+/// one follows the same reading and nothing flips the fold back. The account it pins keeps the
+/// reading the supervisor started with: that decides where the session runs, not what it runs.
+func foldEffectiveFollow(_ plan: inout RelaunchPlan, state: inout FollowState,
+                         project: inout ProjectPolicy, following: FollowAxes, providerID: String,
+                         launchArgs: [String]) {
+    let fresh = projectPolicy(providerID)
+    (project.model, project.effort) = (fresh.model, fresh.effort)
+    foldFollowIntoRelaunch(&plan, state: &state, following: following,
+                           policy: effectivePolicy(launchPolicy(providerID), project: project),
+                           launchArgs: launchArgs)
+}
+
+/// The args the FIRST child of a self-update exec runs with. That image inherits the old child's
+/// args, and a build older than B-1091 passed them through without re-deriving the pair, so the
+/// fold above happens once more here, before the spawn, rather than on the first tick, where the
+/// follow would spend a second restart on it.
+func resumedLaunchArgs(_ args: [String], state: inout FollowState, following: FollowAxes,
+                       policy: LaunchPolicy, target: Snapshot.Account) -> [String] {
+    var plan = RelaunchPlan(target: target, reason: "self-update", countsFuse: false)
+    guard foldFollowIntoRelaunch(&plan, state: &state, following: following, policy: policy,
+                                 launchArgs: args) else { return args }
+    return planLaunchArgs(args, plan: plan)
+}

@@ -1,0 +1,348 @@
+import Foundation
+
+/// The launch flags that exist so something can be LOOKED AT, and the one policy they share: a
+/// launch carrying any of them never pulls the app to the front by itself.
+///
+/// The policy started life inside the login-item state preview, which was the flag that needed it
+/// first, and that was the mistake: every other capture flag has exactly the same requirement and
+/// none of them were covered, so a launch asking for a panel snapshot still got yanked forward by
+/// a window restore. What is scoped to one flag here is nothing; the family is the unit.
+///
+/// Membership is decided by PURPOSE, one question per flag: does this exist so something can be
+/// observed without taking the observer's desktop away? The ones that answer no are in
+/// `interactiveKeys`, and they exist to be DRIVEN by hand instead. Driving something means being in
+/// front of it, so they are not in the family. It costs nothing either way, since a plain `open`
+/// activates the app regardless, but the family means something only while it is defined by purpose
+/// rather than by convenience.
+///
+/// The `modifierKeys` are absent for a different reason: they are modifiers, inert without the flag
+/// they qualify, and that flag is in the list. A launch carrying one of them alone is showing
+/// nothing and has nothing to protect.
+///
+/// The asymmetry worth knowing when adding a flag: including one that did not need it changes
+/// nothing observable, because a foreground launch is activated by macOS anyway and this only
+/// suppresses the app's own second activation. LEAVING ONE OUT is the direction that breaks, and
+/// it breaks silently, in the background, where nobody is watching. When unsure, include it.
+enum CaptureLaunch {
+    /// The login-item row's own state preview. Named because two other rules ask about it
+    /// specifically (LoginItemPreview), and a second spelling of the key would put them on a
+    /// different flag from this list.
+    static let loginItemPreview = "UsageBarLoginItemPreview"
+
+    /// The Settings window held open for a capture. Named for the same reason, and spelled HERE
+    /// rather than beside the code that reads it (`SettingsCaptureLaunch`): that code reaches
+    /// SwiftUI, and the classification below must stay compilable on its own, which is what lets the
+    /// completeness check compile this file without the app.
+    static let settingsCapture = "UsageBarSettingsCapture"
+
+    /// The first-run welcome window held on one screen (`WelcomeWindowController`), and the flag
+    /// that opens it again on a Mac that has already seen it. Spelled here for the reason
+    /// `settingsCapture` is: the window controller reads them, and this file must compile alone.
+    static let welcomePreview = "UsageBarWelcomePreview"
+    static let welcomeForce = "UsageBarWelcomeForce"
+
+    /// The panel's two one-time nudges (`PanelHintsSection`) and the small "Add the usagebar command"
+    /// window (`UsageBarCommandWindowController`), each held for a look. Spelled here for the same
+    /// reason: the views read them, and this file must compile alone.
+    static let panelHintPreview = "UsageBarPanelHintPreview"
+    static let commandPreview = "UsageBarCommandPreview"
+    /// A private build's own surface held on one named screen (Dev or demo); the public build reads nothing.
+    static let overlayPreview = "UsageBarOverlayPreview"
+
+    /// Every flag whose launch is here to be observed. Grouped by what they put on screen.
+    static let backgroundKeys: [String] = [
+        // Fixtures and chrome the whole app is captured through.
+        "UsageBarDemoData",        // fixture accounts, the README and marketing shots
+        "UsageBarAppearance",      // pins this instance light or dark for a capture
+        "UsageBarCardStyle",       // which glass variant, judged on screen rather than in a diff
+        "UsageBarSessionCardCap",  // how wide a session card may get, the same judgement on the board
+        "UsageBarUsageLayout",     // which usage-tab layout to preview (ledger or tray), judged on screen
+        // Surfaces held open so they can be photographed without synthesized input.
+        "UsageBarPanelCapture",    // the pinned usage panel
+        "UsageBarStatusMenuCapture",  // the status item's secondary-click menu
+        "UsageBarPopoverCapture",  // the menu bar popover
+        "UsageBarTab",             // which of that surface's pages it opens on (SurfaceTabLaunch)
+        // The Settings window, and which pane it opens on: one flag rather than two, because the
+        // pane is the value it carries (SettingsCaptureLaunch).
+        settingsCapture,
+        "UsageBarTooltipPreview",  // one callout, which otherwise needs a real hover
+        "UsageBarEmptyStatePreview",
+        welcomePreview,         // the welcome window on one named screen, fixtures only (Dev or demo)
+        panelHintPreview,       // the panel's first hint, the usagebar-command invite, or neither (`off`), held (Dev or demo)
+        commandPreview,         // the "Add the usagebar command" window on one named screen (Dev or demo)
+        overlayPreview,         // a private build's own surface on one named screen (Dev or demo)
+        "UsageBarTokenGraphPreview",
+        "UsageBarUpdateChip",      // the header's update nudge, with no live feed
+        "UsageBarPickPreview",     // the pick panel, with no MCP client or request on disk
+        "UsageBarMoveToApplicationsPreview",  // the move-to-Applications window a disk image copy shows
+        // Every motion the board's live figures could use, side by side on one clock: which one a
+        // quarter-second change should have is a question nobody can answer from a diff
+        // (`MotionDemoWindow`).
+        "UsageBarMotionDemo",
+        // Settings held open while every pane switch is timed, then quits (SettingsTabBench).
+        "UsageBarSettingsTabBench",
+        loginItemPreview,
+        // Artefacts written to disk rather than shown.
+        "UsageBarStripSnapshot",   // the menu bar strip as a standalone PNG
+        "UsageBarWindowSnapshot",  // and whatever windows the flags above opened, then quit
+        // Alerts posted to be looked at. A banner needs no focus, so taking it is pure cost.
+        "UsageBarDryNotifyTest",
+        "UsageBarResetHintTest",
+        "UsageBarResetHintExpiryTest",
+        "UsageBarLoginExpiryTest",
+        "UsageBarUpdateLagTest",
+        "UsageBarClearanceIdleTest",
+        // The host-pressure alarm, which is a banner like the three above it and reaches it the
+        // same way: the flag reports a CPU share of 97% to the watch, and three samples later the
+        // machine is in alarm (`HostHealthMonitor.testCPU`). A background launch for the family's
+        // own reason - a banner needs no focus, so taking one is pure cost.
+        "UsageBarHostHealthTest",
+        // The CPU alarm, a banner like the host one: the flag reports the machine as 97% busy and
+        // thirty seconds later it is in alarm (`CPUAlertMonitor.testBusy`).
+        "UsageBarCPUAlertTest",
+    ]
+
+    /// Flags that qualify another flag and show nothing on their own. Inert alone, and the flag
+    /// each of them qualifies is in `backgroundKeys`, so a launch carrying one is answered by its
+    /// parent.
+    static let modifierKeys = ["UsageBarUpdateChipReady", "UsageBarUpdateChipBusy", "UsageBarTokenGraphHover",
+                               // Qualifies UsageBarWindowSnapshot: how long to wait before the shutter.
+                               "UsageBarWindowSnapshotDelay",
+                               // Login incident fixtures only qualify UsageBarDemoData in a dev build.
+                               "UsageBarLoginHealthPreview",
+                               // Qualifies UsageBarDemoData: two fixtures read as failed first polls.
+                               "UsageBarDemoHardError",
+                               // Qualifies UsageBarDemoData: Claude 4 held over past its 5h reset.
+                               "UsageBarDemoPastReset",
+                               // Qualifies UsageBarDemoData: one session card away from its pin (B-1540).
+                               "UsageBarDemoPinAway",
+                               // Qualifies UsageBarDemoData: Claude 3 signed into Claude 2's login (#6).
+                               "UsageBarDemoSharedLogin",
+                               // Qualifies UsageBarDemoData: one fixture shows a login renewal running.
+                               "UsageBarDemoRenewingLogin",
+                               // Qualifies UsageBarDemoData: Settings shows an add in flight (Debug).
+                               "UsageBarDemoAddAccount",
+                               // Qualifies UsageBarDemoData: Settings' Accounts pane opens with the
+                               // add-account sheet up, on the phase UsageBarDemoAddAccount set (Debug).
+                               "UsageBarDemoAddAccountSheet",
+                               // Qualifies UsageBarDemoData: Settings' fallback command and its note as
+                               // a Mac whose Terminal cannot find the CLI sees them (B-3745, Debug).
+                               "UsageBarDemoCLIOffPath",
+                               // Qualifies UsageBarDemoData: one Settings row opens renaming (Debug).
+                               "UsageBarDemoRenaming",
+                               // Qualifies UsageBarDemoData: one Settings row's actions menu opens (Debug).
+                               "UsageBarDemoMenuOpen",
+                               // Qualifies UsageBarDemoData: one Settings row stops sharing (Debug).
+                               "UsageBarDemoStopSharing",
+                               // Qualifies UsageBarDemoData: the fixture fleet padded to N accounts (Debug).
+                               "UsageBarDemoAccounts",
+                               // Qualifies UsageBarDemoData: headings draw this Mac's real launch chip (Debug).
+                               "UsageBarDemoLaunchChip",
+                               // Qualifies UsageBarDemoData: the Claude fixtures' model windows (Debug).
+                               "UsageBarDemoModelWindows",
+                               // Qualifies UsageBarDemoData: no Claude fixture has a 5-hour window (Debug).
+                               "UsageBarDemoNoSessionWindow",
+                               // Qualifies UsageBarDemoData: the n-th fixture account wears the manual pin,
+                               // and the n-th row draws as hovered, for a capture (B-4334, Debug).
+                               "UsageBarDemoPinnedAccount",
+                               "UsageBarDemoHoverAccount",
+                               // Qualifies UsageBarDemoData: fixtures kept per provider (Debug).
+                               "UsageBarDemoAccountLimit",
+                               // Qualifies UsageBarDemoData: only the named providers' fixtures (Debug).
+                               "UsageBarDemoProviders",
+                               // Qualifies UsageBarDemoData: the launch model the gauge focuses (Debug).
+                               "UsageBarDemoLaunchModel",
+                               // Qualifies UsageBarDemoData: the fixture burn rates multiplied (Debug).
+                               "UsageBarDemoBurnScale",
+                               // Qualifies UsageBarDemoData: YES makes one session wait on you, NO makes
+                               // none, for the dot after the menu bar rings (B-2045, Debug).
+                               "UsageBarDemoWaiting",
+                               // Qualifies UsageBarDemoData: the menu bar rings in four fixed states
+                               // (plenty, under 20%, stale, unreadable) for a capture (B-2045, Debug).
+                               "UsageBarDemoRingStates",
+                               // Qualifies UsageBarDemoData: four Claude fixtures whose weekly windows have
+                               // 15, 40, 70 and 100% left, one per ring colour (B-2045, Debug).
+                               "UsageBarDemoColorLevels",
+                               // Qualifies UsageBarStripSnapshot (demo or Dev): pins the status button to
+                               // light or dark and captures the button itself (B-2045, Debug).
+                               "UsageBarMenuBarAppearance",
+                               // The pick panel with a row already circled, which is the state its
+                               // apply bar exists for and the one state of it no fixture can reach:
+                               // the circle rests on the row the session is already on, so a panel
+                               // that has never been touched has nothing pending by construction
+                               // (`pickColumnSelection`). Reaching it otherwise means synthesized
+                               // clicks on somebody's desktop.
+                               "UsageBarPickPending",
+                               // Which motion the live figures use (`CardMotion.chosen`). It shows
+                               // nothing on its own - a board has to be up for there to be a figure
+                               // - and it qualifies whatever surface the launch is opening, the
+                               // samples window included.
+                               "UsageBarMotion",
+                               // Qualifies UsageBarUpdateChip's busy preview: runs the real stall timer
+                               // against it (`UpdaterController.previewStall`). Alone it only
+                               // shortens the stall threshold of a real update, which shows nothing
+                               // until an update actually hangs.
+                               "UsageBarUpdateStallSeconds",
+                               // Qualify UsageBarCodexUpdateCLI (Debug): the background update's
+                               // pause between runs, the `--codex` it passes, and one environment
+                               // pair for the helper. Without the stand-in the schedule never starts.
+                               "UsageBarCodexUpdateEvery", "UsageBarCodexUpdateCodex", "UsageBarCodexUpdateEnv",
+                               // Qualify UsageBarSettingsCapture (Debug, Dev build or demo data), the same
+                               // way UsageBarChipPhase does: the Integrations header's states, its Remove
+                               // all question held open, and one button's hover callout held open.
+                               "UsageBarDemoIntegrations", "UsageBarIntegrationsConfirm", "UsageBarIntegrationsTip",
+                               // Qualifies UsageBarSettingsCapture the same way (Debug, Dev build or demo
+                               // data): the command line tool's failure banners, no prompt (B-3748).
+                               "UsageBarCLIInstallPreview",
+                               // Qualifies UsageBarSettingsCapture the same way: the Command line tool row
+                               // reads not installed and says a password window is coming (B-4195).
+                               "UsageBarCLINeedsAdmin",
+                               // Qualifies UsageBarSettingsCapture the same way: the two rows Install all
+                               // leaves out show their "Not part of Install all" line (B-4196).
+                               "UsageBarShowNotInInstallAll",
+                               // Qualifies UsageBarSettingsCapture the same way: the Codex and Claude rows
+                               // say Install all skips them on a Mac with no such account (B-4196).
+                               "UsageBarShowNoAccountNote",
+                               // Qualifies UsageBarPanelCapture the same way: the session board shows the
+                               // "Ghostty is not installed" line (B-4194).
+                               "UsageBarGhosttyMissingPreview",
+                               // Qualify UsageBarMoveToApplicationsPreview (Debug, Dev build or demo data):
+                               // where it copies to, a forced failure screen, and pressing Move by itself
+                               // so the copy and relaunch run unattended.
+                               "UsageBarMoveToApplicationsDest", "UsageBarMoveToApplicationsFail",
+                               "UsageBarMoveToApplicationsAutoMove",
+                               // Qualifies the welcome window (Dev build or demo data): opens it on a
+                               // Mac that has already seen it, with real detection, no fixtures.
+                               welcomeForce]
+
+    /// The override that hands the pick claim back to a build that has stood down
+    /// (`pickMayBeClaimed`). Named for the same reason `loginItemPreview` is: the panel's gate asks
+    /// about this flag specifically, and a second spelling of the key would gate on a different flag
+    /// from the one classified here.
+    static let pickClaimOverride = "UsageBarPickClaim"
+
+    /// HOW LONG THAT OVERRIDE LASTS, counted from the launch that carried it.
+    ///
+    /// THE INCIDENT (2026-08-10, twice in one day): a dev instance started to test one thing and
+    /// then left running answered a real `/usagebar`, both times because nobody closes a
+    /// window they have stopped thinking about. An override with no end is a stand-down that lasts
+    /// exactly as long as somebody's attention does. Thirty minutes outlasts a session of driving
+    /// the picker by hand and expires well inside an afternoon: too short costs a developer one
+    /// relaunch of a build they are sitting in front of, too long costs somebody else's
+    /// conversation, silently. Asked as arithmetic when a request knocks (`pickMayBeClaimed`)
+    /// rather than by a timer that switches the flag off, so nothing has to fire and nothing has
+    /// to be cancelled, and a build that slept for an hour is answered like one that was busy.
+    static let pickClaimOverrideLifetime: TimeInterval = 30 * 60
+
+    /// Flags that exist so something can be DRIVEN by hand rather than looked at, which is the other
+    /// answer to the family's one question. Driving something means being in front of it, so these
+    /// are not the family, and that is a statement about purpose rather than about cost (a plain
+    /// `open` activates either way).
+    ///
+    /// Three of them point a chain at a stand-in binary: probe, verdict, chip, click, renewal, and
+    /// the morning message the early-start schedule sends. The fourth hands a stood-down build back
+    /// a capability instead of substituting anything, and it is here on the same test: a developer
+    /// answering the pick panel to see what a real request does is working the app, not observing
+    /// it.
+    ///
+    /// The stand-ins are also the one bucket that can UNLOCK behaviour rather than just redirect it:
+    /// early start refuses to run at all on a build nobody installed unless its stand-in is set
+    /// (`EarlyStartStore.mayRun`), because the thing it would otherwise spend is a real
+    /// subscription's window.
+    ///
+    /// The first two were missed by a scan for `forKey:`, because both reach the defaults through a
+    /// named constant instead. That is why the completeness check now scans for the LITERALS rather
+    /// than for any particular way of looking one up.
+    ///
+    /// `UsageBarCodexUpdateCLI` is another: it points the background Codex update at a scratch `usagebar`
+    /// (CodexUpdateSchedule.swift), and a build nobody installed runs no schedule without it.
+    /// `UsageBarClaudeUsageCLI` points the Claude usage read at a scratch `claude` (Debug only).
+    static let interactiveKeys = ["UsageBarRenewLoginCLI", "UsageBarLoginStatusCLI", "UsageBarEarlyStartCLI",
+                                  pickClaimOverride, "UsageBarRenewLoginTest",
+                                  "UsageBarCodexUpdateCLI", "UsageBarClaudeUsageCLI"]
+
+    /// Every launch flag this app has, in exactly one bucket each. The completeness check compares
+    /// this against the flags actually spelled in the source, so a new one cannot be added without
+    /// somebody deciding which bucket it is in.
+    static var allFlagKeys: [String] { backgroundKeys + modifierKeys + interactiveKeys }
+
+    /// Whether a launch carrying exactly these flags may pull the app forward on its own.
+    ///
+    /// One answer for the whole launch, asked by every startup path that shows a window without
+    /// anybody having clicked anything. Phrased over the set rather than over any single flag so
+    /// that a launch combining several (a demo panel capture in dark mode is three) is answered
+    /// once, the same way.
+    static func mayTakeForeground(activeKeys: Set<String>) -> Bool {
+        activeKeys.isDisjoint(with: backgroundKeys)
+    }
+
+    /// Whether a surface being raised right now may take the foreground.
+    ///
+    /// `prompted` = somebody asked for it just now and is waiting on it: a click, or a command they
+    /// typed that will not finish until they answer. Those always come forward, whatever the launch
+    /// was for, because being in front of the person who asked IS the surface working. Everything
+    /// unprompted asks the family instead.
+    ///
+    /// The two go through one function so that "which of these is this?" is a decision with a name
+    /// rather than a default argument somebody remembers to override. The pick panel has one of
+    /// each: the picker a CLI is blocked on, and the same panel raised by a launch flag for a look.
+    static func mayTakeForeground(prompted: Bool, activeKeys: Set<String>) -> Bool {
+        prompted || mayTakeForeground(activeKeys: activeKeys)
+    }
+
+    /// This launch's answer for anything unprompted.
+    static var launchMayTakeForeground: Bool { mayTakeForeground(activeKeys: activeKeys()) }
+
+    /// Whether a launch carrying exactly these flags may write the user's own WINDOW STATE: which
+    /// windows were open, for the next launch to restore.
+    ///
+    /// The same family question with a second consequence, and it is spelled separately because the
+    /// two callers mean different things by the answer - one is about this launch's frontmost app,
+    /// the other about what the NEXT launch will do - and a divergence between them has to be
+    /// visible rather than silent.
+    ///
+    /// A LAUNCH THAT EXISTS TO BE LOOKED AT MAY NOT LEAVE A WINDOW BEHIND. The flags here are how a
+    /// screenshot is taken, and taking one must not change the app the user goes back to: a capture
+    /// that opened a window and recorded it as open makes the next ordinary launch put that window
+    /// up uninvited. `-UsageBarPanelCapture` has always said this in its own words (it deliberately does
+    /// not go through `setPinned`, which would write the pin into the shared defaults); this is that
+    /// same rule for the window that has an ordinary restore flag rather than a pin. It is not
+    /// hypothetical for a RELEASE bundle either: the demo-data flag opens this family on any build,
+    /// so the domain being written is the real app's (codex review of 3d70880).
+    static func mayRecordWindowState(activeKeys: Set<String>) -> Bool {
+        mayTakeForeground(activeKeys: activeKeys)
+    }
+
+    /// This launch's answer about the user's window state.
+    static var launchMayRecordWindowState: Bool { mayRecordWindowState(activeKeys: activeKeys()) }
+
+    /// Which of the family this launch carries.
+    static func activeKeys(in defaults: UserDefaults = .standard) -> Set<String> {
+        Set(backgroundKeys.filter { carries($0, in: defaults) })
+    }
+
+    /// Whether this launch carries one named flag, in whatever shape its value arrived (`isActive`).
+    /// For the flags asked about one at a time rather than as a set: the family is answered over the
+    /// whole launch, an override is answered about itself.
+    static func carries(_ key: String, in defaults: UserDefaults = .standard) -> Bool {
+        isActive(rawValue: defaults.object(forKey: key))
+    }
+
+    /// Whether a flag was carried, from whatever the defaults hold for it.
+    ///
+    /// Presence is the switch, because the family has no single value shape: `-UsageBarPanelCapture
+    /// YES` is a boolean, `-UsageBarTooltipPreview fleet` names a target, `-UsageBarUpdateChip 0.15.0`
+    /// carries a version, `-UsageBarStripSnapshot <path>` carries a path. What they share is being
+    /// there. An explicit falsy value is still honoured, so a flag can be switched off in a saved
+    /// command without deleting it, which is how these commands are actually edited.
+    static func isActive(rawValue: Any?) -> Bool {
+        switch rawValue {
+        case let text as String: return !falsy.contains(text.lowercased())
+        case let number as NSNumber: return number.boolValue
+        case nil: return false
+        default: return true
+        }
+    }
+
+    private static let falsy: Set<String> = ["", "no", "false", "0", "off"]
+}

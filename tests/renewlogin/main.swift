@@ -1,0 +1,454 @@
+import Foundation
+
+// Assertion harness for the "Renew login" background flow: the pure command knowledge
+// (UsageBar/Core/RenewLoginCommand.swift) and the runner that drives it
+// (UsageBar/Core/RenewLoginRunner.swift). Both are Foundation-only on purpose, so nothing else
+// comes along.
+//
+// The runner is exercised against STUB CLIs written by this file, never a real provider login:
+// a real one would spend the machine's own credentials, and the point here is the driving, not
+// the vendor's OAuth. Each stub answers one question and answers it by its exit code or by a
+// file it leaves behind, so a pass cannot come from the harness agreeing with itself.
+//
+// Two of the pure checks are round trips through the interpreters the strings are built for:
+// /bin/sh reports what the environment variable actually became, and osascript reports what the
+// AppleScript literal actually decoded to. A quoting rule can only be verified by the thing that
+// does the unquoting.
+
+var failures = 0
+func expect(_ condition: Bool, _ name: String) {
+    if condition { print("PASS \(name)") } else { failures += 1; print("FAIL \(name)") }
+}
+
+/// Run a program and return its trimmed stdout (nil when it could not be started).
+func capture(_ executable: String, _ arguments: [String]) -> String? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = Pipe()
+    guard (try? process.run()) != nil else { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .newlines)
+}
+
+// MARK: the plans
+
+let claudePlan = RenewLoginCommand.plan(providerID: "claude")
+let codexPlan = RenewLoginCommand.plan(providerID: "codex")
+expect(claudePlan?.arguments == ["--strict-mcp-config", "auth", "login"],
+       "claude re-logs in through its own auth subcommand, with the host's MCP config kept out")
+// The ordering above is the whole bug the previous release shipped (13ade3a): --strict-mcp-config
+// is a GLOBAL option, and Commander rejects a global option written after the subcommand ("unknown
+// option"), so the renewal could only ever fail. What is pinned is that one option's position, not
+// a rule about every dash-word: a SUBCOMMAND option (`auth login --console`, which the claude CLI
+// already takes) legitimately follows its subcommand, and a blanket "options first" rule would
+// both reject it and push the next author into moving it ahead of `auth`, where the main command
+// reports it as unknown for the same reason the release failed. Codex's plan carries no global
+// option at all, so its shape is pinned as a literal below.
+if let arguments = claudePlan?.arguments,
+   let mcpGuard = arguments.firstIndex(of: "--strict-mcp-config"),
+   let subcommand = arguments.firstIndex(of: "auth") {
+    expect(mcpGuard < subcommand,
+           "the global --strict-mcp-config precedes `auth`, where the main command parses it: "
+               + arguments.joined(separator: " "))
+} else {
+    expect(false, "claude's plan carries both the MCP guard and the auth subcommand")
+}
+expect(claudePlan?.needsTerminal == true,
+       "claude draws a terminal UI, so it is given a pty")
+expect(claudePlan?.confirmKeystroke == "\r",
+       "claude's success screen waits on a key, so one is sent")
+expect(codexPlan?.arguments == ["login"], "codex re-logs in through `codex login`")
+expect(codexPlan?.needsTerminal == false, "codex has no UI, so it needs no pty")
+expect(codexPlan?.successMarkers.isEmpty == true && codexPlan?.failureMarkers.isEmpty == true,
+       "codex is judged by its exit code alone, never by a guessed word in its output")
+expect(RenewLoginCommand.plan(providerID: "gemini") == nil,
+       "a provider with no known login command has no menu entry to enable")
+
+// MARK: which home is the default one, and what that does to the environment
+
+let user = URL(fileURLWithPath: "/Users/u")
+expect(RenewLoginCommand.defaultHome(providerID: "claude", userHome: user) == "/Users/u/.claude",
+       "the default Claude home is ~/.claude")
+expect(RenewLoginCommand.defaultHome(providerID: "codex", userHome: user) == "/Users/u/.codex",
+       "the default Codex home is ~/.codex")
+expect(RenewLoginCommand.isDefaultHome("/Users/u/.claude/", providerID: "claude", userHome: user),
+       "a trailing slash does not hide the default home")
+expect(RenewLoginCommand.isDefaultHome("/Users/u/x/../.claude", providerID: "claude", userHome: user),
+       "an unnormalised path does not hide the default home")
+expect(!RenewLoginCommand.isDefaultHome("/Users/u/.claude2", providerID: "claude", userHome: user),
+       "a numbered sibling is NOT the default home")
+
+let named = RenewLoginCommand.environment(envKey: "CLAUDE_CONFIG_DIR", home: "/Users/u/.claude2",
+                                          providerID: "claude", userHome: user)
+expect(named["CLAUDE_CONFIG_DIR"] == .some("/Users/u/.claude2"),
+       "a numbered account points the variable at its own home")
+let defaulted = RenewLoginCommand.environment(envKey: "CLAUDE_CONFIG_DIR", home: "/Users/u/.claude",
+                                              providerID: "claude", userHome: user)
+expect(defaulted.keys.contains("CLAUDE_CONFIG_DIR") && defaulted["CLAUDE_CONFIG_DIR"] == .some(nil),
+       "the default home REMOVES the variable rather than spelling out the default path")
+
+// MARK: reading a terminal UI's screen
+
+let dressed = "\u{1B}[2m\u{1B}[32mLogin \u{1B}[1msuccessful\u{1B}[0m. Press Enter\u{1B}]0;title\u{07}"
+expect(RenewLoginCommand.plainText(dressed) == "Login successful. Press Enter",
+       "colour codes, cursor moves and window titles come off before matching")
+expect(RenewLoginCommand.contains(anyOf: ["login successful"],
+                                  in: RenewLoginCommand.plainText(dressed)),
+       "a marker split by escape codes is still found")
+expect(RenewLoginCommand.contains(anyOf: ["LOGIN SUCCESSFUL"], in: "...login successful..."),
+       "matching ignores case, so a reworded capitalisation does not break it")
+expect(!RenewLoginCommand.contains(anyOf: ["login failed"], in: "opening browser to sign in"),
+       "an absent marker is absent")
+
+// MARK: the visible-Terminal fallback's quoting
+
+expect(RenewLoginCommand.shellQuoted("/Users/u/.claude2") == "/Users/u/.claude2",
+       "an ordinary path is shown to the user unquoted")
+expect(RenewLoginCommand.shellQuoted("/o'brien") == #"'/o'\''brien'"#,
+       "an embedded single quote is broken out the only way single quotes allow")
+expect(RenewLoginCommand.shellQuoted("") == "''", "an empty word still has to occupy a word")
+for hostile in ["a;rm -rf /", "a b", "$(id)", "`id`", "a\nb", "a|b", "a&b", "a*b", "a\\b", "a\"b"] {
+    expect(RenewLoginCommand.shellQuoted(hostile).hasPrefix("'"),
+           "shell metacharacters are quoted: \(hostile.debugDescription)")
+}
+expect(RenewLoginCommand.shellCommand(executable: "/usr/local/bin/claude",
+                                      envKey: "CLAUDE_CONFIG_DIR", home: "/Users/u/.claude2",
+                                      arguments: ["auth", "login"])
+        == "env CLAUDE_CONFIG_DIR=/Users/u/.claude2 /usr/local/bin/claude auth login",
+       "the fallback command sets the account's config home and nothing else")
+expect(RenewLoginCommand.shellCommand(executable: "/usr/local/bin/claude",
+                                      envKey: "CLAUDE_CONFIG_DIR", home: nil,
+                                      arguments: ["auth", "login"])
+        == "env -u CLAUDE_CONFIG_DIR /usr/local/bin/claude auth login",
+       "the default home's fallback UNSETS the variable")
+
+let awkward = "/tmp/o'brien's dir/.claude 2"
+let readBack = RenewLoginCommand.shellCommand(
+    executable: "/usr/bin/printenv", envKey: "CLAUDE_CONFIG_DIR", home: awkward,
+    arguments: ["CLAUDE_CONFIG_DIR"])
+expect(capture("/bin/sh", ["-c", readBack]) == awkward,
+       "the shell hands the CLI back the exact config home, quotes and spaces intact")
+let unset = RenewLoginCommand.shellCommand(
+    executable: "/usr/bin/printenv", envKey: "CLAUDE_CONFIG_DIR", home: nil,
+    arguments: ["CLAUDE_CONFIG_DIR"])
+expect(capture("/bin/sh", ["-c", "export CLAUDE_CONFIG_DIR=/leaked; " + unset]) == "",
+       "the default home's fallback beats an exported CLAUDE_CONFIG_DIR from the user's profile")
+
+expect(RenewLoginCommand.appleScriptString(#"a"b"#) == #""a\"b""#,
+       "a double quote cannot end the AppleScript literal early")
+expect(RenewLoginCommand.appleScriptString(#"a\b"#) == #""a\\b""#,
+       "a backslash is escaped, so the one `'\\''` introduces survives the second layer")
+for value in [awkward, readBack, #"quote " and \ backslash"#] {
+    let literal = RenewLoginCommand.appleScriptString(value)
+    expect(capture("/usr/bin/osascript", ["-e", "return \(literal)"]) == value,
+           "AppleScript decodes the literal back to the original: \(value.debugDescription)")
+}
+let script = RenewLoginCommand.terminalScript(command: readBack)
+expect(script.contains("do script ") && script.contains("activate") && !script.contains(" in window"),
+       "the fallback command runs in a NEW Terminal window, brought forward")
+// The window is identified by the tab `do script` returned, never by a title: a user's own window
+// can be called anything, including whatever a match on a name would pick.
+expect(script.contains("first window whose tabs contains t") && script.contains("on error"),
+       "the window closed later is the one this script opened, and failing to name it is survivable")
+expect(RenewLoginCommand.terminalCloseScript(windowID: 42)
+        .contains("close (every window whose id is 42) saving no"),
+       "closing names one window by id, tolerates it being gone, and asks nothing")
+
+// MARK: the success receipt
+
+// The receipt is what turns an unwatchable window into two distinguishable endings. Both are run
+// through a real shell, because `&&` is the whole of the rule and only the shell can say so.
+let receiptDir = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("usagebar-receipt-\(UUID().uuidString)")
+try? FileManager.default.createDirectory(at: receiptDir, withIntermediateDirectories: true)
+defer { try? FileManager.default.removeItem(at: receiptDir) }
+
+func receiptLands(after command: String, marker: String) -> Bool {
+    _ = capture("/bin/sh", ["-c", RenewLoginCommand.commandWithReceipt(command, marker: marker)])
+    return FileManager.default.fileExists(atPath: marker)
+}
+let signedIn = receiptDir.appendingPathComponent("ok").path
+let refused = receiptDir.appendingPathComponent("no").path
+expect(receiptLands(after: "true", marker: signedIn),
+       "a login that succeeded leaves the receipt its window is closed on")
+expect(!receiptLands(after: "false", marker: refused),
+       "a login that failed leaves none, so the window keeps its error on screen")
+// The path lands in the shell exactly as written, spaces, quotes and all - a receipt written
+// somewhere else is a window that never closes.
+let awkwardMarker = receiptDir.appendingPathComponent("o'brien's receipt 2").path
+expect(receiptLands(after: "true", marker: awkwardMarker),
+       "the receipt path survives the shell whatever it is made of")
+expect(RenewLoginCommand.commandWithReceipt("cmd", marker: "/tmp/m").hasSuffix("&& exit")
+        && !RenewLoginCommand.commandWithReceipt("cmd", marker: "/tmp/m").contains(";"),
+       "the shell is asked to leave only after the receipt, and only ever with `&&`")
+
+// MARK: the runner, against stub CLIs
+
+let stubs = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("usagebar-renewlogin-\(UUID().uuidString)")
+try? FileManager.default.createDirectory(at: stubs, withIntermediateDirectories: true)
+defer { try? FileManager.default.removeItem(at: stubs) }
+
+func stub(_ name: String, _ body: String) -> String {
+    let url = stubs.appendingPathComponent(name)
+    try? ("#!/bin/sh\n" + body).write(to: url, atomically: true, encoding: .utf8)
+    try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    return url.path
+}
+
+/// A plan shaped like Claude's (pty, markers, one keystroke) but pointed at a stub.
+func terminalPlan(confirm: String? = "\r") -> RenewLoginCommand.Plan {
+    RenewLoginCommand.Plan(arguments: [], needsTerminal: true,
+                           progressMarkers: ["opening browser"],
+                           successMarkers: ["login successful"],
+                           failureMarkers: ["login failed"],
+                           confirmKeystroke: confirm)
+}
+
+/// A plan shaped like Codex's: no pty, no markers, exit code is the whole answer.
+let exitCodePlan = RenewLoginCommand.Plan(arguments: [], needsTerminal: false,
+                                          progressMarkers: [], successMarkers: [],
+                                          failureMarkers: [], confirmKeystroke: nil)
+
+let keyReceipt = stubs.appendingPathComponent("keystroke-arrived").path
+
+// The success stub proves three things at once: it refuses to run without a pty, its markers arrive
+// wrapped in escape codes, and it only writes the receipt file after a keystroke reaches its stdin.
+let successStub = stub("success", """
+[ -t 0 ] && [ -t 1 ] || exit 9
+printf 'Opening \\033[0mbrowser to sign in\\n'
+printf 'Login \\033[1msuccessful\\033[0m. Press Enter to continue\\n'
+head -c 1 > /dev/null
+: > "\(keyReceipt)"
+sleep 5
+""")
+let successOutcome = await RenewLoginRunner.run(executable: successStub, plan: terminalPlan(),
+                                                environment: [:],
+                                                handshakeIdleLimit: 3, overallLimit: 15)
+expect(successOutcome == .renewed, "a success marker under a pty reads as renewed")
+var receipted = false
+for _ in 0 ..< 60 where !receipted {
+    receipted = FileManager.default.fileExists(atPath: keyReceipt)
+    if !receipted { usleep(50_000) }
+}
+expect(receipted, "the keystroke the success screen waits on actually reaches the CLI's stdin")
+
+let failureStub = stub("failure", """
+printf 'Opening browser to sign in\\n'
+printf '\\033[31mLogin failed\\033[0m: something the CLI did not like\\n'
+sleep 10
+""")
+expect(await RenewLoginRunner.run(executable: failureStub, plan: terminalPlan(), environment: [:],
+                                  handshakeIdleLimit: 3, overallLimit: 15) == .failed(.reported),
+       "a failure marker reads as refused, without waiting for the deadline")
+
+let silentStub = stub("silent", "sleep 30\n")
+let silentStart = Date()
+expect(await RenewLoginRunner.run(executable: silentStub, plan: terminalPlan(), environment: [:],
+                                  handshakeIdleLimit: 1, overallLimit: 30) == .failed(.timedOut),
+       "silence before the browser is up times out on the short guard")
+expect(Date().timeIntervalSince(silentStart) < 10,
+       "…and does so on the SHORT guard, not by sitting out the whole renewal window")
+
+let strandedStub = stub("stranded", "printf 'Opening browser to sign in\\n'\nsleep 30\n")
+expect(await RenewLoginRunner.run(executable: strandedStub, plan: terminalPlan(), environment: [:],
+                                  handshakeIdleLimit: 1, overallLimit: 3) == .failed(.timedOut),
+       "once the browser is up the short guard stops applying, and the renewal window ends it")
+
+// A killed stub must not outlive its runner: a login process left running would sit on the
+// account's config home against a challenge nobody can complete.
+expect(capture("/bin/sh", ["-c", "pgrep -f \(stubs.path)/stranded | wc -l"])?
+        .trimmingCharacters(in: .whitespaces) == "0",
+       "a timed-out login process is gone, not orphaned")
+
+expect(await RenewLoginRunner.run(executable: stub("ok", "exit 0\n"), plan: exitCodePlan,
+                                  environment: [:], handshakeIdleLimit: 3, overallLimit: 15)
+        == .renewed,
+       "a marker-less provider that exits 0 read as renewed")
+expect(await RenewLoginRunner.run(executable: stub("bad", "exit 3\n"), plan: exitCodePlan,
+                                  environment: [:], handshakeIdleLimit: 3, overallLimit: 15)
+        == .failed(.reported),
+       "a marker-less provider that exits non-zero reads as refused")
+expect(await RenewLoginRunner.run(executable: stub("notty", "[ -t 1 ] && exit 4\nexit 0\n"),
+                                  plan: exitCodePlan, environment: [:],
+                                  handshakeIdleLimit: 3, overallLimit: 15) == .renewed,
+       "the marker-less path runs on a plain pipe, with no pty spent on a CLI that has no UI")
+expect(await RenewLoginRunner.run(executable: stubs.appendingPathComponent("nothing-here").path,
+                                  plan: exitCodePlan, environment: [:],
+                                  handshakeIdleLimit: 1, overallLimit: 5) == .failed(.notInstalled),
+       "a login command that is not there says so instead of hanging")
+expect(await RenewLoginRunner.run(executable: "claude-that-is-not-installed",
+                                  plan: exitCodePlan, environment: [:],
+                                  handshakeIdleLimit: 1, overallLimit: 5) == .failed(.notInstalled),
+       "a bare name that resolved to nothing is not installed either")
+let notExecutable = stubs.appendingPathComponent("not-executable")
+try! "#!/bin/sh\nexit 0\n".write(to: notExecutable, atomically: true, encoding: .utf8)
+expect(await RenewLoginRunner.run(executable: notExecutable.path, plan: exitCodePlan, environment: [:],
+                                  handshakeIdleLimit: 1, overallLimit: 5) == .failed(.notInstalled),
+       "a file without the execute bit is not a CLI UsageBar can run")
+// A user's Cancel ends a login that is still waiting on the browser, well inside its own clocks.
+let cancelFlag = RenewLoginRunner.LoginCancel()
+let cancelStarted = Date()
+Task { try? await Task.sleep(for: .milliseconds(1200)); cancelFlag.raise() }
+expect(await RenewLoginRunner.run(executable: stub("waits", "sleep 30\n"), plan: exitCodePlan,
+                                  environment: [:], handshakeIdleLimit: 60, overallLimit: 60,
+                                  cancel: cancelFlag) == .failed(.cancelled)
+        && Date().timeIntervalSince(cancelStarted) < 15,
+       "a raised cancel ends a login that is waiting and says it was cancelled")
+
+// The environment reaches the child exactly as `environment` composed it - the whole point of the
+// feature is that the login lands on THIS account's config home.
+let envStub = stub("env-named", "[ \"$CLAUDE_CONFIG_DIR\" = \"/tmp/a b/.claude2\" ] && exit 0\nexit 3\n")
+expect(await RenewLoginRunner.run(executable: envStub, plan: exitCodePlan,
+                                  environment: ["CLAUDE_CONFIG_DIR": "/tmp/a b/.claude2"],
+                                  handshakeIdleLimit: 3, overallLimit: 15) == .renewed,
+       "the child is handed the exact config home, spaces intact, with no shell in between")
+setenv("CLAUDE_CONFIG_DIR", "/leaked", 1)
+let unsetStub = stub("env-unset", "[ -n \"${CLAUDE_CONFIG_DIR:-}\" ] && exit 3\nexit 0\n")
+expect(await RenewLoginRunner.run(executable: unsetStub, plan: exitCodePlan,
+                                  environment: ["CLAUDE_CONFIG_DIR": nil],
+                                  handshakeIdleLimit: 3, overallLimit: 15) == .renewed,
+       "a nil value REMOVES the variable, beating one the app itself inherited")
+unsetenv("CLAUDE_CONFIG_DIR")
+
+// MARK: the visible chain - a click must never be able to do nothing
+
+// The rule these hold is an ORDERING, and an ordering does not show up in a type check: the card
+// has to be marked before anything can go async, and the "it started" signal has to be out before
+// the login process is spawned, or a failure to spawn takes the announcement down with it. The
+// bodies are dug out by their own closing brace at type-member indentation, the way the redeem
+// suite does it, rather than scanning whole files where an unrelated call would read as a match.
+func functionBody(_ source: String, from declaration: String) -> String? {
+    guard let start = source.range(of: declaration),
+          let end = source.range(of: "\n    }", range: start.upperBound ..< source.endIndex)
+    else { return nil }
+    return String(source[start.upperBound ..< end.lowerBound])
+}
+
+func readSource(_ path: String) -> String {
+    (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+}
+
+let storeSource = readSource("UsageBar/Stores/RenewLoginStore.swift")
+let cardSource = readSource("UsageBar/Views/AccountCardView.swift")
+let rowSource = readSource("UsageBar/Views/AccountListRowView.swift")
+// The card's derived answers live in AccountFacts, shared with the compact list row so both
+// surfaces offer the renewal on exactly the same terms (see the logincheck suite's note).
+let factsSource = readSource("UsageBar/Views/AccountFacts.swift")
+let menuSource = readSource("UsageBar/Views/AccountCardMenu.swift")
+let settingsSource = readSource("UsageBar/Views/SettingsAccountsView.swift")
+// The row's login state lives one file over from the rest of the pane (its status strip was split
+// out of SettingsAccountsView for file size), and the greying is a property of THAT button.
+let rowStatusSource = readSource("UsageBar/Views/SettingsAccountRowStatus.swift")
+expect(!storeSource.isEmpty && !cardSource.isEmpty && !rowSource.isEmpty && !factsSource.isEmpty
+        && !menuSource.isEmpty,
+       "the renewal's call sites are readable from the suite")
+
+if let body = functionBody(storeSource, from: "func renew(accountID: String,"),
+   let marked = body.range(of: "inFlight.insert"),
+   let async = body.range(of: "Task {"),
+   let announced = body.range(of: "SystemAlert.post"),
+   let spawned = body.range(of: "RenewLoginRunner.run(") {
+    expect(marked.lowerBound < async.lowerBound,
+           "the card is marked BEFORE any async work, so the menu closes onto a changed card")
+    expect(announced.lowerBound < spawned.lowerBound,
+           "the 'it started' notification goes out BEFORE the login process is spawned")
+    expect(body.contains("guard announced else"),
+           "a notification that could not be delivered is not treated as a signal")
+    expect(body.range(of: "openTerminal", range: announced.upperBound ..< spawned.lowerBound) != nil,
+           "…and falls back to a window the user can watch, before anything runs unseen")
+    expect(body.components(separatedBy: "SystemAlert.post").count - 1 >= 3,
+           "every ending speaks: started, renewed, and not renewed")
+} else {
+    expect(false, "renew()'s body was found with its ordering intact")
+}
+
+expect(functionBody(storeSource, from: "func canRenew(")?.contains("DemoUsage.isActive") == true,
+       "demo fixtures have no config home, so the entry is dead on those cards by construction")
+expect(factsSource.contains("RenewLoginStore.shared.isRenewing(usage.id)")
+        && cardSource.contains("facts.isRenewingLogin") && rowSource.contains("facts.isRenewingLogin"),
+       "the surfaces themselves read the in-flight state, which is the signal that needs no permission")
+
+// MARK: - One busy answer, asked by every entry point
+
+// A renewal can be started from four places, and a fix that guarded one of them left the other
+// three racing (codex review, 2026-08-04). So the store owns the whole question - running OR still
+// settling - and every surface disables itself on that one answer rather than assembling its own.
+expect(functionBody(storeSource, from: "func isRenewing(")
+        .map { $0.contains("inFlight.contains(accountID)") && $0.contains("settling.contains(accountID)") }
+        == true,
+       "the store's one busy answer covers the running login AND the settling one")
+expect(functionBody(storeSource, from: "func canRenew(")?.contains("!isRenewing(accountID)") == true,
+       "and every offer that greys itself out asks that answer, not just the in-flight set")
+// Entry 1, the card's expiry chip.
+expect(factsSource.contains("RenewLoginStore.shared.canRenew(accountID: usage.id,")
+        && cardSource.contains(".disabled(!facts.canRenewLogin)")
+        && rowSource.contains(".disabled(!facts.canRenewLogin)"),
+       "both surfaces' chips are dead while this account is being signed in")
+// Entry 2, the Settings row's button.
+expect(!rowStatusSource.isEmpty
+        && rowStatusSource.contains("renew.canRenew(accountID: item.id,"),
+       "so is the Settings row's button")
+// Entry 3, the shared context menu (card right-click and the row's ellipsis both render it).
+expect(menuSource.contains("RenewLoginStore.shared.canRenew(accountID: accountID,")
+        && !menuSource.contains("canRenew(providerID:"),
+       "and the menu entry, through the same call rather than a second condition beside it")
+expect(settingsSource.contains("AccountActionsMenu(accountID: item.id"),
+       "and the Settings list offers those same entries instead of carrying a second copy")
+// Entry 4 has no control to disable: the expiry notification's button calls straight in. It is
+// caught by the guard at the top of `renew` itself, which is why that guard must not read the
+// in-flight set directly either.
+expect(functionBody(storeSource, from: "func renew(accountID: String, providerID:")
+        .map { $0.contains("guard !isRenewing(accountID)") } == true,
+       "and the entry with nothing to grey out is stopped inside renew itself")
+// No surface may keep its own copy of the rule: that is the shape the first fix had.
+expect(!settingsSource.contains("renewalSucceededAt")
+        && !(cardSource + rowSource + factsSource).contains("renewalSucceededAt")
+        && !menuSource.contains("renewalSucceededAt"),
+       "no view works the settling out for itself from a timestamp and a clock")
+
+// The destructive entry is gated on the same fact, and for a sharper reason: the CLI is writing a
+// credential into the very folder "Remove account…" moves to the Trash.
+if let removeEntry = menuSource.range(of: "RemoveAccountAction.present(") {
+    expect(menuSource.range(of: "RenewLoginStore.shared.isRenewing(accountID)",
+                            range: removeEntry.upperBound ..< menuSource.endIndex) != nil,
+           "removing an account is off while a login is running against its config home")
+} else {
+    expect(false, "the removal entry was found in the shared menu")
+}
+
+// MARK: - When the settling starts, and what ends it
+
+expect(functionBody(storeSource, from: "func renew(accountID: String, providerID:")
+        .map { body in
+            guard let ran = body.range(of: "await RenewLoginRunner.run"),
+                  let begin = body.range(of: "beginSettling(accountID)",
+                                         range: ran.upperBound ..< body.endIndex),
+                  let drop = body.range(of: "inFlight.remove(accountID)",
+                                        range: ran.upperBound ..< body.endIndex)
+            else { return false }
+            return begin.upperBound <= drop.lowerBound
+        } == true,
+       "a success starts settling BEFORE the flag that was hiding the offer comes off")
+// Only an account discovery still calls signed out: for any other one the verdict was cleared by
+// the same success, so there is no gap and "renewing" would be an invented state.
+expect(functionBody(storeSource, from: "private func beginSettling(")
+        .map { $0.contains("settling.begin(accountID, isDormant: isDormant)") } == true,
+       "and it hands the set what discovery says rather than deciding for itself who settles")
+// The deadline is a scheduled STATE CHANGE, not a timestamp a view compares against: nothing
+// schedules a redraw for a clock, so an expired settle used to sit on screen until the next poll.
+expect(functionBody(storeSource, from: "private func beginSettling(")
+        .map { $0.contains("Task.sleep") && $0.contains("RenewalSettling.window")
+                && $0.contains("endSettling(accountID)") } == true,
+       "the deadline fires a change of state rather than leaving a view to notice the time")
+// …and discovery agreeing ends it sooner, which is the normal way out.
+let usageStoreSource = readSource("UsageBar/Stores/UsageStore.swift")
+expect(usageStoreSource.contains("RenewLoginStore.shared.discoveryReported(dormant: dormantIDs)"),
+       "every refresh tells the store what discovery found, so a landed login stops settling at once")
+
+print(failures == 0 ? "ALL PASS" : "\(failures) FAILURES")
+exit(failures == 0 ? 0 : 1)

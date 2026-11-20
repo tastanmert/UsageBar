@@ -1,0 +1,406 @@
+import Foundation
+
+/// Cross-account "fleet" aggregation: for each provider with two or more visible accounts, pool
+/// the same window class across the accounts to answer "how much does the whole fleet have left,
+/// and when does it get quota back". Pure math over the already-fetched usages; no I/O, so the
+/// test harness can compile it standalone.
+///
+/// Percentages pool with equal weights inside a plan: one account's full window is 100 units, so a
+/// five-account pool holds 500 units ("5 accounts' worth"). Accounts on different NAMED plans still
+/// get separate pools (`summaries(byPlan: true)`). The one cross-plan number is
+/// `FleetMath.weighted`, which weights each account's WEEKLY remaining by its plan's multiple of the
+/// vendor's lowest paid plan (`PlanWeight`). Vendors publish those multiples for the 5-hour window
+/// only, so applying them to the weekly window is itself an assumption; the session and model
+/// windows are never weighted.
+struct FleetPool: Hashable {
+    /// One account's contribution to the pool, in the accounts' display order - the segments of
+    /// the combined bar.
+    struct Member: Hashable {
+        var accountLabel: String
+        var remaining: Double
+        var severity: MetricSeverity
+        var resetsAt: Date?
+    }
+
+    /// A scheduled quota refill: when a member's window rolls over, the pool gets back what that
+    /// member has used so far. Staggered resets are the multi-account superpower, so they are
+    /// first-class here.
+    struct Refill: Hashable {
+        var at: Date
+        var accountLabel: String
+        /// Units the pool gains at `at` (the member's current used percent).
+        var gain: Double
+        /// Accounts in the pool this refill belongs to (capacity = poolSize x 100 units).
+        var poolSize: Int
+
+        /// `gain` as a share of the whole pool's capacity, in percent (gain / (poolSize x 100) x 100).
+        var poolShare: Double { poolSize > 0 ? gain / Double(poolSize) : 0 }
+        var poolShareText: String { Self.percentText(poolShare) }
+        /// The one account's own gain ("100%"), for the hover that spells out both readings.
+        var gainText: String { Self.percentText(gain) }
+
+        /// One decimal, trailing ".0" dropped: 12.5%, 8%, 24%. Non-finite reads as 0%.
+        static func percentText(_ v: Double) -> String {
+            let r = ((v.isFinite ? v : 0) * 10).rounded() / 10
+            return r == r.rounded() ? "\(Int(r))%" : String(format: "%.1f%%", r)
+        }
+    }
+
+    var kind: MetricKind
+    /// Representative window label (a localization key such as "Weekly", or a model name).
+    var label: String
+    /// The model this pool is scoped to (weeklyModel pools only) - the focus resolver's handle.
+    var modelName: String?
+    var members: [Member]
+    /// Upcoming refills, soonest first (past resets excluded).
+    var refills: [Refill]
+
+    /// Total units left across the pool (0...members×100).
+    var totalRemaining: Double { members.map(\.remaining).reduce(0, +) }
+    var averageRemaining: Double { totalRemaining / Double(members.count) }
+    /// The account with the least room - the fleet's weak spot.
+    var minMember: Member { members.min { $0.remaining < $1.remaining }! }
+    var minAccountLabel: String { minMember.accountLabel }
+    var minRemaining: Double { minMember.remaining }
+    /// Soonest upcoming reset: the next moment the pool gets quota back.
+    var nextReset: Date? { refills.first?.at }
+    var nextResetAccountLabel: String? { refills.first?.accountLabel }
+    /// Steady-state refill speed (units per hour) once every member's window cycles - the
+    /// long-run budget the fleet's burn rate is measured against.
+    func steadyRefillPerHour(windowHours: Double) -> Double {
+        Double(members.count) * 100 / windowHours
+    }
+}
+
+struct FleetSummary: Hashable {
+    var providerID: String
+    var accountCount: Int
+    /// Ordered session → weekly → model pools; only classes that two or more accounts share.
+    var pools: [FleetPool]
+    /// Which plan this summary covers when the provider's accounts sit on two or more named plans
+    /// (`FleetMath.summaries(byPlan: true)`); nil when the summary is the whole provider.
+    var planTier: Tier? = nil
+
+    /// One plan's slice of a provider. `name` nil = the accounts whose plan this machine cannot name,
+    /// grouped together once a split happens (the advisor's "Unknown plan" tier, same rule).
+    struct Tier: Hashable {
+        var name: String?
+        /// Stable identity for rate keys and view ids.
+        var key: String { name?.lowercased() ?? "?" }
+    }
+
+    /// View identity: the provider alone when unsplit, provider plus plan when split.
+    var id: String { planTier.map { "\(providerID)|plan=\($0.key)" } ?? providerID }
+
+    /// The pool the strip headlines when no model focus resolves: the weekly budget when present,
+    /// else the session window.
+    var headline: FleetPool? { pools.first { $0.kind == .weeklyAll } ?? pools.first }
+
+    /// Names of the model-scoped pools, the candidates the focus resolver picks from.
+    var modelPoolNames: [String] {
+        pools.filter { $0.kind == .weeklyModel }.map { $0.modelName ?? $0.label }
+    }
+
+    /// Headline honoring a resolved model focus: the named model pool when it exists, else the
+    /// plain headline - so a missing window (schema drift, non-flagship plan) degrades to the
+    /// weekly budget instead of an empty gauge.
+    func headline(focusedModel: String?) -> FleetPool? {
+        if let name = focusedModel,
+           let pool = pools.first(where: { $0.kind == .weeklyModel && ($0.modelName ?? $0.label) == name }) {
+            return pool
+        }
+        return headline
+    }
+
+    /// The pools "All pools" renders, in display order: every window the fleet has a pool for, one
+    /// row each (B-1544, owner ruling 2026-10-12: the mode is named "all", so it draws all). The
+    /// focused model's pool leads, the account-wide weekly follows, any other model pool after it,
+    /// and the 5-hour session pool closes. The leading pool is the same one the old rule led with
+    /// for every input, so the menu-bar number and the advisor's next-refill line, which both follow
+    /// the leading pool, do not move; the session pool goes last because it paces work rather than
+    /// capping it. This replaces the 2026-09-28 rule that hid a model pool unless it was the focus.
+    func displayPools(focusedModel: String?) -> [FleetPool] {
+        func isFocus(_ pool: FleetPool) -> Bool {
+            pool.kind == .weeklyModel && (pool.modelName ?? pool.label) == focusedModel
+        }
+        let focus = pools.filter(isFocus)
+        let weekly = pools.filter { $0.kind == .weeklyAll }
+        let otherModels = pools.filter { $0.kind == .weeklyModel && !isFocus($0) }
+        let session = pools.filter { $0.kind == .session }
+        return focus + weekly + otherModels + session
+    }
+}
+
+/// Which model window (if any) the display should focus - shared by the fleet gauge, the menu-bar
+/// strip and the status line so "the number UsageBar leads with" is ONE concept. Mirrors the smart
+/// launcher's rule (UsageBarCLI/Snapshot.swift): a declared primary model constrains only when a
+/// reported window carries it; no declared primary = flagship-first. Pure so the test harness
+/// compiles it standalone; the app passes the launch policy's model and ModelCatalog's tier order.
+enum FleetFocus {
+    /// The window name the display leads with, or nil for the account-wide weekly.
+    static func focusedModel(_ focus: GaugeFocus, primaryModel: String?,
+                             available: [String], flagshipOrder: [String]) -> String? {
+        guard !available.isEmpty else { return nil }
+        switch focus {
+        case .weekly:
+            return nil
+        case .all, .primary:
+            let primary = primaryModel?.trimmingCharacters(in: .whitespaces).lowercased() ?? ""
+            guard !primary.isEmpty else { return flagship(available, order: flagshipOrder) }
+            // A declared non-flagship primary (e.g. sonnet) matches no reported window → nil →
+            // the weekly budget, the window that primary actually burns.
+            return available.first { matches($0, primary) }
+        }
+    }
+
+    /// The highest-tier name by the given order; names matching nothing rank last.
+    static func flagship(_ names: [String], order: [String]) -> String? {
+        names.min { rank($0, order) < rank($1, order) }
+    }
+
+    private static func rank(_ name: String, _ order: [String]) -> Int {
+        order.firstIndex { matches(name, $0) } ?? order.count
+    }
+
+    /// "Fable" matches "fable"; a versioned window name and its alias match by containment.
+    static func matches(_ windowName: String, _ model: String) -> Bool {
+        let window = windowName.lowercased(), model = model.lowercased()
+        return window == model || window.contains(model) || model.contains(window)
+    }
+}
+
+enum FleetMath {
+    /// Summaries in the accounts' display order. `label` maps an account to its display name
+    /// (the user's nickname), injected so this stays free of store dependencies.
+    ///
+    /// `minMembers` is how many accounts a window needs before it is worth pooling. Two on the
+    /// panel, where a pool of one is just that account's own card standing right below it. The
+    /// menu bar's pooled strip asks for ONE, because there a pool is the only reading a
+    /// single-account provider gets. It changes nothing about the arithmetic or about who is in a
+    /// pool - the members of a class are every account reporting it either way - so every pool the
+    /// panel draws comes back from a `minMembers: 1` pass identical, member for member.
+    ///
+    /// `byPlan`: when a provider's pooled accounts sit on two or more NAMED plans, return one
+    /// summary per plan instead of one per provider (unknown-plan accounts form their own, last).
+    /// The provider still needs `minMembers` pooled accounts to appear at all; inside a split every
+    /// plan pools from ONE account, because a plan of one is still that plan's whole budget and the
+    /// alternative drops the provider's strip (and its fold header) entirely. Off by default, so a
+    /// caller that does not ask gets the unsplit summaries bit for bit.
+    static func summaries(accounts: [AccountUsage], now: Date = Date(), minMembers: Int = 2,
+                          byPlan: Bool = false,
+                          label: (AccountUsage) -> String) -> [FleetSummary] {
+        var providerOrder: [String] = []
+        var groups: [String: [AccountUsage]] = [:]
+        for account in accounts where !account.metrics.isEmpty {
+            if groups[account.providerID] == nil { providerOrder.append(account.providerID) }
+            groups[account.providerID, default: []].append(account)
+        }
+        let tiers = byPlan ? planTiers(accounts: accounts) : [:]
+        return providerOrder.flatMap { providerID -> [FleetSummary] in
+            guard let members = groups[providerID], members.count >= minMembers else { return [] }
+            guard members.contains(where: { tiers[$0.id] != nil }) else {
+                return summary(providerID, members, tier: nil, minMembers: minMembers, now: now,
+                               label: label).map { [$0] } ?? []
+            }
+            return planGroups(members).compactMap { tier, group in
+                summary(providerID, group, tier: tier, minMembers: 1, now: now, label: label)
+            }
+        }
+    }
+
+    /// `members` grouped by plan: named plans in display order, the unknown one last (it is the
+    /// least informative row). Shared with the menu bar's pooled strip, so both split in one order.
+    static func planGroups(_ members: [AccountUsage])
+        -> [(tier: FleetSummary.Tier, members: [AccountUsage])] {
+        var order: [FleetSummary.Tier] = []
+        var byTier: [FleetSummary.Tier: [AccountUsage]] = [:]
+        for member in members {
+            let tier = FleetSummary.Tier(name: member.planName)
+            if byTier[tier] == nil { order.append(tier) }
+            byTier[tier, default: []].append(member)
+        }
+        let ordered = order.filter { $0.name != nil } + order.filter { $0.name == nil }
+        return ordered.map { ($0, byTier[$0]!) }
+    }
+
+    /// The plan tier of every pooled account whose provider splits (two or more named plans among
+    /// its pooled accounts), keyed by account id. Accounts of providers that do not split are
+    /// absent. Shared by `summaries(byPlan:)` and the burn-rate pass, so the gauge and its pace
+    /// forecast cannot disagree about who is on which plan.
+    static func planTiers(accounts: [AccountUsage]) -> [String: FleetSummary.Tier] {
+        let pooled = accounts.filter { !$0.metrics.isEmpty }
+        var tiers: [String: FleetSummary.Tier] = [:]
+        for (_, members) in Dictionary(grouping: pooled, by: \.providerID)
+        where Set(members.compactMap(\.planName)).count >= 2 {
+            for member in members { tiers[member.id] = FleetSummary.Tier(name: member.planName) }
+        }
+        return tiers
+    }
+
+    /// One summary over `members`, pooled at `minMembers` and stamped with `tier`.
+    private static func summary(_ providerID: String, _ members: [AccountUsage],
+                                tier: FleetSummary.Tier?, minMembers: Int, now: Date,
+                                label: (AccountUsage) -> String) -> FleetSummary? {
+        var pools: [FleetPool] = []
+        for kind in [MetricKind.session, .weeklyAll] {
+            let entries = members.compactMap { account in
+                account.metrics.first { $0.kind == kind }.map { (account, $0) }
+            }
+            if let pool = pool(kind: kind, entries: entries, now: now, minMembers: minMembers,
+                               label: label) {
+                pools.append(pool)
+            }
+        }
+        // Model-scoped windows pool per model name: two accounts' Fable windows are one
+        // budget, but a Fable window and an Opus window are not.
+        let modelEntries = members.flatMap { account in
+            account.metrics.filter { $0.kind == .weeklyModel }.map { (account, $0) }
+        }
+        let byModel = Dictionary(grouping: modelEntries) { $0.1.modelName ?? $0.1.label }
+        for name in byModel.keys.sorted() {
+            if let pool = pool(kind: .weeklyModel, entries: byModel[name]!, now: now,
+                               minMembers: minMembers, label: label) {
+                pools.append(pool)
+            }
+        }
+        guard !pools.isEmpty else { return nil }
+        return FleetSummary(providerID: providerID, accountCount: members.count, pools: pools,
+                            planTier: tier)
+    }
+
+    /// One pooled window class, or nil when fewer than `minMembers` accounts share it (on the
+    /// panel, a "pool" of one is just that account's own meter, already on its card).
+    private static func pool(kind: MetricKind, entries: [(AccountUsage, UsageMetric)], now: Date,
+                             minMembers: Int,
+                             label: (AccountUsage) -> String) -> FleetPool? {
+        guard entries.count >= minMembers, !entries.isEmpty else { return nil }
+        let members = entries.map { account, metric in
+            FleetPool.Member(accountLabel: label(account), remaining: metric.remainingPercent,
+                             severity: metric.severity, resetsAt: metric.resetsAt)
+        }
+        let refills = entries
+            .compactMap { account, metric in
+                metric.resetsAt.map {
+                    FleetPool.Refill(at: $0, accountLabel: label(account), gain: metric.usedPercent,
+                                     poolSize: entries.count)
+                }
+            }
+            .filter { $0.at > now }
+            .sorted { $0.at < $1.at }
+        return FleetPool(kind: kind, label: entries[0].1.label,
+                         modelName: entries[0].1.modelName, members: members, refills: refills)
+    }
+}
+
+/// One account's capacity relative to its vendor's lowest paid plan (Claude Pro = 1, ChatGPT
+/// Plus = 1), and how that multiple was established.
+enum PlanWeight {
+    enum Source: String, Hashable {
+        /// Read off the plan the provider itself reports.
+        case detected
+        /// The user set it (`codexProMultipleKey`), because the provider does not report it.
+        case config
+        /// Neither: a fallback no reading backs.
+        case assumed
+    }
+
+    /// App-domain UserDefaults key: Codex Pro's multiple of Plus, 5 or 20. The app-server answers
+    /// planType "pro" for both Pro tiers (checked live 2026-09-29 against `account/rateLimits/read`
+    /// and `account/read`), so only the user can say which one they pay for.
+    static let codexProMultipleKey = "codexProUsageMultiple"
+    /// Codex Pro when neither the provider nor the user says: the lower published tier.
+    static let assumedCodexProMultiple: Double = 5
+
+    static func weight(providerID: String, planName: String?,
+                       codexProMultiple: Double?) -> (value: Double, source: Source) {
+        // "Max 20x", "max_20x" and "MAX 20X" name the same tier.
+        let plan = (planName ?? "").lowercased().filter { !$0.isWhitespace && $0 != "_" }
+        switch (providerID, plan) {
+        // Anthropic renamed Max 20x to Ultra (2026-10-31).
+        case ("claude", "max20x"), ("claude", "ultra"), ("claude", "claudeultra"):
+            return (20, .detected)
+        // Max ($100) is the old 5x tier under its current name.
+        case ("claude", "max5x"), ("claude", "max"): return (5, .detected)
+        case ("claude", "pro"): return (1, .detected)
+        // Business (formerly Team) carries the same Codex allowance as Plus.
+        case ("codex", "plus"), ("codex", "team"), ("codex", "business"): return (1, .detected)
+        case ("codex", "pro"):
+            if let multiple = codexProMultiple, multiple == 5 || multiple == 20 {
+                return (multiple, .config)
+            }
+            return (assumedCodexProMultiple, .assumed)
+        default:
+            return (1, .assumed)
+        }
+    }
+
+    /// A pooled figure is only as sure as its least sure member.
+    static func combined(_ sources: Set<Source>) -> Source {
+        if sources.contains(.assumed) { return .assumed }
+        if sources.contains(.config) { return .config }
+        return .detected
+    }
+}
+
+/// One provider's weekly remaining across every plan it holds, weighted by plan capacity.
+struct FleetWeighted: Hashable {
+    /// 0...100, rounded to a whole percent.
+    var remainingPercent: Double
+    var source: PlanWeight.Source
+}
+
+extension FleetMath {
+    /// Whether any account of the provider reports a 5-hour window. Ultra has none (claude.com/pricing:
+    /// "No 5-hour limit"), so a fleet of those is a two-bar fleet and 5-hour UI has nothing to say.
+    static func hasSessionWindow(_ accounts: [AccountUsage], provider: String) -> Bool {
+        accounts.contains { $0.providerID == provider && $0.metrics.contains { $0.kind == .session } }
+    }
+
+    /// Whether the settings for a 5-hour window (relay, auto reset) have anything to act on. Shown
+    /// while no reading of the provider exists yet (so they do not flash away on launch), while an
+    /// account has a 5-hour window, and while the switch is already on (it must stay reachable to
+    /// be turned off).
+    static func showsSessionSettings(_ accounts: [AccountUsage], provider: String,
+                                     alreadyOn: Bool = false) -> Bool {
+        alreadyOn
+            || !accounts.contains { $0.providerID == provider && !$0.metrics.isEmpty }
+            || hasSessionWindow(accounts, provider: provider)
+    }
+
+    /// Per provider: sum(weight x weekly remaining) / sum(weight). An account without a weekly
+    /// reading, or whose reading is stale, stays out of both sums; a provider left with none is
+    /// absent. One account is enough, so a single-account provider reads its own remaining.
+    static func weighted(accounts: [AccountUsage],
+                         codexProMultiple: Double?) -> [String: FleetWeighted] {
+        typealias Sum = (weighted: Double, weights: Double, sources: Set<PlanWeight.Source>)
+        var sums: [String: Sum] = [:]
+        for account in accounts where !account.isStale {
+            guard let remaining = account.metrics
+                .first(where: { $0.kind == .weeklyAll })?.remainingPercent else { continue }
+            let weight = PlanWeight.weight(providerID: account.providerID,
+                                           planName: account.planName,
+                                           codexProMultiple: codexProMultiple)
+            var sum = sums[account.providerID] ?? (weighted: 0, weights: 0, sources: [])
+            sum.weighted += weight.value * remaining
+            sum.weights += weight.value
+            sum.sources.insert(weight.source)
+            sums[account.providerID] = sum
+        }
+        return sums.compactMapValues { sum in
+            guard sum.weights > 0 else { return nil }
+            return FleetWeighted(remainingPercent: (sum.weighted / sum.weights).rounded(),
+                                 source: PlanWeight.combined(sum.sources))
+        }
+    }
+
+    /// The plan a summary's pools cover: the split tier's name, or the plan every pooled account
+    /// of an unsplit provider shares. nil when they do not all name one plan, which weighs as an
+    /// unknown plan.
+    static func planName(of summary: FleetSummary, accounts: [AccountUsage]) -> String? {
+        if let tier = summary.planTier { return tier.name }
+        let plans = Set(accounts
+            .filter { $0.providerID == summary.providerID && !$0.metrics.isEmpty }
+            .map(\.planName))
+        return plans.count == 1 ? plans.first ?? nil : nil
+    }
+}

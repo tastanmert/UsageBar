@@ -1,0 +1,264 @@
+import Darwin
+import Foundation
+
+/// Feed the relay's classifier one or more chunks and report what it concluded overall.
+private func codexClassify(_ chunks: [[UInt8]]) -> (human: Bool, pending: Bool) {
+    var classifier = CodexTerminalInputClassifier()
+    var human = false
+    for chunk in chunks where !chunk.isEmpty { human = classifier.consume(chunk) || human }
+    return (human, classifier.pending)
+}
+
+/// Whole sequence plus every two-chunk split of it. A reply that arrives in two reads must reach
+/// the same verdict as one that arrives whole.
+private func codexClassifyEveryFragment(_ bytes: [UInt8]) -> [(human: Bool, pending: Bool)] {
+    (0...bytes.count).map { codexClassify([Array(bytes[..<$0]), Array(bytes[$0...])]) }
+}
+
+private func codexEscape(_ body: String) -> [UInt8] { Array("\u{1b}\(body)".utf8) }
+
+/// Walk one read through the pair the relay wires together: the classifier decides whether those
+/// bytes stamp a keyboard edit, and the guard decides whether the restored draft is suspect.
+private func codexResumeDraftSuspected(after bytes: [UInt8]) -> Bool {
+    var classifier = CodexTerminalInputClassifier()
+    var draft = CodexResumeDraftGuard()
+    draft.observe(humanInput: classifier.consume(bytes) ? Date() : nil, inputReceipt: nil, ready: false)
+    return draft.suspected
+}
+
+/// Codex asks the terminal for its keyboard flags, device attributes and cursor position at start
+/// up. Anything the terminal answers must not read as a person editing the composer.
+func runCodexTerminalReplyChecks() {
+    let replies: [(String, [UInt8])] = [
+        ("kitty keyboard flags", codexEscape("[?0u")),
+        ("kitty keyboard flags with parameters", codexEscape("[?1;2u")),
+        ("secondary device attributes", codexEscape("[>0;95;0c")),
+        ("DECRPM mode report", codexEscape("[?2026;2$y")),
+        ("XTVERSION device control string", codexEscape("P>|Ghostty 1.2") + codexEscape("\\")),
+        ("cursor position report", codexEscape("[24;80R")),
+        ("focus in", codexEscape("[I")),
+        ("SGR mouse report", codexEscape("[<0;10;20M")),
+    ]
+    for (name, bytes) in replies {
+        check("Codex relay reads \(name) as a terminal reply, whole or fragmented",
+              codexClassifyEveryFragment(bytes).allSatisfy { !$0.human && !$0.pending })
+    }
+    let edits: [(String, [UInt8])] = [
+        ("a kitty encoded key press", codexEscape("[97;5u")),
+        ("a modifyOtherKeys key press", codexEscape("[27;5;97~")),
+        ("bracketed paste start", codexEscape("[200~")),
+        ("bracketed paste end", codexEscape("[201~")),
+        ("an application cursor key", codexEscape("OA")),
+        ("a meta key press", codexEscape("b")),
+    ]
+    for (name, bytes) in edits {
+        check("Codex relay reads \(name) as a keyboard edit, whole or fragmented",
+              codexClassifyEveryFragment(bytes).allSatisfy { $0.human && !$0.pending })
+    }
+    let unfinished = codexClassify([codexEscape("[?0")])
+    check("Codex relay still holds an unfinished sequence as pending", !unfinished.human && unfinished.pending)
+    let mixed = codexClassify([codexEscape("[?0u") + Array("a".utf8)])
+    check("Codex relay reports a key press that follows a reply in the same read", mixed.human && !mixed.pending)
+    // The guard this feeds: a start-up reply before the initialization receipt must not make the
+    // resume draft suspect, or every direct send to that session is refused for its whole life.
+    check("Codex keyboard flags reply before ready leaves the resume draft guard clear",
+          !codexResumeDraftSuspected(after: codexEscape("[?0u")))
+    check("Codex real typing before ready still makes the resume draft suspect",
+          codexResumeDraftSuspected(after: Array("hello".utf8)))
+}
+
+func runCodexInputChecks() {
+    let now = Date()
+    let launch = now.addingTimeInterval(-100)
+    let turn = now.addingTimeInterval(-30)
+    check("Codex unknown keyboard evidence holds drafts", codexInputDraftSuspected(lastInput: nil, userTurnAt: turn, launchedAt: launch))
+    check("Codex single pasted draft after turn is held", codexInputDraftSuspected(lastInput: turn.addingTimeInterval(1), userTurnAt: turn, launchedAt: launch))
+    check("Codex old unsent draft does not expire into permission to overwrite", codexInputDraftSuspected(lastInput: launch.addingTimeInterval(1), userTurnAt: nil, launchedAt: launch))
+    check("Codex submitted user input clears draft suspicion", !codexInputDraftSuspected(lastInput: turn.addingTimeInterval(-1), userTurnAt: turn, launchedAt: launch))
+    check("Codex empty and slash input refuse before native menus", codexSessionInputProblem("") != nil && codexSessionInputProblem("/model") != nil && codexSessionInputProblem("!echo hello") != nil)
+    check("Codex paste escape injection is refused", codexSessionInputProblem("hello\u{1b}[201~\r") != nil)
+    check("Codex multiline plain prompt stays supported", codexSessionInputProblem("hello\nworld") == nil)
+    var clock: Double = 0
+    var polls = 0
+    let confirmed = awaitCodexInputConfirmation(timeout: 1, poll: { polls += 1; return polls == 3 }, sleep: { clock += $0 }, clock: { clock })
+    check("Codex native confirmation waits for actual receipt", confirmed && polls == 3)
+    clock = 0
+    check("Codex missing native receipt has a bounded refusal", !awaitCodexInputConfirmation(timeout: 1, poll: { false }, sleep: { clock += $0 }, clock: { clock }))
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("usagebar-codex-input-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let home = root.appendingPathComponent("home")
+    let transcript = home.appendingPathComponent("sessions/root.jsonl")
+    let queue = root.appendingPathComponent("queue")
+    let log = root.appendingPathComponent("input.log")
+    do {
+        try FileManager.default.createDirectory(at: transcript.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let id = UUID().uuidString, turnID = UUID().uuidString
+        let iso = ISO8601DateFormatter()
+        func line(_ type: String, _ payload: [String: Any], _ date: Date) throws -> Data {
+            var data = try JSONSerialization.data(withJSONObject: ["type": type, "payload": payload, "timestamp": iso.string(from: date)])
+            data.append(10); return data
+        }
+        var data = try line("session_meta", ["id": id, "session_id": id, "source": "cli"], launch)
+        data += try line("event_msg", ["type": "task_started", "turn_id": turnID], turn)
+        data += try line("event_msg", ["type": "user_message", "message": "first prompt"], turn)
+        data += try line("event_msg", ["type": "task_complete", "turn_id": turnID], turn.addingTimeInterval(1))
+        try data.write(to: transcript)
+        var observer = CodexSessionObserver(binding: CodexSessionBinding(nonce: "fixture", sessionID: id, transcriptPath: transcript.path), launchedAt: launch)
+        observer.poll(home: home.path)
+        var input = SessionInputState(sessionKey: "101", servedEpoch: 0, dir: queue)
+        var epoch = Int(now.timeIntervalSince1970 * 1000)
+        try writeSessionInputRequest(SessionInputRequest(epoch: epoch, text: "target only"), sessionKey: "101", dir: queue)
+        try writeSessionInputRequest(SessionInputRequest(epoch: epoch, text: "sibling only"), sessionKey: "202", dir: queue)
+        var keyboard = KeyboardActivity()
+        keyboard.observe(stamp: turn.addingTimeInterval(-1))
+        var delivered: [String] = []
+        var injection: SessionInputInjection = .done
+        func apply(_ observed: CodexSessionObserver?, terminalReady: Bool = true, confirmed: Bool = true,
+                   startupDraft: Bool = false) -> SessionInputAction {
+            applyCodexSessionInput(&input, observer: observed, keyboard: keyboard, launchedAt: launch,
+                terminalReady: terminalReady, startupDraftSuspected: startupDraft, dir: queue, log: log, now: now,
+                inject: { if injection == .done { delivered.append($0) }; return injection }, confirm: { confirmed })
+        }
+        check("Codex unknown session leaves queue untouched", apply(nil).typed == nil && delivered.isEmpty && readSessionInputRequest(sessionKey: "101", dir: queue) != nil)
+        check("Codex lost terminal owner holds input", apply(observer, terminalReady: false).typed == nil && delivered.isEmpty)
+        keyboard.observe(stamp: now.addingTimeInterval(-1))
+        check("Codex human typing holds input", apply(observer).typed == nil && delivered.isEmpty)
+        keyboard.lastStamp = turn.addingTimeInterval(2)
+        keyboard.lastBurstAt = nil
+        check("Codex quiet ambiguous input refuses without typing", apply(observer).typed == nil && delivered.isEmpty
+            && readSessionInputResult(sessionKey: "101", dir: queue)?.outcome == "refused-unsafe-input"
+            && readSessionInputRequest(sessionKey: "101", dir: queue) == nil)
+        epoch += 1
+        try writeSessionInputRequest(SessionInputRequest(epoch: epoch, text: "target only"), sessionKey: "101", dir: queue)
+        keyboard.lastStamp = turn.addingTimeInterval(-1)
+        check("startup draft predating native initialization receipt still refuses delivery",
+              apply(observer, startupDraft: true).typed == nil && delivered.isEmpty
+              && readSessionInputResult(sessionKey: "101", dir: queue)?.outcome == "refused-unsafe-input")
+        epoch += 1
+        try writeSessionInputRequest(SessionInputRequest(epoch: epoch, text: "target only"), sessionKey: "101", dir: queue)
+        injection = .held
+        check("Codex late human input holds the original queued request", apply(observer).typed == nil && readSessionInputRequest(sessionKey: "101", dir: queue)?.text == "target only")
+        injection = .done
+        check("Codex exact target receives requested text", apply(observer).typed == "target only" && delivered == ["target only"])
+        check("Codex sibling queue is isolated", readSessionInputRequest(sessionKey: "202", dir: queue)?.text == "sibling only")
+        check("Codex confirmed injection writes result and audit", readSessionInputResult(sessionKey: "101", dir: queue)?.delivered == true && (try? String(contentsOf: log, encoding: .utf8))?.contains("target only") == true)
+        check("Codex served request is not replayed", apply(observer).typed == nil && delivered.count == 1)
+        epoch += 1
+        try writeSessionInputRequest(SessionInputRequest(epoch: epoch, text: "unconfirmed"), sessionKey: "101", dir: queue)
+        check("Codex tty bytes without native receipt never report delivered", apply(observer, confirmed: false).typed == nil
+            && readSessionInputResult(sessionKey: "101", dir: queue)?.outcome == "unconfirmed-input"
+            && readSessionInputResult(sessionKey: "101", dir: queue)?.delivered == false)
+        epoch += 1
+        injection = .uncertain
+        try writeSessionInputRequest(SessionInputRequest(epoch: epoch, text: "partial"), sessionKey: "101", dir: queue)
+        check("Codex partial write records uncertainty without delivery or replay", apply(observer).typed == nil
+            && readSessionInputResult(sessionKey: "101", dir: queue)?.outcome == "unconfirmed-input"
+            && readSessionInputResult(sessionKey: "101", dir: queue)?.delivered == false
+            && readSessionInputRequest(sessionKey: "101", dir: queue) == nil)
+        injection = .done
+        // B-1706: a `usagebar session clear` with somewhere to reopen bypasses the slash rule and is
+        // answered by a reopen; without one, or as a plain send, `/clear` is refused as before.
+        func applyClear(intent: String?, target: String?) -> SessionInputAction {
+            epoch += 1
+            try? writeSessionInputRequest(SessionInputRequest(epoch: epoch, text: windowClearCommand, intent: intent),
+                                          sessionKey: "101", dir: queue)
+            return applyCodexSessionInput(&input, observer: observer, keyboard: keyboard, launchedAt: launch,
+                terminalReady: true, dir: queue, log: log, now: now, reopen: { target },
+                inject: { delivered.append($0); return .done }, confirm: { true })
+        }
+        let typedBefore = delivered.count
+        check("Codex clear with no reopen target is still refused",
+              applyClear(intent: sessionClearIntent, target: nil).reopenAs == nil
+              && readSessionInputResult(sessionKey: "101", dir: queue)?.outcome == "refused-unsafe-input")
+        check("Codex plain send of /clear is still refused even with a reopen target",
+              applyClear(intent: nil, target: "claude").reopenAs == nil
+              && readSessionInputResult(sessionKey: "101", dir: queue)?.outcome == "refused-unsafe-input")
+        check("Codex clear with a reopen target reopens without typing",
+              applyClear(intent: sessionClearIntent, target: "claude").reopenAs == "claude"
+              && readSessionInputResult(sessionKey: "101", dir: queue)?.outcome == "reopened-provider"
+              && delivered.count == typedBefore)
+        var working = observer
+        let activeID = UUID().uuidString
+        let handle = try FileHandle(forWritingTo: transcript)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: line("event_msg", ["type": "task_started", "turn_id": activeID], now))
+        try handle.close()
+        working.poll(home: home.path)
+        try writeSessionInputRequest(SessionInputRequest(epoch: epoch + 1, text: "wait"), sessionKey: "101", dir: queue)
+        check("Codex active turn holds queued input", apply(working).typed == nil && delivered.count == 2)
+    } catch { check("Codex input fixture: \(error)", false) }
+}
+
+nonisolated(unsafe) private var codexPTYGo = false
+
+/// Run only under the test runner's isolated PTY, before the ordinary suite initializes.
+func runCodexInputPTYFixture() -> Never {
+    guard let terminal = CodexInputRelay() else { exit(10) }
+    signal(SIGUSR1) { _ in codexPTYGo = true }
+    guard let child = terminal.spawn([CommandLine.arguments[0], "--codex-input-pty-reader", CommandLine.arguments.last!],
+                                 environment: ProcessInfo.processInfo.environment) else { terminal.close(); exit(11) }
+    func stop(_ code: Int32) -> Never {
+        kill(child, SIGKILL)
+        var status: Int32 = 0
+        _ = waitpid(child, &status, 0)
+        terminal.close()
+        exit(code)
+    }
+    guard let generation = SessionMonitoring.generation(child) else { stop(12) }
+    let deadline = Date().addingTimeInterval(5)
+    while !(terminal.terminalReady(child: child, startedAt: generation) && terminal.canSend) && Date() < deadline { terminal.pump(timeout: 0.01) }
+    guard terminal.terminalReady(child: child, startedAt: generation) && terminal.canSend else { stop(13) }
+    print("READY"); fflush(stdout)
+    while !codexPTYGo && Date() < deadline { terminal.pump(timeout: 0.01) }
+    guard codexPTYGo else { stop(14) }
+    // UsageBar ships typing into sessions closed: the shipped relay refuses before it looks at the
+    // terminal. From here on the fixture opens the gate and drives the submission.
+    guard !BrimFeatures.typesIntoSessions, !terminal.typesIntoSessions,
+          terminal.submit(CommandLine.arguments.last!, child: child, startedAt: generation) == .failed(EPERM),
+          terminal.canSend else { stop(19) }
+    terminal.typesIntoSessions = true
+    guard terminal.submit("wrong", child: child, startedAt: generation - 1) == .failed(ENOTTY) else { stop(15) }
+    let cancelled = CommandLine.arguments.last! == "cancel"
+    let cancellation = Date().addingTimeInterval(0.15)
+    let result = terminal.submit(CommandLine.arguments.last!, child: child, startedAt: generation,
+        shouldContinue: { !cancelled || Date() < cancellation })
+    guard result == (cancelled ? .uncertain : .done) else { stop(16) }
+    if cancelled {
+        guard !terminal.canSend, terminal.submit("again", child: child, startedAt: generation) == .failed(ENOTTY) else { stop(18) }
+    }
+    var status: Int32 = 0
+    var ended: pid_t = 0
+    while Date() < deadline {
+        terminal.pump(timeout: 0.01)
+        ended = waitpid(child, &status, WNOHANG)
+        if ended == child { break }
+    }
+    guard ended == child else { stop(17) }
+    terminal.close()
+    exit(supervisorExitCode(childStatus: status))
+}
+
+func runCodexInputPTYReader() -> Never {
+    var mode = termios()
+    guard tcgetattr(STDIN_FILENO, &mode) == 0 else { exit(20) }
+    cfmakeraw(&mode)
+    guard tcsetattr(STDIN_FILENO, TCSANOW, &mode) == 0 else { exit(21) }
+    print("\u{1b}[?2004h", terminator: ""); fflush(stdout)
+    _ = fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK)
+    var bytes: [UInt8] = []
+    var buffer = [UInt8](repeating: 0, count: 512)
+    let expected = Array(CommandLine.arguments.last!.utf8).count + (CommandLine.arguments.last! == "cancel" ? 17 : 18)
+    let deadline = Date().addingTimeInterval(5)
+    while bytes.count < expected && Date() < deadline {
+        let count = read(STDIN_FILENO, &buffer, buffer.count)
+        if count > 0 { bytes += buffer.prefix(count) }
+        usleep(10_000)
+    }
+    print(Data(bytes).base64EncodedString()); fflush(stdout)
+    // stdin and stdout share one open file description, so the O_NONBLOCK set above also makes
+    // this process's last close of the PTY non-blocking, and the tty layer then flushes the
+    // receipt instead of waiting for the fixture to read it. Restore blocking and drain first.
+    _ = fcntl(STDIN_FILENO, F_SETFL, 0)
+    tcdrain(STDOUT_FILENO)
+    exit(bytes.count == expected ? 0 : 22)
+}

@@ -1,0 +1,355 @@
+# Session wait events
+
+UsageBar can publish a stream of events about when a supervised Claude Code or Codex session is
+waiting on a person, so an external watcher (a monitoring agent, a dashboard, an alert) does not
+have to poll `usagebar status` and guess.
+
+This is a machine-to-machine integration surface. It is documented here rather than in the app's
+README because its audience is a script or another agent, not a person reading the project's own
+feature list.
+
+## Directory layout
+
+Every file below lives at `~/.usagebar/events/` on the machine running the supervisor:
+
+```
+~/.usagebar/events/
+  spool.jsonl        append-only log, one JSON event per line
+  seq                the next sequence number an appended event will receive
+  cursor             the last sequence number successfully delivered (or dead-lettered)
+  sink.json           {"url": "...", "secret": "...", "createdAt": "..."}, mode 0600
+  deliver.lock        an flock target; not meant to be read
+  dead-letter.jsonl  events that ran out of retries or failed permanently
+```
+
+`seq` counts up every time a wait is decided, whether or not a sink is configured. `cursor` only
+advances during a delivery pass (`usagebar events --deliver-once`). The two numbers can disagree, and
+that disagreement is exactly what `usagebar events --since` exists to close: a consumer that fell
+behind, or one that never had a sink registered at all, can read everything from a sequence number
+forward at any time.
+
+## Event schema
+
+One line of `spool.jsonl` is one JSON object:
+
+```json
+{
+  "v": 1,
+  "seq": 1284,
+  "at": "2026-09-22T23:41:07.412Z",
+  "kind": "wait.opened",
+  "provider": "claude",
+  "session": {
+    "key": "claude:41287:1758575401",
+    "supervisorPid": 41287,
+    "supervisorStartedAt": 1758575401,
+    "childPid": 41301,
+    "transcriptSessionId": "0f2c-uuid",
+    "launchNonce": null,
+    "account": "personal",
+    "directory": "/Users/example/workspace/usagebar",
+    "project": "usagebar",
+    "worktree": null
+  },
+  "request": {
+    "id": "a3f19c2b8d04e551",
+    "kind": "permission",
+    "confidence": "confirmed",
+    "since": "2026-09-22T23:40:58.900Z",
+    "noticeType": "permission_prompt",
+    "tool": "Bash",
+    "summary": "Claude needs your permission to use Bash"
+  },
+  "resolution": null,
+  "idempotencyKey": "b71d0e5f9a2c4438"
+}
+```
+
+Fields absent from a JSON object have their own meaning (they are not "unknown by omission"): a
+missing `tool` means no tool name could be attached, a missing `summary` means the wait had nothing
+to say about itself, `resolution` is only ever present on a `wait.resolved` event.
+
+`session.supervisorStartedAt` is an opaque generation stamp, not a timestamp to be read on its own:
+on Claude it is an epoch-second value, on Codex it is a microsecond-resolution generation counter
+(`CodexSupervisor.swift:57`). It is not comparable across providers, and it always changes across a
+restart of the same provider's supervisor.
+
+`kind` is one of `wait.opened`, `wait.updated`, `wait.resolved`, `session.ended`. `request.kind` is
+one of `permission`, `question`, `unknown`. `request.confidence` is one of `confirmed`, `suspected`,
+`unknown`. `resolution`, present only on `wait.resolved`, is one of `answered`, `denied`,
+`superseded`, `session-ended`, `unknown` (see Limitations below: `denied` is reserved for a future
+version and is never emitted by v1).
+
+`reason`, present only on `session.ended`, says why the session ended:
+
+```json
+"reason": { "supervisorSignal": 15, "childSignal": 15 }
+```
+
+`supervisorSignal` is the termination signal the supervisor received (`1` SIGHUP, a closed terminal;
+`15` SIGTERM, a kill), or `0` when none came and the session ended because its child exited on its
+own. Beside it is exactly one of `childExitCode` (the child exited normally with that code) or
+`childSignal` (the child was killed by that signal). The field was added without bumping `v`: lines
+written before it existed simply have no `reason`.
+
+`confidence == "confirmed"` is reserved for signals this build can prove reached a real dialog:
+Claude's structured question tool call, and Claude's `permission_prompt` /
+`worker_permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input`
+notifications. Every Codex signal, and Claude's plain `idle_prompt`, is `suspected` at best and is
+never promoted to `confirmed`.
+
+### How a structured question is recognised
+
+- Claude, transcript: an `AskUserQuestion` (or `ExitPlanMode`) tool call open in the transcript.
+  Claude Code 2.1.280 writes that call only after it is answered, so on 2.1.280 this row rarely
+  fires.
+- Claude, `permission_prompt` notice: on Claude Code 2.1.280 an `AskUserQuestion` dialog fires the
+  same `permission_prompt` notification, with the same message ("Claude needs your permission"), as
+  a tool permission does. What tells them apart is Claude Code's own session registry,
+  `<config home>/sessions/<child pid>.json`: while a dialog is open it says `"status": "waiting"`,
+  with `"waitingFor": "input needed"` for the question dialog and `"permission prompt"` for every
+  permission dialog. Read that way, the wait is `kind: "question"`, `confidence: "confirmed"`,
+  `tool: "AskUserQuestion"`, `noticeType: "permission_prompt"`. If the registry is read a tick after
+  the notice, the wait opens as a permission and a `wait.updated` with the same `request.id` turns
+  it into a question; it is never turned back.
+- Codex: a `request_user_input` `function_call` in the rollout with no `function_call_output` for
+  its `call_id` yet (Codex CLI 0.155.1 writes the call when the "Question 1/1" chooser opens and the
+  output when it is answered). The wait is `kind: "question"`, `confidence: "suspected"`,
+  `tool: "request_user_input"`; its output landing resolves it `answered`, the turn ending or being
+  interrupted resolves it `unknown`.
+
+### What counts as an answer
+
+`answered` also means Claude Code's session registry (`<config home>/sessions/<pid>.json`) reported
+the dialog the wait stood over as closed: its `status` left `waiting` after having said `waiting`
+for that very wait. Approve, refuse and Esc are indistinguishable there and all read `answered`.
+While the registry says `waiting`, nothing in the transcript and no key pressed closes the wait.
+The rest of this section applies when the registry cannot speak for the session (no file, another
+pid, no `status`, or it never said `waiting` for the wait).
+
+Otherwise a Claude wait resolves `answered` only when a record a PERSON produced lands in the
+main-chain transcript after the wait began. Census of every stamped record kind in 14 days of transcripts on
+the development machine (Claude Code 2.1.277 to 2.1.280, 400 files, 2026-09-23):
+
+| Record (type, subtype, content) | Count | Person? |
+|---|---|---|
+| `attachment` | 18277 | no |
+| `assistant` | 13036 | no |
+| `user`, tool result | 7363 | yes (a dialog's answer is written as one) |
+| `queue-operation` | 3333 | no (no `uuid`, never read) |
+| `user`, text, `promptSource: "system"` (task notification) | 621 | no |
+| `user`, text, `isMeta` (command caveat, Stop hook feedback, skill body, peer message) | 738 | no |
+| `user`, text, `<command-name>` (a slash command) | 385 | yes |
+| `user`, text, `promptSource: "typed"` or `"queued"` (`origin.kind: "human"`) | 97 | yes |
+| `user`, text, `promptSource: "sdk"` | 7 | yes |
+| `user`, text, `[Request interrupted by user]` | 3 | yes |
+| `system`, `stop_hook_summary` / `turn_duration` / `local_command` / `away_summary` / `model_fallback` / `informational` | 971 / 827 / 378 / 32 / 3 / 3 | no |
+| `file-history-delta` | 194 | no |
+
+Any `origin.kind` other than `human`, or any `promptSource` other than `typed`, `queued` or `sdk`,
+is treated as not a person. When the conversation moves without a person (a task notification
+wakes the session), a standing wait resolves `unknown`. A `system` record does not move the
+conversation at all: an auto mode notice written 0.97 s after a wait opened used to resolve it
+`answered` (H1 rerun O4). An `idle_prompt` wait, once open, stays open through Claude Code writing
+to an otherwise idle transcript; only the conversation moving or a keyboard burst ends it. A
+terminal focus report is not typing: two stamps that focus changes recorded by UsageBar.app explain
+(switching out and back in) never end one, while a report that closes a run of real keys (typing,
+then switching away) still does.
+
+## Verifying a delivered event
+
+Each delivered event is a single HTTP POST with these headers:
+
+```
+Content-Type: application/json
+X-UsageBar-Timestamp: 1758575401
+X-UsageBar-Signature: sha256=<hex>
+X-UsageBar-Idempotency-Key: b71d0e5f9a2c4438
+X-UsageBar-Event: wait.opened
+```
+
+The signature is `HMAC-SHA256(key: secret, message: "<timestamp>.<body>")`, where `<body>` is the
+exact bytes of the POST body and `<timestamp>` is the value of `X-UsageBar-Timestamp`, joined with a
+literal `.`. A receiver written in Python:
+
+```python
+import hashlib
+import hmac
+
+def verify(secret: str, timestamp: str, body: bytes, signature_header: str) -> bool:
+    message = f"{timestamp}.".encode() + body
+    expected = "sha256=" + hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+```
+
+Use `hmac.compare_digest` (or the equivalent constant-time comparison in your language), not `==`,
+to avoid a timing side channel.
+
+## Catching up: `usagebar events` vs `usagebar status --json`
+
+```
+usagebar events --since <seq> [--limit n]   # every event with seq > <seq>, oldest first (default limit 500)
+usagebar events --follow [--since <seq>]    # print events after <seq> (default: from --latest-seq), then block and print each new one
+usagebar events --latest-seq                # the highest seq written so far, for aligning on startup
+usagebar events --deliver-once [--replay-dead-letter]   # run one delivery pass by hand
+usagebar events sink set <url> --secret-stdin           # configure the one destination (secret read from stdin)
+usagebar events sink show                               # print the url and whether a secret is set (never the value)
+usagebar events sink clear                              # remove the sink configuration
+```
+
+The two read paths answer different questions:
+
+- `usagebar events --since <seq>` answers "what happened between then and now" - it is the catch-up
+  path for a consumer that missed some deliveries (sink was down, consumer was down, this is the
+  first time it has ever asked).
+- `usagebar status --json` answers "what is true right now" - it already reports each session's
+  `state` / `noticeType` / `quiet` fields and is the reconciliation path, not the event log.
+
+A consumer should treat `usagebar status --json` as the source of truth for "is this session waiting
+on someone right now" and `usagebar events --since` as the source of truth for "what did I miss."
+
+A delivery pass (`usagebar events --deliver-once`, which every supervisor spawns) holds one lock and
+keeps reading past the cursor until nothing is left, then checks once more after unlocking and
+takes the lock again if anything arrived. That is what delivers the `wait.resolved` and
+`session.ended` a supervisor appends as it exits while an earlier pass is still sending: the
+deliverer the exit path spawns loses the lock and leaves, and the pass holding it picks them up.
+Both loops are bounded (5 reads, 5 lock rounds); a pass that reaches the bound with events still
+waiting, having moved the cursor, spawns one fresh deliverer for the rest.
+
+## Local consumers: `usagebar events --follow`
+
+`usagebar events --follow [--since <seq>]` prints every event with `seq > <seq>` in the same encoding
+as `--since`, then blocks and prints one JSON line per new event as soon as it is appended. It is
+woken by kernel file events on `~/.usagebar/events`, so the consumer does no polling, runs no listener
+and exposes no URL. Without `--since` it starts at `--latest-seq` (only new events).
+
+Exit codes:
+
+- `0` - stopped by SIGTERM or SIGINT, or its stdout was closed (the consumer went away).
+- `1` - setup failure (the events directory could not be watched).
+- `2` - usage error.
+- `3` - events were lost: either the spool was trimmed past the consumer's cursor, or the seq
+  counter is below the cursor (the spool was rebuilt). The stderr line names the case and both
+  numbers.
+
+Consumer contract:
+
+- Persist your own cursor (the `seq` of the last event you handled) after handling each event, and
+  restart with `usagebar events --follow --since <cursor>`.
+- Deduplicate on `idempotencyKey`.
+- Discard a trailing fragment that does not end in a newline: a stop can land mid-line.
+- On start and on exit code `3`, reconcile with `usagebar status --json`, then realign with
+  `usagebar events --latest-seq` and restart from there.
+
+A seq hole that is not a trim (an append that failed after taking its number) is reported on stderr
+and skipped: the missing event was never written, so no reader could have received it.
+
+The webhook sink and any number of `--follow` readers run together; neither moves the other's
+cursor. Trim is driven by the webhook delivery cursor only (it keeps about 1000 events behind it),
+so a follow consumer that lags more than ~1000 events behind a trim gets exit code `3`.
+
+The follower also re-checks the spool every 60 s as a safety net against a missed file event; that
+is not the delivery path.
+
+## Deduplication
+
+Every event carries `idempotencyKey`, computed from the request it describes, the event kind, and
+the resolution (when there is one). A `wait.updated` also folds in its own `seq`: one wait can be
+updated more than once (confidence upgraded, then a tool or summary filled in), and each update is a
+distinct event with a distinct key. Delivery retries and replays resend the spooled line itself, so
+every attempt of one event carries the same key. The same underlying wait event, recomputed on a
+retry or a resend, always produces the same key; the one exception is a `wait.updated` that is
+re-derived and appended to the spool again, which gets a new `seq` and so a new key. A consumer that records "I have already acted on key X" and
+skips a repeat is safe against: webhook retries, a `--replay-dead-letter` replay, and a supervisor
+self-update that takes the same session over and re-derives an event it already sent. The key
+includes `session.key`, which carries the supervisor's pid and start time, so the same key only
+comes back for the same supervisor identity. A NEW supervisor generation (a fresh `usagebar claude` or
+`usagebar codex`, even in the same directory for the same notification) has a different `session.key`
+and its events are new requests with new keys.
+
+`request.id` is a separate, narrower key: it names the specific wait (open dialog, open question),
+stable across `wait.opened` / `wait.updated` / `wait.resolved` for the same wait, and different for
+every distinct wait. Use it to correlate the lifecycle of one wait across multiple events; use
+`idempotencyKey` to decide whether to act on a given event at all.
+
+## Limitations
+
+1. Codex cannot prove a permission dialog was actually shown to a person. The hook payload carries
+   no such field, and Codex's own rollout transcript records no approval history to check against.
+   Every Codex permission wait is `confidence: "suspected"` and stays that way in this version.
+2. A plain text question typed into Claude's response and a session nobody is talking to at all
+   produce the identical signal (`idle_prompt`). Both are reported as `request.kind: "unknown"`,
+   `confidence: "suspected"`. Telling them apart is left to whatever reads this stream.
+3. A background worker's permission prompt is closed by the session registry when the registry
+   tracks it (Claude Code 2.1.280 does for `permission_prompt`), not by the worker's own result.
+   Watching the main session's transcript move is the fallback when the registry cannot speak.
+4. Only one open wait is tracked per session at a time. If a second one appears before the first is
+   resolved, the first is reported `resolution: "superseded"` - its real outcome is never known.
+5. Claude Code's documented `Notification` type list and this build's own list disagree in both
+   directions (the docs omit `worker_permission_prompt`, which this build has observed; this build
+   does not recognize three `quota_auto_resume_*` types the docs list). This feature does not
+   reconcile either list.
+6. Whether `PermissionRequest` fires only when a tool call is actually presented to a person, or
+   also when a hook auto-decides it, is unconfirmed by Claude Code's own documentation.
+7. Where `request.tool` comes from depends on the request:
+   - Claude permission and unknown waits: always absent. The Claude tracker passes no tool name,
+     because nothing on the Claude side confirms which tool a notification is about; the tool is
+     only mentioned in `request.summary`, as Claude Code's own message text.
+   - Codex permission waits: the tool field of the pending `PermissionRequest` hook payload.
+   - Structured questions (`request.kind: "question"`): the name of the question tool call that is
+     open in the transcript (for example `AskUserQuestion`), `AskUserQuestion` for a question read
+     off Claude Code's session registry, and `request_user_input` for Codex.
+8. Codex's `~/.codex/config.toml` `notify` key is already claimed by another tool on this machine
+   (a computer-use client). This feature does not read or write it.
+9. Codex structured questions (`request_user_input`, Codex CLI 0.155.1) are reported from the
+   rollout (see "How a structured question is recognised"). Codex MCP elicitation is unverified.
+   While a Codex question stands, `usagebar status --json` still reports the session's `state` as
+   `working`; only the event stream shows the question.
+10. Out of scope for v1: Codex subagents, delivering to more than one sink, and any event older
+    than what the spool trimming window retains. 8 MiB is the size that TRIGGERS a trim (together
+    with delivery having caught up with at least half of the spool), not an amount that is kept. A
+    trim keeps only events with `seq > cursor - 1000` plus everything not yet delivered, so right
+    after a trim with every event delivered, only about the last 1000 events are left.
+11. v1 cannot tell a permission request that was answered "yes" apart from one answered "no," so a
+    consumer cannot use `resolution` to learn whether a permission was approved or refused.
+    Measured values (H1 rerun, 2026-09-23): Claude Code 2.1.280, "No" on a Bash permission resolves
+    `answered` (cell A2); Codex CLI 0.155.1, Esc on a command approval resolves `unknown` (cell B1
+    deny). `resolution: "denied"` is reserved in the schema for a future version that reads the
+    transcript's own tool result to tell them apart, and is never emitted by this version. On
+    Claude Code 2.1.280, Esc on a background agent's dialog now resolves `answered` (it read
+    `unknown` before the registry closed waits; H1f B1x).
+12. The structured question reading on Claude Code 2.1.280 rests on the session registry's
+    `waitingFor`, which is undocumented. A version that drops or renames it reports its questions as
+    permissions again (late rather than wrong). A plan awaiting approval (`ExitPlanMode`) on 2.1.280
+    also fires `permission_prompt`, and the registry names it `"permission prompt"`, so it is
+    reported as a permission. The registry's `status` is undocumented as well. A wait is closed by
+    it only after it said `waiting` for that wait (the handshake), so a version that stops writing
+    `waiting` falls back to the pre-registry rules (late or early as before) and never closes a
+    wait early on the registry's word. Each such fallback leaves one line in `~/.usagebar/handoff.log`
+    (`closed by legacy rules; registry v<version> never said waiting`).
+13. A tool result counts as a person's answer only on sessions whose registry cannot speak. There, if
+    Claude Code writes the result of one tool call while a permission dialog for another call is
+    still open, that wait resolves `answered` early (observed on 2.1.280 before the registry closed
+    waits: H1f B5t).
+14. A child replaced mid-dialog (a cap handoff, a relaunch) leaves the old notice to the older
+    rules, because the new child's registry knows nothing of the old dialog. A dialog that closes
+    because its agent was stopped (`TaskStop`) reads `answered`, the same as one a person closed.
+15. A dialog answered within about two seconds of its notice, before the supervisor's next tick,
+    is still reported. On Claude Code 2.1.280 the registry said `waiting` on the tick before the
+    notice and left it after the notice fired, so the wait opens and resolves `answered` in the same
+    tick; a re-announced dialog whose wait is already open resolves that wait `answered` instead of
+    `superseded`. Two dialogs both answered inside one tick report only one of them. Without those
+    readings (a supervisor self-update across the answer, a registry with no `statusUpdatedAt`), the
+    older rules decide exactly as before this change (early or late, limitation 12), and the
+    fallback leaves the limitation 12 line.
+16. A plain text question in a Codex reply (an ordinary reply that asks something, with no
+    structured `request_user_input` chooser) produces no wait event, and `usagebar status --json`
+    cannot tell it apart from a reply that asks nothing. Measured on Codex CLI 0.155.1
+    (2026-09-23, two plain text questions and one reply of "ok", each watched for 120 seconds):
+    no `wait.*` event and no notice, and every `usagebar status --json` sample, taken about once a
+    second, read `state: "idle"` from the moment the turn's `task_complete` landed, with no
+    `noticeType`, for the questions and the "ok" reply alike. Answering the question in plain
+    text is an ordinary new turn (`working`, then `idle`) and produces no event either. Codex's
+    rollout records both kinds of turn with the same record types in the same order: the question
+    exists only as the text of the final assistant message, and no rollout field says Codex is
+    waiting for a person. This version reads no Codex signal for it.

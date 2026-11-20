@@ -1,0 +1,154 @@
+import Foundation
+
+// What the store PUBLISHES rather than what it shows: the non-secret snapshot the `usagebar` CLI reads
+// to pick a launch account, the fleet shapes inside it, and the tripwire that watches the flagship
+// pool. Lifted out of UsageStore.swift (past the repo's 500-line cap) along the seam the callers
+// already use - the refresh loop and the settings writes call in here, and nothing here fetches.
+
+extension UsageStore {
+    /// Rewrite the snapshot from the cached accounts + current settings. No-op for a build nobody
+    /// installed and for demo mode (neither may publish), or before the first successful refresh.
+    /// `isUnshipped` rather than `isDev` because the settings writes reach here directly: gating only
+    /// the refresh loop would leave a locally built Release republishing on every toggle.
+    func republishSnapshot() {
+        // BRIM-GATE: mirror snapshots retain UsageBar timestamps and data; settings must not rebuild them.
+        // In live mode this is UsageBar's own snapshot, which `usagebar status --json` reads.
+        guard BrimFeatures.liveProbes else { return }
+        guard BuildVariant.publishesOwnState, !DemoUsage.isActive,
+              !lastPublishedAccounts.isEmpty else { return }
+        let (fleet, fleetPools) = fleetForSnapshot()
+        // Outside the gauge switch and for single-account providers too: this is the one number a
+        // reader draws a provider's remaining from, not a pool the panel shows.
+        let weighted = FleetMath.weighted(accounts: lastPublishedAccounts,
+                                          codexProMultiple: Self.codexProMultiple)
+            .mapValues { UsageSnapshot.Weighted(remainingPercent: $0.remainingPercent,
+                                                weightSource: $0.source.rawValue) }
+        let snapshot = UsageSnapshot.make(accounts: lastPublishedAccounts, launchHomes: lastLaunchHomes,
+                           statuslineFullQuota: SettingsStore.shared.statuslineFullQuota,
+                           displayMode: SettingsStore.shared.displayMode.rawValue,
+                           fleet: fleet, fleetPools: fleetPools,
+                           fleetWeighted: weighted.isEmpty ? nil : weighted,
+                           // What the PANEL shows, for the surfaces that mirror it. The accounts
+                           // themselves keep the order they are written in, because readers that
+                           // resolve near-ties by taking the first candidate depend on it
+                           // (UsageSnapshot.accountOrder states the whole trade).
+                           accountOrder: SettingsStore.shared
+                               .orderedAccountIDs(lastPublishedAccounts.map(\.id)),
+                           resetStates: Dictionary(lastPublishedAccounts.map {
+                               ($0.id, RedeemAction.offer(for: $0).stateName)
+                           }, uniquingKeysWith: { first, _ in first }))
+        snapshot.write()
+        adoptPublished(snapshot)
+    }
+
+    /// Feed the claude flagship weekly pool to the dry-pool notifier. The flagship window is chosen
+    /// by tier order (not the gauge's display focus), so the tripwire watches the top model pool
+    /// regardless of what the panel currently shows. No pool (fewer than two accounts share the
+    /// flagship window) means nothing to arm.
+    func notifyFlagshipDryness(accounts labeled: [AccountUsage]) {
+        let now = Date()
+        let summaries = FleetMath.summaries(accounts: labeled, now: now) { $0.accountLabel }
+        guard let summary = summaries.first(where: { $0.providerID == "claude" }),
+              let flagship = FleetFocus.flagship(summary.modelPoolNames,
+                                                 order: ModelCatalog.claudeAliases),
+              let pool = summary.pools.first(where: {
+                  $0.kind == .weeklyModel && ($0.modelName ?? $0.label) == flagship
+              }),
+              // No known upcoming reset means stale or partial data (e.g. wake-from-sleep with
+              // fetches still failing): a nil reset would read as a new cycle and re-fire a stale
+              // alert. Skip this round; the next successful fetch recovers naturally.
+              pool.nextReset != nil else { return }
+        DryPoolNotifier.shared.evaluate(
+            remaining: pool.totalRemaining,
+            capacity: Double(pool.members.count) * 100,
+            accountCount: pool.members.count,
+            resetAt: pool.nextReset,
+            windowName: pool.modelName ?? pool.label)
+    }
+
+    /// The model name the display leads with for `providerID`, given the available model window
+    /// names - the glue between the pure resolver and the app's stores. One resolution shared by
+    /// the fleet gauge, the menu-bar strip and the CLI's own fleet line.
+    static func focusedModel(providerID: String, available: [String]) -> String? {
+        FleetFocus.focusedModel(SettingsStore.shared.gaugeFocus,
+                                primaryModel: DemoUsage.launchModelOverride
+                                    ?? LaunchPolicyStore.shared.policy(providerID).model,
+                                available: available,
+                                flagshipOrder: ModelCatalog.claudeAliases)
+    }
+
+    /// Codex Pro's multiple of Plus as the user set it (`defaults write app.usagebar.UsageBar
+    /// codexProUsageMultiple -int 20`); nil when unset. `double(forKey:)` also reads a string "20".
+    static var codexProMultiple: Double? {
+        let value = UserDefaults.standard.double(forKey: PlanWeight.codexProMultipleKey)
+        return value > 0 ? value : nil
+    }
+
+    /// `usagebar status`'s fleet line follows the SAME switch as the panel's gauge: published
+    /// only while the gauge is on, and only for providers with a real pool (2+ accounts with a
+    /// weekly window). Launch mode is deliberately irrelevant - one toggle, one meaning.
+    ///
+    /// Two shapes from one pass: `fleet` keeps the single headline pool (the pre-0.17 contract
+    /// older CLIs render) and `fleetPools` carries the panel's ordered pool list (gauge focus
+    /// applied, session pools excluded) for CLIs that render every pool the gauge shows.
+    /// A provider split by plan (FleetMath `byPlan`) publishes every plan's pools under its
+    /// `fleetPools` entry, each stamped with `plan`, and no single `fleet` pool.
+    func fleetForSnapshot() -> ([String: UsageSnapshot.Fleet]?,
+                                        [String: [UsageSnapshot.Fleet]]?) {
+        guard SettingsStore.shared.showFleetGauge else { return (nil, nil) }
+        var fleet: [String: UsageSnapshot.Fleet] = [:]
+        var fleetPools: [String: [UsageSnapshot.Fleet]] = [:]
+        let now = Date()
+        for summary in FleetMath.summaries(accounts: lastPublishedAccounts, byPlan: true,
+                                           label: { $0.accountLabel }) {
+            let focused = Self.focusedModel(providerID: summary.providerID,
+                                            available: summary.modelPoolNames)
+            let weight = PlanWeight.weight(
+                providerID: summary.providerID,
+                planName: FleetMath.planName(of: summary, accounts: lastPublishedAccounts),
+                codexProMultiple: Self.codexProMultiple)
+            func published(_ pool: FleetPool) -> UsageSnapshot.Fleet {
+                var dryAt: Date?
+                var sustainable = false
+                if let rate = fleetRates[FleetForecast.rateKey(
+                    provider: summary.providerID, window: pool.kind.rawValue,
+                    model: pool.modelName, plan: summary.planTier?.key)] {
+                    dryAt = FleetForecast.depletion(
+                        remaining: pool.totalRemaining,
+                        refills: pool.refills.map { ($0.at, $0.gain) },
+                        perHour: rate.perHour,
+                        steadyRefillPerHour: pool.steadyRefillPerHour(windowHours: 168),
+                        now: now)
+                    sustainable = dryAt == nil
+                }
+                return UsageSnapshot.Fleet(
+                    remaining: pool.totalRemaining,
+                    capacity: Double(pool.members.count) * 100,
+                    dryAt: dryAt, sustainable: sustainable,
+                    poolName: pool.kind == .weeklyModel ? (pool.modelName ?? pool.label) : nil,
+                    plan: summary.planTier.map { $0.name ?? "unknown" },
+                    capacityWeight: weight.value, weightSource: weight.source.rawValue)
+            }
+            // A provider split by plan has no single headline pool; older CLIs that read only
+            // `fleet` then print no pool line for it instead of one plan's pool labelled as the
+            // whole provider.
+            if summary.planTier == nil, let pool = summary.headline(focusedModel: focused),
+               pool.kind != .session {
+                fleet[summary.providerID] = published(pool)
+            }
+            // Mirrors FleetStripView.displayedPools, so `usagebar status` shows the same pools
+            // as the panel: "all" renders every weekly-cycle pool in display order, the
+            // single-pool modes just the focus-resolved headline.
+            let ordered: [FleetPool]
+            switch SettingsStore.shared.gaugeFocus {
+            case .all: ordered = summary.displayPools(focusedModel: focused)
+            case .primary, .weekly:
+                ordered = summary.headline(focusedModel: focused).map { [$0] } ?? []
+            }
+            let pools = ordered.filter { $0.kind != .session }
+            // Accumulate: a provider split by plan arrives once per plan.
+            if !pools.isEmpty { fleetPools[summary.providerID, default: []] += pools.map(published) }
+        }
+        return (fleet.isEmpty ? nil : fleet, fleetPools.isEmpty ? nil : fleetPools)
+    }
+}

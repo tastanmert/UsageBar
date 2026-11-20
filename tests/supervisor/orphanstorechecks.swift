@@ -1,0 +1,1023 @@
+import Darwin
+import Foundation
+
+// THE RECLAIM DRIVEN END TO END, one round at a time
+// (UsageBar/Stores/OrphanReclaimStore*.swift - the round in one file and the sweep in the other,
+// which is a seam the assertions cross freely).
+//
+// SPLIT FROM orphanchecks.swift when that file reached the repo's 1,000-line cap for a test file
+// (2026-09-02), along the seam the suite already had inside it: over there are the pure rules,
+// stated with no state and no machine at all, and here is what happens BETWEEN two rounds - which
+// is where every defect this feature has had actually lived. All four Criticals the reviews found
+// were in this half.
+//
+// NOTHING HERE TOUCHES A REAL PROCESS. Every reading is a fixture and every signal is recorded
+// rather than sent (`FakeMachine`), which is the whole reason the store takes its machine as a
+// struct of closures.
+
+// MARK: - the round, end to end
+
+/// A machine with nothing real behind it: every reading is a fixture and every signal is recorded.
+@MainActor
+final class FakeMachine {
+    var table: [ProcessIdentity] = []
+    var programs: [pid_t: String] = [:]
+    var directories: [pid_t: String] = [:]
+    var sockets: [OrphanReclaim.Connection] = []
+    /// Pids whose descriptor table this machine refuses to enumerate, which is a DIFFERENT fixture
+    /// from a pid with no sockets (`OrphanReclaim.Sockets`).
+    var unreadableSockets: Set<pid_t> = []
+    var times: [pid_t: Double] = [:]
+    var memory: [pid_t: UInt64] = [:]
+    var leases: [OrphanLease] = []
+    var leaseReads = 0
+    var cleared: [String] = []
+    var terminals: Set<pid_t> = []
+    var listening: Set<UInt16> = []
+    /// What the kernel says about one pid when asked directly, for the pids it is asked about. A
+    /// pid absent from here answers `.gone`, which is what makes an ordinary fixture's dead
+    /// supervisor still read as dead.
+    var presence: [pid_t: ProcessPresence] = [:]
+    /// The table as the ESCALATION sees it, which is a whole grace period after the round's own
+    /// walk: nil means "the same table", and setting it is how a fixture states what the machine
+    /// did in between (a member exited, a stranger took its group).
+    var laterTable: [ProcessIdentity]?
+    /// Every signal that was "sent", as `(signal, pid)`. A pid at or below zero would be a process
+    /// GROUP to `kill(2)`, which nothing here may ever address: the number is recorded exactly as
+    /// it was passed so the assertions can ask.
+    var sent: [(Int32, pid_t)] = []
+    /// Which pids the table still holds for the SWEEP, which is a different question from the
+    /// round's own walk: a kill takes effect between them.
+    var surviving: [pid_t: Int64] = [:]
+    var delivered: [(text: String, inbox: URL, name: String)] = []
+    /// What each delivered letter would hand the port as `--to` (nil: written directly).
+    var recipients: [String?] = []
+    var gitRoot = "/Users/x/workspace/bigdata"
+    /// What `<dir>/.git` is, for the paths the default below does not cover: a parallel line's
+    /// `.git` FILE, which is what folds a worktree into its repository (`OrphanNotice.repository`).
+    var gitEntries: [String: OrphanNotice.GitEntry] = [:]
+    /// What `realpath` would say about a path. Absent means the path is already its own real form,
+    /// which is every path in every other fixture here; the one that needs this is the checkout
+    /// whose two spellings have to disagree (`resolve`).
+    var resolvedPaths: [String: String] = [:]
+    /// Each pid's inherited `USAGEBAR_SUPERVISOR_PID`; absent means the environment was unreadable.
+    var markers: [pid_t: pid_t] = [:]
+    /// The machine's gate; open unless a check is about UsageBar's closed one.
+    var mayReclaim = true
+
+    func store(home: URL = URL(fileURLWithPath: "/Users/x")) -> OrphanReclaimStore {
+        OrphanReclaimStore(machine: OrphanReclaimStore.Machine(
+            program: { [self] pid in MainActor.assumeIsolated { programs[pid] } },
+            directory: { [self] pid in MainActor.assumeIsolated { directories[pid] } },
+            connections: { [self] pids in
+                MainActor.assumeIsolated {
+                    OrphanReclaim.Sockets(connections: sockets.filter { pids.contains($0.pid) },
+                                          unreadable: unreadableSockets.intersection(pids))
+                }
+            },
+            sample: { [self] pids, at in
+                MainActor.assumeIsolated {
+                    ProcessResourceSample(times: times.filter { pids.contains($0.key) },
+                                          childTimes: [:],
+                                          memory: memory.filter { pids.contains($0.key) },
+                                          diskWritten: [:], at: at)
+                }
+            },
+            hasTerminal: { [self] pid in MainActor.assumeIsolated { terminals.contains(pid) } },
+            leases: { [self] in MainActor.assumeIsolated { leaseReads += 1; return leases } },
+            clearLease: { [self] lease in
+                MainActor.assumeIsolated { cleared.append(lease.pidFile) }
+            },
+            signals: OrphanKill.Signals(
+                send: { [self] signal, pid in
+                    MainActor.assumeIsolated { sent.append((signal, pid)) }
+                },
+                alive: { [self] pids in
+                    MainActor.assumeIsolated { surviving.filter { pids.contains($0.key) } }
+                },
+                listening: { [self] in MainActor.assumeIsolated { listening } },
+                presence: { [self] pid in
+                    MainActor.assumeIsolated { presence[pid] ?? .gone }
+                },
+                table: { [self] in MainActor.assumeIsolated { laterTable ?? table } }),
+            resolve: { [self] path in
+                MainActor.assumeIsolated { resolvedPaths[path] ?? path }
+            },
+            gitEntry: { [self] path in
+                MainActor.assumeIsolated {
+                    gitEntries[path] ?? (path == gitRoot + "/.git" ? .directory : nil)
+                }
+            },
+            deliver: { [self] letter, inbox, name in
+                MainActor.assumeIsolated {
+                    delivered.append((letter.text, inbox, name))
+                    recipients.append(letter.recipient)
+                }
+            },
+            home: home,
+            marker: { [self] pid in MainActor.assumeIsolated { markers[pid] } },
+            // Opened: these checks drive the reclaim. UsageBar's closed gate is checked
+            // on its own (runOrphanGateChecks).
+            mayReclaim: mayReclaim))
+    }
+}
+
+/// WHAT THE STORE HANDS THE PORT AS `--to`, per place a checkout can sit. The flat inbox key is
+/// not an address the port resolves for a deep checkout, and no address exists for one outside the
+/// workspace (B-1956).
+@MainActor
+private func runOrphanRecipientChecks() {
+    let at = Date(timeIntervalSince1970: 1_800_000_000)
+    func announced(from root: String) -> (recipient: String??, inbox: String?) {
+        let fake = FakeMachine()
+        fake.gitRoot = root
+        fake.store().announce(OrphanNotice.Report(
+            project: root, program: "node", pid: 900, processes: 1, cpuPercent: nil,
+            memoryBytes: 0, listeningPorts: [], ageSeconds: 600, outcome: .failed(reason: "x")),
+            at: at)
+        return (fake.recipients.first, fake.delivered.first?.inbox.path)
+    }
+    let deep = announced(from: "/Users/x/workspace/social/brands/repo")
+    check("a checkout three levels down is addressed by its path, into the flat-key inbox",
+          deep.recipient == .some("social/brands/repo")
+              && deep.inbox == "/Users/x/.claude/inboxes/social-brands-repo")
+    check("…a two-level one by its path too",
+          announced(from: "/Users/x/workspace/koodata/kooai").recipient == .some("koodata/kooai"))
+    let outside = announced(from: "/opt/elsewhere/bigdata")
+    check("…and one outside the workspace has no address and goes by the direct write, to its own key",
+          outside.recipient == .some(nil) && outside.inbox == "/Users/x/.claude/inboxes/bigdata")
+}
+
+@MainActor
+func runOrphanStoreChecks() {
+    runOrphanRecordExpiryChecks()
+    runOrphanMemoryChecks()
+    runOrphanRecipientChecks()
+    let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+    let repo = "/Users/x/workspace/bigdata"
+    let web = repo + "/web"
+    // Old enough for tier B: the age is taken from the root's own start time.
+    let born = Int64(t0.addingTimeInterval(-3600).timeIntervalSince1970 * 1_000_000)
+    // Far from this process's own numbers, so nothing here can be mistaken for the meter itself
+    // (`ProcessTree.ownFamily`, which is what a plan spares).
+    let group = pid_t(getpgrp()) + 5_000
+    let root = group, worker = group + 1
+
+    func busyServer(_ fake: FakeMachine) {
+        fake.table = [ProcessIdentity(pid: root, parent: 1, group: group, startedAt: born),
+                      ProcessIdentity(pid: worker, parent: root, group: group, startedAt: born)]
+        fake.programs = [root: "/opt/homebrew/bin/node", worker: "/opt/homebrew/bin/node"]
+        fake.directories = [root: web, worker: web]
+        fake.sockets = [OrphanReclaim.Connection(pid: root, localPort: 3000, remotePort: 0,
+                                                 remoteIsLoopback: true, listening: true)]
+        fake.memory = [root: 400_000_000, worker: 100_000_000]
+        fake.surviving = [root: born, worker: born]
+    }
+
+    // WHAT DRIVES EVERY SWEEP BELOW, and the reason it is a lease rather than two rounds of
+    // evidence: tier B is report-only while the reclaim is being observed
+    // (`OrphanReclaim.verdict`), so the one tier that still signals anything is the one holding a
+    // STATEMENT - a dev-watch lease whose supervisor is gone. Written just above the fixtures that
+    // use it rather than beside the lease section further down, because the grace period, the
+    // escalation and the failure report are all reached through here now.
+    let leaseBorn = Date(timeIntervalSince1970: Double(born) / 1_000_000).addingTimeInterval(-1)
+    func abandoned(_ fake: FakeMachine) {
+        fake.leases = [OrphanLease(project: "bigdata-web", pidFile: "/tmp/bigdata-web.devwatch.pid",
+                                   supervisor: 999_999, bornAt: leaseBorn, child: root,
+                                   childBornAt: leaseBorn.addingTimeInterval(2))]
+    }
+
+    // MARK: 🔴 two rounds, and a report rather than a reclaim (the hold on v0.65.0)
+
+    // THE INFERENCE TIER IS SWITCHED OFF AND THIS IS THE CELL THAT SAYS SO. It used to end this
+    // tree on the second round; three repairs and a root-cause review later, the review's verdict
+    // was that the DESIGN goes on producing the same class of defect - a kill authorised by the
+    // absence of a veto, over readings whose failure is spelled the same way as their safe answer -
+    // and that it must not send a signal until there is a positive authorisation model to replace
+    // that. So everything up to the last step is unchanged: the tree is still found, still measured
+    // over two rounds, still cleared of every veto, and then WRITTEN ABOUT instead of ended.
+    let fake = FakeMachine()
+    busyServer(fake)
+    fake.times = [root: 100, worker: 0]
+    let store = fake.store()
+    store.observe(strays: [root: web, worker: web], processes: fake.table,
+                  sessions: OrphanReclaim.Sessions(), at: t0)
+    check("the first round of a busy leftover sends nothing at all", fake.sent.isEmpty)
+    // AND SAYS NOTHING EITHER, because there is nothing to say yet: a rate needs two readings, so
+    // on a first round this app does not know whether the thing is busy at all.
+    check("…and puts nothing on the panel, since nothing has been read twice",
+          store.watching.isEmpty && fake.delivered.isEmpty)
+    // One whole core burned over the five minutes between rounds.
+    fake.times = [root: 400, worker: 0]
+    let round2 = t0.addingTimeInterval(OrphanReclaim.roundInterval)
+    store.observe(strays: [root: web, worker: web], processes: fake.table,
+                  sessions: OrphanReclaim.Sessions(), at: round2)
+    check("the second round of a candidate with nothing against it signals nothing at all",
+          fake.sent.isEmpty)
+    check("…and reports it instead, with no doubt to name",
+          store.records.first?.outcome == .reported(doubts: [])
+              && store.records.first?.program == "node" && store.records.count == 1)
+    check("…and the project is told, in its own inbox, by the key the workspace path gives",
+          fake.delivered.count == 1
+              && fake.delivered.first?.inbox.path == "/Users/x/.claude/inboxes/bigdata"
+              && fake.delivered.first?.text.contains("**reply**: none") == true)
+    // AND THE MESSAGE SAYS WHICH IT IS, since "left it alone" has two quite different meanings now:
+    // a doubt this app could not resolve, and a tree it is sure about and will not act on.
+    check("…and the message says the ending is switched off rather than naming a doubt",
+          fake.delivered.first?.text.contains("switched off while this feature is being observed")
+              == true
+              && fake.delivered.first?.text.contains("it could not be:") != true)
+    check("…and it is on the panel, which is where a reader sees it without opening an inbox",
+          store.watching.map(\.pid) == [root] && store.watching.first?.doubts.isEmpty == true)
+    // A THIRD ROUND SAYING THE SAME THING SAYS IT TO NOBODY. The tree has not moved and neither has
+    // the answer, so the memory of what was said last refuses it (`OrphanReclaim.Told`).
+    fake.times = [root: 700, worker: 0]
+    store.observe(strays: [root: web, worker: web], processes: fake.table,
+                  sessions: OrphanReclaim.Sessions(),
+                  at: round2.addingTimeInterval(OrphanReclaim.roundInterval))
+    check("…and a third round with the same answer about the same tree is not written again",
+          fake.delivered.count == 1 && store.records.count == 1 && fake.sent.isEmpty)
+
+    // MARK: a child that ignores SIGTERM, and a root that dies before its grandchildren
+
+    let stubborn = FakeMachine()
+    busyServer(stubborn)
+    abandoned(stubborn)
+    let second = stubborn.store()
+    second.observe(strays: [:], processes: stubborn.table,
+                   sessions: OrphanReclaim.Sessions(), at: round2)
+    // The root goes at once and the worker does not, which is the ordinary shape of this. The table
+    // the ESCALATION reads is the machine ten seconds later, so the root is out of it.
+    stubborn.surviving = [worker: born]
+    stubborn.laterTable = [ProcessIdentity(pid: worker, parent: 1, group: group, startedAt: born)]
+    // 🔴 THE FIRST SIGNAL IS ONE CALL PER PROCESS TOO (root-cause review, 2026-09-02). It used to
+    // reach the whole job in one `kill(-pgid)` wherever the group read clean, on the argument that
+    // a `SIGTERM` is a request rather than an execution. The argument survived the review and its
+    // EVIDENCE did not: "the group is clean" is a completeness claim about the machine read out of
+    // a table walk that can miss a process, and the tier that is still allowed to act is the one
+    // that acts on a statement rather than on a reading (`OrphanKill.plan`).
+    check("the first signal is delivered one process at a time, in a stated order",
+          stubborn.sent.map(\.0) == [SIGTERM, SIGTERM]
+              && stubborn.sent.map(\.1) == [root, worker])
+    second.advance(at: round2.addingTimeInterval(4))
+    check("a survivor is waited on rather than shot immediately",
+          stubborn.sent.map(\.0) == [SIGTERM, SIGTERM])
+    second.advance(at: round2.addingTimeInterval(OrphanKill.grace))
+    check("…and signalled outright once the grace period is up",
+          stubborn.sent.map(\.0) == [SIGTERM, SIGTERM, SIGKILL]
+              && stubborn.sent.last?.1 == worker)
+    check("…with nothing recorded while it is still going on", second.records.isEmpty)
+    second.advance(at: round2.addingTimeInterval(OrphanKill.grace + OrphanKill.finalGrace))
+    check("a process that survives SIGKILL is reported as a failure, not as a reclaim",
+          second.records.first?.outcome == .failed(
+              reason: "1 of 2 processes survived SIGKILL"))
+
+    // MARK: 🔴 what the machine did DURING the grace period (codex review, 2026-09-02)
+
+    // THE SECOND SIGNAL USED TO RE-SEND THE FIRST ONE'S PLAN, which is a set of pids decided ten
+    // seconds earlier. It goes stale in that window, and the stale reading ends with a SIGKILL at
+    // somebody who was never a candidate.
+    //
+    // THE FIXTURE HAS TO CONTAIN A REUSED NUMBER OR IT PROVES NOTHING, which is worth writing down
+    // because the first version of it did not and passed anyway: with the exited member simply
+    // ABSENT from the fresh table, a plan built from the stale target list drops it on the way past
+    // `OrphanKill.plan` (which signals nothing the table does not hold), so the assertion was green
+    // against the defect (measured, 2026-09-02 - the mutant survived). The hazard is the member
+    // that exited AND had its number handed to something else inside the ten seconds: then the
+    // stale list names a pid that is very much there, and only the start-time confirmation stops
+    // the signal. So here the root goes and a new process takes its number.
+    let racing = FakeMachine()
+    busyServer(racing)
+    abandoned(racing)
+    let sixthRace = racing.store()
+    sixthRace.observe(strays: [:], processes: racing.table,
+                      sessions: OrphanReclaim.Sessions(), at: round2)
+    check("the first signal names the confirmed processes and nothing wider",
+          racing.sent.map(\.1) == [root, worker])
+    let reused = born + 999_999
+    racing.surviving = [worker: born, root: reused]
+    racing.laterTable = [ProcessIdentity(pid: worker, parent: 1, group: group, startedAt: born),
+                         ProcessIdentity(pid: root, parent: 1, group: group, startedAt: reused)]
+    sixthRace.advance(at: round2.addingTimeInterval(OrphanKill.grace))
+    // THE STRANGER WEARING THE OLD NUMBER IS THE ONE THIS EXISTS FOR.
+    check("a member that exited and had its number handed on is never signalled again",
+          !racing.sent.contains { $0.0 == SIGKILL && $0.1 == root })
+    check("…the survivor is signalled one process at a time instead",
+          racing.sent.filter { $0.0 == SIGKILL }.map(\.1) == [worker])
+
+    // AND THE SAME HAZARD WHERE THE REUSED NUMBER LANDS IN A JOB OF ITS OWN, which is the cell that
+    // pins the target list itself: with the survivors confirmed there is one process to signal, and
+    // with the original target list there is a stranger's pid in the delivery.
+    let direct = FakeMachine()
+    busyServer(direct)
+    abandoned(direct)
+    let seventhRace = direct.store()
+    seventhRace.observe(strays: [:], processes: direct.table,
+                        sessions: OrphanReclaim.Sessions(), at: round2)
+    let elsewhere = group + 700, outsider = group + 701
+    direct.surviving = [worker: born, root: reused]
+    direct.laterTable = [ProcessIdentity(pid: worker, parent: 1, group: group, startedAt: born),
+                         ProcessIdentity(pid: root, parent: 1, group: elsewhere, startedAt: reused),
+                         ProcessIdentity(pid: outsider, parent: 1, group: elsewhere,
+                                         startedAt: born)]
+    seventhRace.advance(at: round2.addingTimeInterval(OrphanKill.grace))
+    check("a pid that is no longer the process it was is not in the SIGKILL delivery at all",
+          !direct.sent.contains { $0.0 == SIGKILL && $0.1 == root })
+    check("…and what IS delivered is the one surviving process, nothing wider",
+          direct.sent.filter { $0.0 == SIGKILL }.map(\.1) == [worker])
+    check("…and the outsider sharing that job is never in it either",
+          !direct.sent.contains { $0.1 == outsider })
+
+    // MARK: 🔴 nothing is ever addressed to a process group, at either signal
+
+    // THE NEGATIVE PID IS THE WHOLE ASSERTION. `kill` reads a pid at or below zero as a process
+    // GROUP - `kill(-1)` reaches every process this user owns and `kill(-0)` the caller's own job -
+    // so a single such number in the delivery set is the difference between ending a tree and
+    // ending whatever else shares its group. It used to be true of `SIGKILL` alone
+    // (`OrphanKill.escalation`, since folded away); the root-cause review took the group arm off
+    // the first signal too, so this is now asked of every signal every sweep in this file sent.
+    for (name, fake) in [("a job every member of which is being reclaimed", stubborn),
+                         ("a job that picked up a reused number", racing),
+                         ("a survivor whose job holds an outsider", direct)] {
+        check("no signal is ever addressed to a process group (\(name))",
+              !fake.sent.contains { $0.1 <= 1 })
+    }
+
+    // MARK: 🔴 a number that changed hands between the sweep's two readings (codex review, same)
+
+    // THE SWEEP READS THE MACHINE TWICE: once to ask who is still alive, and again - a moment later
+    // - to rebuild the plan against a fresh table. A survivor that exited in between and had its
+    // number handed on is alive in BOTH readings and is a different process in the second, and the
+    // plan only asks whether a pid is in the table. So the recorded start time is intersected
+    // against the fresh walk as well, and a pid survives only where all three readings agree.
+    let handedOn = FakeMachine()
+    busyServer(handedOn)
+    abandoned(handedOn)
+    let eighthRace = handedOn.store()
+    eighthRace.observe(strays: [:], processes: handedOn.table,
+                       sessions: OrphanReclaim.Sessions(), at: round2)
+    // `alive()` still names the worker at the start time the round recorded, so it is a survivor;
+    // the fresh table a moment later says that number belongs to something younger.
+    handedOn.surviving = [worker: born]
+    handedOn.laterTable = [ProcessIdentity(pid: worker, parent: 1, group: group, startedAt: reused)]
+    eighthRace.advance(at: round2.addingTimeInterval(OrphanKill.grace))
+    check("a survivor whose number changed hands between the two readings is not signalled",
+          !handedOn.sent.contains { $0.0 == SIGKILL })
+
+    // MARK: the tree is gone and the port is not
+
+    let stuck = FakeMachine()
+    busyServer(stuck)
+    abandoned(stuck)
+    let third = stuck.store()
+    third.observe(strays: [:], processes: stuck.table,
+                  sessions: OrphanReclaim.Sessions(), at: round2)
+    stuck.surviving = [:]
+    stuck.listening = [3000]
+    third.advance(at: round2.addingTimeInterval(1))
+    check("a reclaim whose port is still held afterwards does not report success",
+          {
+              if case .failed = third.records.first?.outcome { return true }
+              return false
+          }())
+
+    // MARK: a browser on it, which must end the whole thing before it starts
+
+    let watched = FakeMachine()
+    busyServer(watched)
+    watched.sockets.append(OrphanReclaim.Connection(pid: root, localPort: 3000, remotePort: 54_321,
+                                                    remoteIsLoopback: true, listening: false))
+    watched.times = [root: 100, worker: 0]
+    let fourth = watched.store()
+    fourth.observe(strays: [root: web, worker: web], processes: watched.table,
+                   sessions: OrphanReclaim.Sessions(), at: t0)
+    watched.times = [root: 400, worker: 0]
+    fourth.observe(strays: [root: web, worker: web], processes: watched.table,
+                   sessions: OrphanReclaim.Sessions(), at: round2)
+    check("a server with a browser attached is never signalled, however busy or old",
+          watched.sent.isEmpty && fourth.records.isEmpty)
+
+    // MARK: tier C, which is the whole of what a doubt buys
+
+    let doubted = FakeMachine()
+    busyServer(doubted)
+    // Not a program this app is willing to end - a soft veto, so the answer is a message rather
+    // than either a signal or silence.
+    doubted.programs = [root: "/usr/local/bin/mystery", worker: "/usr/local/bin/mystery"]
+    doubted.times = [root: 100, worker: 0]
+    let eighth = doubted.store()
+    eighth.observe(strays: [root: web, worker: web], processes: doubted.table,
+                   sessions: OrphanReclaim.Sessions(), at: t0)
+    doubted.times = [root: 400, worker: 0]
+    eighth.observe(strays: [root: web, worker: web], processes: doubted.table,
+                   sessions: OrphanReclaim.Sessions(), at: round2)
+    check("something heavy this app cannot vouch for is reported and never signalled",
+          doubted.sent.isEmpty && eighth.records.first?.outcome
+              == .reported(doubts: [.unknownProgram]))
+    check("…on the panel as well as in the project's inbox",
+          eighth.watching.map(\.pid) == [root] && doubted.delivered.count == 1
+              && doubted.delivered.first?.text.contains("Left it alone.") == true)
+    // AND NOT AGAIN AN HOUR LATER, which is what turns a channel into noise.
+    doubted.times = [root: 700, worker: 0]
+    eighth.observe(strays: [root: web, worker: web], processes: doubted.table,
+                   sessions: OrphanReclaim.Sessions(),
+                   at: round2.addingTimeInterval(OrphanReclaim.roundInterval))
+    check("…and not said a second time the same day",
+          doubted.delivered.count == 1 && eighth.records.count == 1)
+
+    // MARK: which session a leftover came from (B-3185): named only when the marker names a board session
+    for (label, markers, board, expected) in [
+        ("a marker naming a live session", [root: pid_t(4242)], Set<pid_t>([4242]), pid_t?.some(4242)),
+        ("a marker naming a session no longer on the board", [root: 4242], Set<pid_t>([77]), nil),
+        ("an environment that could not be read", [:], Set<pid_t>([4242]), nil)] {
+        let owned = FakeMachine()
+        busyServer(owned)
+        owned.programs = [root: "/usr/local/bin/mystery", worker: "/usr/local/bin/mystery"]
+        owned.markers = markers
+        owned.times = [root: 100, worker: 0]
+        let attributed = owned.store()
+        attributed.observe(strays: [root: web, worker: web], processes: owned.table,
+                           sessions: OrphanReclaim.Sessions(), at: t0, supervisors: board)
+        owned.times = [root: 400, worker: 0]
+        attributed.observe(strays: [root: web, worker: web], processes: owned.table,
+                           sessions: OrphanReclaim.Sessions(), at: round2, supervisors: board)
+        check("\(label): the watch is attributed to \(String(describing: expected))",
+              attributed.watching.first?.session == expected)
+        check("…and so is the record of it",
+              attributed.records.first?.session == expected && attributed.records.count == 1)
+    }
+
+    // MARK: 🔴 a descriptor table the machine would not read (codex review, 2026-09-02)
+
+    // "NOBODY IS CONNECTED TO IT" AND "I COULD NOT FIND OUT" WERE THE SAME EMPTY LIST, and the
+    // first of those is a reading that lets a tree be ended. One transient PROC_PIDLISTFDS failure
+    // therefore turned the in-use veto off with nothing saying so - the browser holding an HMR
+    // socket would simply not have been seen. Named, it is a doubt, and a doubt is tier C.
+    let blind = FakeMachine()
+    busyServer(blind)
+    blind.unreadableSockets = [worker]
+    blind.times = [root: 100, worker: 0]
+    let ninth = blind.store()
+    ninth.observe(strays: [root: web, worker: web], processes: blind.table,
+                  sessions: OrphanReclaim.Sessions(), at: t0)
+    blind.times = [root: 400, worker: 0]
+    ninth.observe(strays: [root: web, worker: web], processes: blind.table,
+                  sessions: OrphanReclaim.Sessions(), at: round2)
+    check("a tree whose sockets could not be enumerated is reported rather than ended",
+          blind.sent.isEmpty
+              && ninth.records.first?.outcome == .reported(doubts: [.unreadable]))
+
+    // MARK: a round is not a tick
+
+    let paced = FakeMachine()
+    busyServer(paced)
+    paced.times = [root: 100, worker: 0]
+    let fifth = paced.store()
+    fifth.observe(strays: [root: web, worker: web], processes: paced.table,
+                  sessions: OrphanReclaim.Sessions(), at: t0)
+    paced.times = [root: 400, worker: 0]
+    // Two seconds later, which is the sampler's own beat: a pair this close is one moment read
+    // twice, and taking it as a round would confirm a link step as a runaway.
+    fifth.observe(strays: [root: web, worker: web], processes: paced.table,
+                  sessions: OrphanReclaim.Sessions(), at: t0.addingTimeInterval(2))
+    // WHAT A SECOND ROUND WOULD HAVE PRODUCED IS THE THING BEING ASSERTED AWAY, so the reading is
+    // taken off the panel rather than off the signals: with the inference tier report-only, "no
+    // signal" is true of every round and would be true of this one however the pacing worked.
+    check("the sampler's own tick does not take a round",
+          paced.sent.isEmpty && fifth.watching.isEmpty && paced.delivered.isEmpty)
+
+    // MARK: Reclaim defaults and an explicitly disabled machine
+
+    // The product enables reclaim; an explicitly disabled machine still reads the lease
+    // without signalling, clearing or delivering anything.
+    check("UsageBar ships reclaim enabled", BrimFeatures.orphanReclaim
+              && OrphanReclaimStore.Machine.real.mayReclaim)
+    let shut = FakeMachine()
+    shut.mayReclaim = false
+    busyServer(shut)
+    abandoned(shut); shut.markers = [root: 4242]
+    let shutStore = shut.store()
+    shutStore.observe(strays: [:], processes: shut.table,
+                      sessions: OrphanReclaim.Sessions(), at: t0, supervisors: [4242])
+    shut.surviving = [:]
+    shutStore.advance(at: t0.addingTimeInterval(1))
+    check("with the gate closed an abandoned lease is never signalled, cleared or announced",
+          shut.sent.isEmpty && shut.cleared.isEmpty && shut.delivered.isEmpty)
+
+    // MARK: the lease, driven through the store
+
+    let leased = FakeMachine()
+    busyServer(leased)
+    abandoned(leased); leased.markers = [root: 4242]
+    let sixth = leased.store()
+    // ONE ROUND, NOT TWO: the lease is a statement by the machine's own harness, not an inference,
+    // and it is the one tier that still ends anything while tier B is report-only.
+    sixth.observe(strays: [:], processes: leased.table,
+                  sessions: OrphanReclaim.Sessions(), at: t0, supervisors: [4242])
+    check("an abandoned lease is acted on in the very first round it is seen",
+          leased.sent.map(\.0) == [SIGTERM, SIGTERM])
+    check("…one process at a time, over the members the lease's own tree holds",
+          leased.sent.map(\.1) == [root, worker])
+    leased.surviving = [:]
+    sixth.advance(at: t0.addingTimeInterval(1))
+    check("…recorded as a reclaim the lease itself justified, naming its session though never watched (B-3969)",
+          sixth.records.first?.outcome == .reclaimedByLease && sixth.records.first?.session == 4242)
+    // 🔴 AND THE MESSAGE NAMES THE PROCESSES, not just how many of them there were (root-cause
+    // review, 2026-09-02). A machine that comes back wrong is read by comparing what this app says
+    // it ended against what the person finds missing, and a count compares with nothing.
+    check("…and the message writes down every pid the signal actually went to",
+          leased.delivered.first?.text.contains("- Signalled: \(root), \(worker)") == true)
+    check("…and the lease's four files go too, so no green light is left pointing at nothing",
+          leased.cleared == ["/tmp/bigdata-web.devwatch.pid"])
+
+    // AND A LEASE WHOSE SUPERVISOR IS ALIVE IS THE ROW THAT MUST END IN SILENCE.
+    let tended = FakeMachine()
+    busyServer(tended)
+    let leaseBornStamp = Int64(leaseBorn.timeIntervalSince1970 * 1_000_000)
+    tended.table.append(ProcessIdentity(pid: 999_999, parent: 1, group: 999_999,
+                                        startedAt: leaseBornStamp))
+    tended.leases = [OrphanLease(project: "bigdata-web", pidFile: "/tmp/bigdata-web.devwatch.pid",
+                                 supervisor: 999_999, bornAt: leaseBorn, child: root,
+                                 childBornAt: leaseBorn.addingTimeInterval(2))]
+    let seventh = tended.store()
+    seventh.observe(strays: [:], processes: tended.table,
+                    sessions: OrphanReclaim.Sessions(), at: t0)
+    check("a dev-watch supervisor that is alive and well has its server left entirely alone",
+          tended.sent.isEmpty && tended.cleared.isEmpty)
+
+    // MARK: 🔴 the table missing the supervisor, through the store (codex review, 2026-09-02)
+
+    // THE WALK IS ONE `proc_pidinfo` PER PID AND ANY OF THEM CAN FAIL FOR A PASS. Read as death,
+    // that lands in tier A, which sends a SIGTERM in the same round with no two-round confirmation
+    // and no veto sweep anywhere near it - so a single missed reading ended a dev server whose
+    // supervisor was sitting right there. Both fixtures below leave the supervisor OUT of the
+    // table, which is exactly what such a failure looks like from in here.
+    for (verdict, answer) in [("alive when the kernel is asked", ProcessPresence.running),
+                              ("something the kernel will not answer for", .unknown)] {
+        let missed = FakeMachine()
+        busyServer(missed)
+        missed.presence = [999_999: answer]
+        missed.leases = [OrphanLease(project: "bigdata-web",
+                                     pidFile: "/tmp/bigdata-web.devwatch.pid",
+                                     supervisor: 999_999, bornAt: leaseBorn, child: root,
+                                     childBornAt: leaseBorn.addingTimeInterval(2))]
+        let store = missed.store()
+        store.observe(strays: [:], processes: missed.table,
+                      sessions: OrphanReclaim.Sessions(), at: t0)
+        check("a supervisor absent from the table but \(verdict) has its server left alone",
+              missed.sent.isEmpty && missed.cleared.isEmpty && store.records.isEmpty)
+    }
+
+    // MARK: 🔴 a live session working in the checkout (2026-09-02, the first real machine)
+
+    // TWO DEV SERVERS WERE ENDED IN CHECKOUTS WHOSE SESSIONS WERE SITTING RIGHT THERE, within
+    // eleven minutes of each other, on the first day this ran on a real machine: geo at 14:48
+    // (48 hours old, 2.7 GB, holding :3100) and bigdata at 14:58. The geo session reopened :3100
+    // inside the minute, which is the whole proof that the tree was wanted. Both messages said
+    // "No live session was working in this checkout" - a sentence with no test behind it anywhere,
+    // because the veto it describes did not exist: the intent was written in the design note
+    // (`OrphanReclaim.minimumAge`, "a checkout with no session on it") and never in the rule.
+    //
+    // THE FIXTURE IS THAT TREE. It draws no veto of the old kind at all - a recognised program, one
+    // checkout, no terminal, no ancestor, nothing connected, every field readable - and it clears
+    // the bar on MEMORY rather than on CPU, which is how both of the real ones did.
+    let ancient = Int64(t0.addingTimeInterval(-48 * 3600).timeIntervalSince1970 * 1_000_000)
+    func leftoverServer(_ fake: FakeMachine, project: String) {
+        fake.table = [ProcessIdentity(pid: root, parent: 1, group: group, startedAt: ancient),
+                      ProcessIdentity(pid: worker, parent: root, group: group, startedAt: ancient)]
+        fake.programs = [root: "/opt/homebrew/bin/node", worker: "/opt/homebrew/bin/node"]
+        fake.directories = [root: project, worker: project]
+        fake.sockets = [OrphanReclaim.Connection(pid: root, localPort: 3100, remotePort: 0,
+                                                 remoteIsLoopback: true, listening: true)]
+        // 2.7 GB against a bar of two, at about one per cent of a core: heavy, and idle.
+        fake.memory = [root: 2_700_000_000, worker: 100_000_000]
+        fake.surviving = [root: ancient, worker: ancient]
+        fake.times = [root: 100, worker: 0]
+    }
+
+    let occupied = FakeMachine()
+    leftoverServer(occupied, project: web)
+    let tenth = occupied.store()
+    tenth.observe(strays: [root: web, worker: web], processes: occupied.table,
+                  sessions: OrphanReclaim.Sessions(checkouts: [web]), at: t0)
+    occupied.times = [root: 103, worker: 0]
+    tenth.observe(strays: [root: web, worker: web], processes: occupied.table,
+                  sessions: OrphanReclaim.Sessions(checkouts: [web]), at: round2)
+    check("a leftover in a checkout a session is working in is reported and never signalled",
+          occupied.sent.isEmpty
+              && tenth.records.first?.outcome == .reported(doubts: [.sessionPresent]))
+    check("…and the message names the doubt and what to do about it",
+          occupied.delivered.count == 1
+              && occupied.delivered.first?.text
+                  .contains("a session is working in this checkout") == true
+              && occupied.delivered.first?.text.contains("`/dev-watch`") == true)
+
+    // AND THE SAME TREE WITH NOBODY IN THE CHECKOUT STILL READS AS A CANDIDATE, which is the half
+    // this repair must not have taken with it: the veto is a doubt about ONE reading, not a new
+    // bar. What it earns is a message with no doubt in it rather than a signal, which is the hold
+    // on the inference tier and not this veto (`OrphanReclaim.verdict`).
+    let vacant = FakeMachine()
+    leftoverServer(vacant, project: web)
+    let eleventh = vacant.store()
+    eleventh.observe(strays: [root: web, worker: web], processes: vacant.table,
+                     sessions: OrphanReclaim.Sessions(), at: t0)
+    vacant.times = [root: 103, worker: 0]
+    eleventh.observe(strays: [root: web, worker: web], processes: vacant.table,
+                     sessions: OrphanReclaim.Sessions(), at: round2)
+    check("…while the same tree in a checkout nobody is in draws no doubt at all",
+          vacant.sent.isEmpty
+              && eleventh.records.first?.outcome == .reported(doubts: []))
+    check("…and its message says so as a fact rather than as a doubt it could not resolve",
+          vacant.delivered.first?.text.contains("no session is working in its checkout") == true)
+
+    // A SESSION IN THE TRUNK COVERS ITS PARALLEL LINES, on the rule the messages are already
+    // addressed by: a worktree is the repository, so a session in `bigdata` speaks for a leftover
+    // in `bigdata/.worktrees/wt1` - which is very likely something that session's own commands
+    // started (`OrphanReclaim.checkout`).
+    let line = repo + "/.worktrees/wt1"
+    let parallel = FakeMachine()
+    leftoverServer(parallel, project: line)
+    parallel.gitEntries = [line + "/.git": .file("gitdir: " + repo + "/.git/worktrees/wt1")]
+    let twelfth = parallel.store()
+    twelfth.observe(strays: [root: line, worker: line], processes: parallel.table,
+                    sessions: OrphanReclaim.Sessions(checkouts: [web]), at: t0)
+    parallel.times = [root: 103, worker: 0]
+    twelfth.observe(strays: [root: line, worker: line], processes: parallel.table,
+                    sessions: OrphanReclaim.Sessions(checkouts: [web]), at: round2)
+    check("a session in the repository speaks for a leftover in a worktree of it",
+          parallel.sent.isEmpty
+              && twelfth.records.first?.outcome == .reported(doubts: [.sessionPresent]))
+
+    // 🔴 AND THE TWO SIDES HAVE TO BE SPELLED THE SAME WAY (codex review, 2026-09-02). A
+    // session's root reaches this store through `realpath` (`ProjectLoadAccounting.roots`), and a
+    // worktree's repository reaches it as the text of a `.git` file, which nothing resolves. Where
+    // the workspace sits behind a symlink the two name one checkout in two spellings, compare
+    // unequal, and the veto is missed in the one direction that ends a process.
+    let linked = repo.replacingOccurrences(of: "/workspace/", with: "/ws-link/")
+    let crooked = FakeMachine()
+    leftoverServer(crooked, project: line)
+    crooked.gitEntries = [line + "/.git": .file("gitdir: " + linked + "/.git/worktrees/wt1")]
+    crooked.resolvedPaths = [linked: repo]
+    let symlinked = crooked.store()
+    symlinked.observe(strays: [root: line, worker: line], processes: crooked.table,
+                      sessions: OrphanReclaim.Sessions(checkouts: [web]), at: t0)
+    crooked.times = [root: 103, worker: 0]
+    symlinked.observe(strays: [root: line, worker: line], processes: crooked.table,
+                      sessions: OrphanReclaim.Sessions(checkouts: [web]), at: round2)
+    check("a checkout whose two spellings differ only by a symlink is one checkout",
+          crooked.sent.isEmpty
+              && symlinked.records.first?.outcome == .reported(doubts: [.sessionPresent]))
+
+    // MARK: 🔴 a dev-watch lease whose supervisor is alive (2026-09-02, three messages about it)
+
+    // THE SUPERVISOR IS A `bash` THAT HOLDS NOTHING AND ITS SERVER IS THE TREE UNDER IT, so with
+    // the lease tended the whole thing fell past tier A into the evidence tiers and was reported
+    // as a leftover - three times in thirty minutes, in a checkout whose own harness had registered
+    // that server. The advice in the message ("run it under `/dev-watch`, whose lease says whose it
+    // is") was being given to a tree already running under exactly that.
+    //
+    // THE FIXTURE PUTS THE TREE IN THE STRAYS, which the tended-lease row above does not: with an
+    // empty stray set nothing reaches tier B or C at all, so "left entirely alone" was true there
+    // for a reason that says nothing about this.
+    let tendedStray = FakeMachine()
+    leftoverServer(tendedStray, project: web)
+    let tendedBorn = Date(timeIntervalSince1970: Double(ancient) / 1_000_000)
+    tendedStray.leases = [OrphanLease(project: "bigdata-web",
+                                      pidFile: "/tmp/bigdata-web.devwatch.pid",
+                                      supervisor: root, bornAt: tendedBorn, child: worker,
+                                      childBornAt: tendedBorn)]
+    let sixteenth = tendedStray.store()
+    sixteenth.observe(strays: [root: web, worker: web], processes: tendedStray.table,
+                      sessions: OrphanReclaim.Sessions(), at: t0)
+    tendedStray.times = [root: 103, worker: 0]
+    sixteenth.observe(strays: [root: web, worker: web], processes: tendedStray.table,
+                      sessions: OrphanReclaim.Sessions(), at: round2)
+    check("a tree its own live dev-watch lease still answers for is never signalled",
+          tendedStray.sent.isEmpty && tendedStray.cleared.isEmpty)
+    // AND THE OTHER HALF ON ITS OWN FIXTURE, because a signalled tree writes nothing until its
+    // sweep finishes: asserting silence on the one above would have been silence about a kill in
+    // flight. With a session in the checkout the tree lands in tier C instead, which is exactly
+    // where the real one landed, and what has to be empty then is the inbox.
+    let tendedTold = FakeMachine()
+    leftoverServer(tendedTold, project: web)
+    tendedTold.leases = [OrphanLease(project: "bigdata-web",
+                                     pidFile: "/tmp/bigdata-web.devwatch.pid",
+                                     supervisor: root, bornAt: tendedBorn, child: worker,
+                                     childBornAt: tendedBorn)]
+    let nineteenth = tendedTold.store()
+    nineteenth.observe(strays: [root: web, worker: web], processes: tendedTold.table,
+                       sessions: OrphanReclaim.Sessions(checkouts: [web]), at: t0)
+    tendedTold.times = [root: 103, worker: 0]
+    nineteenth.observe(strays: [root: web, worker: web], processes: tendedTold.table,
+                       sessions: OrphanReclaim.Sessions(checkouts: [web]), at: round2)
+    check("…and is never written about either, the harness having registered it already",
+          tendedTold.delivered.isEmpty && nineteenth.records.isEmpty
+              && nineteenth.watching.isEmpty)
+    // AND THE VETO IS ABOUT THAT TREE RATHER THAN ABOUT THE MACHINE. A live lease somewhere else on
+    // the box says nothing about this leftover, and a blanket "any lease is tended" would switch
+    // the whole feature off for as long as one dev server is up.
+    let otherLease = FakeMachine()
+    leftoverServer(otherLease, project: web)
+    otherLease.table.append(ProcessIdentity(pid: 999_999, parent: 1, group: 999_999,
+                                           startedAt: ancient))
+    otherLease.leases = [OrphanLease(project: "other", pidFile: "/tmp/other.devwatch.pid",
+                                    supervisor: 999_999, bornAt: tendedBorn, child: 999_998,
+                                    childBornAt: tendedBorn)]
+    let seventeenth = otherLease.store()
+    seventeenth.observe(strays: [root: web, worker: web], processes: otherLease.table,
+                        sessions: OrphanReclaim.Sessions(), at: t0)
+    otherLease.times = [root: 103, worker: 0]
+    seventeenth.observe(strays: [root: web, worker: web], processes: otherLease.table,
+                        sessions: OrphanReclaim.Sessions(), at: round2)
+    check("…while a lease over some other tree leaves this one exactly as exposed as before",
+          otherLease.sent.isEmpty
+              && seventeenth.records.first?.outcome == .reported(doubts: []))
+
+    // MARK: 🔴 a tended lease's child, after the machine handed that number on (codex review of
+    // 80faa73)
+
+    // `OrphanLease.state(of:)` ANSWERS `tended` OFF THE SUPERVISOR ALONE and never reaches its own
+    // child check on that path, so this used to trust `<project>.devwatch.pid.child` as a bare
+    // integer. That file is rewritten only on the next spawn: a live supervisor whose server tree
+    // has died leaves the number standing, and any tree that is handed it takes a HARD veto - never
+    // reported, never reclaimed, silently, for as long as the stale file stands. The fixture is
+    // that: the supervisor is alive and IS the lease's writer, and the child file names this tree's
+    // root at a birth two days before the process holding that number began.
+    let staleChild = FakeMachine()
+    leftoverServer(staleChild, project: web)
+    let liveSupervisor = Int64(t0.addingTimeInterval(-72 * 3600).timeIntervalSince1970 * 1_000_000)
+    staleChild.table.append(ProcessIdentity(pid: 999_999, parent: 1, group: 999_999,
+                                            startedAt: liveSupervisor))
+    let supervisorBorn = Date(timeIntervalSince1970: Double(liveSupervisor) / 1_000_000)
+    staleChild.leases = [OrphanLease(project: "other", pidFile: "/tmp/other.devwatch.pid",
+                                     supervisor: 999_999, bornAt: supervisorBorn, child: root,
+                                     childBornAt: supervisorBorn)]
+    let twentieth = staleChild.store()
+    twentieth.observe(strays: [root: web, worker: web], processes: staleChild.table,
+                      sessions: OrphanReclaim.Sessions(), at: t0)
+    staleChild.times = [root: 103, worker: 0]
+    twentieth.observe(strays: [root: web, worker: web], processes: staleChild.table,
+                      sessions: OrphanReclaim.Sessions(), at: round2)
+    check("a lease naming a child number the machine has handed on speaks for nothing",
+          twentieth.records.first?.outcome == .reported(doubts: [])
+              && staleChild.delivered.count == 1)
+
+    // MARK: 🔴 one tree, one message (2026-09-02, the same pid reported three times)
+
+    // THE EPHEMERAL PORT IS WHY THE SITUATION KEY COULD NOT HOLD IT (`OrphanReclaim.fingerprint`):
+    // the three real messages read `:3000, :55955`, `:3000, :54887`, `:3000, :58902`, one per
+    // restart of the server under the supervisor. Nothing about the tree or the answer changed, so
+    // the second and third said nothing the first had not.
+    let repeated = FakeMachine()
+    leftoverServer(repeated, project: web)
+    let eighteenth = repeated.store()
+    var moment = t0
+    for (index, ephemeral) in [55_955, 54_887, 58_902].enumerated() {
+        repeated.sockets = [
+            OrphanReclaim.Connection(pid: root, localPort: 3100, remotePort: 0,
+                                     remoteIsLoopback: true, listening: true),
+            OrphanReclaim.Connection(pid: worker, localPort: UInt16(ephemeral), remotePort: 0,
+                                     remoteIsLoopback: true, listening: true),
+        ]
+        if index > 0 { repeated.times = [root: Double(100 + index * 3), worker: 0] }
+        eighteenth.observe(strays: [root: web, worker: web], processes: repeated.table,
+                           sessions: OrphanReclaim.Sessions(checkouts: [web]), at: moment)
+        moment = moment.addingTimeInterval(OrphanReclaim.sleepGap + 60)
+    }
+    check("a standing leftover is written about once, not once per round it is still standing",
+          repeated.delivered.count == 1 && eighteenth.records.count == 1)
+    // A CHANGED ANSWER IS NEWS. A doubt has appeared that was not there before - here the machine
+    // has stopped answering for one member's sockets - so what the reader was told last time is no
+    // longer what this app thinks, and the memory must not hold that back.
+    repeated.unreadableSockets = [worker]
+    eighteenth.observe(strays: [root: web, worker: web], processes: repeated.table,
+                       sessions: OrphanReclaim.Sessions(checkouts: [web]), at: moment)
+    check("…and a different answer about the same tree is said, since it was not said before",
+          repeated.delivered.count == 2
+              && eighteenth.records.first?.outcome
+                  == .reported(doubts: [.sessionPresent, .unreadable]))
+    // AND A NUMBER HANDED ON IS A NEW TREE. Same pid, a later birth, and every OTHER thing about
+    // the reading left exactly as it was - the doubts included - so the only reason this can be
+    // said again is the identity half of the memory above. The alternative is an app that goes
+    // quiet about something it has never reported.
+    let reborn = ancient + 1_000_000
+    repeated.table = repeated.table.map {
+        ProcessIdentity(pid: $0.pid, parent: $0.parent, group: $0.group, startedAt: reborn)
+    }
+    repeated.surviving = [root: reborn, worker: reborn]
+    // With the port a restart of it would really take: left on the previous one, the situation key
+    // would silence this round on its own and the identity half of the memory above would never be
+    // asked anything.
+    repeated.sockets = [
+        OrphanReclaim.Connection(pid: root, localPort: 3100, remotePort: 0,
+                                 remoteIsLoopback: true, listening: true),
+        OrphanReclaim.Connection(pid: worker, localPort: 61_004, remotePort: 0,
+                                 remoteIsLoopback: true, listening: true),
+    ]
+    moment = moment.addingTimeInterval(OrphanReclaim.sleepGap + 60)
+    eighteenth.observe(strays: [root: web, worker: web], processes: repeated.table,
+                       sessions: OrphanReclaim.Sessions(checkouts: [web]), at: moment)
+    check("…and a tree that only shares its pid with the last one is reported afresh",
+          repeated.delivered.count == 3)
+
+    // AND TIER A IS NOT SUBJECT TO ANY OF THIS. A lease is a statement rather than an inference -
+    // this machine's own harness named that tree, and the supervisor that wrote it is gone - so a
+    // session in the checkout says nothing about it. Withholding here would leave exactly the
+    // abandoned server the lease exists to name.
+    let leasedBusy = FakeMachine()
+    busyServer(leasedBusy)
+    abandoned(leasedBusy)
+    let thirteenth = leasedBusy.store()
+    thirteenth.observe(strays: [:], processes: leasedBusy.table,
+                       sessions: OrphanReclaim.Sessions(checkouts: [web]), at: t0)
+    check("an abandoned lease is acted on however many sessions are working in the checkout",
+          leasedBusy.sent.map(\.0) == [SIGTERM, SIGTERM])
+    leasedBusy.surviving = [:]
+    thirteenth.advance(at: t0.addingTimeInterval(1))
+    check("…and recorded as the reclaim the lease itself justified, not as a report",
+          thirteenth.records.first?.outcome == .reclaimedByLease)
+
+    // MARK: 🔴 a board that would not place one of its own rows (root-cause review, 2026-09-02)
+
+    // A ROSTER ROW WITH NO DIRECTORY IS DROPPED ON THE WAY IN (`ProjectLoadAccounting.roots`), and
+    // a dropped row reads exactly like a machine with one session fewer - which is the reading that
+    // says "nobody is working in this checkout". So the round fails closed: every tree on it takes
+    // `sessionUnknown`, which is soft, so what comes out is a message rather than either a signal
+    // or silence. Nothing about the tree itself is in doubt here, which is the point - the doubt is
+    // about the ROUND.
+    let unplaced = FakeMachine()
+    leftoverServer(unplaced, project: web)
+    let twentyFirst = unplaced.store()
+    twentyFirst.observe(strays: [root: web, worker: web], processes: unplaced.table,
+                        sessions: OrphanReclaim.Sessions(checkouts: [], unreadable: true), at: t0)
+    check("a round whose board would not place a session doubts every tree on it",
+          unplaced.sent.isEmpty
+              && twentyFirst.records.first?.outcome == .reported(doubts: [.sessionUnknown]))
+    check("…and the message says which reading was missing rather than inventing one",
+          unplaced.delivered.first?.text
+              .contains("a live session would not say which checkout it is working in") == true)
+    // AND IT IS THE ROUND'S OWN STATE RATHER THAN A STANDING ONE: the next round, with a board that
+    // can place everything, answers about the tree again. Read off the PANEL rather than the inbox,
+    // because the two gates on a message are about repetition rather than about the answer - the
+    // situation here has not moved, so this round is one the reader has already been written to
+    // about (`OrphanReclaim.silenced`), and what changed is what the app now thinks.
+    unplaced.times = [root: 103, worker: 0]
+    twentyFirst.observe(strays: [root: web, worker: web], processes: unplaced.table,
+                        sessions: OrphanReclaim.Sessions(checkouts: [web]), at: round2)
+    check("…while the round after it, on a board that can, answers about the tree again",
+          twentyFirst.watching.map(\.doubts) == [[.sessionPresent]])
+
+    // MARK: 🔴 the two memories, and the rounds that lost one of them (codex review of 80faa73)
+
+    // WHAT WAS SAID ABOUT A TREE USED TO BE WRITTEN BEFORE THE SITUATION KEY WAS ASKED, so a tree
+    // the key silenced was recorded as having been told about. The key deliberately carries no pid
+    // (`OrphanReclaim.fingerprint`), so a second tree in the same project on the same port collides
+    // with the first BY DESIGN - and the second tree's own answer was then refused by a memory of a
+    // message that was about something else. It was never announced at all.
+    let collided = FakeMachine()
+    leftoverServer(collided, project: web)
+    let twentySecond = collided.store()
+    twentySecond.observe(strays: [root: web, worker: web], processes: collided.table,
+                         sessions: OrphanReclaim.Sessions(checkouts: [web]), at: t0)
+    check("the first tree in a project on a port is written about",
+          collided.delivered.count == 1)
+    // The second tree: the same number at a later birth, which is what the machine does with a pid
+    // and is the cheapest way to state "a different tree, same situation key".
+    let handedRoot = ancient + 1_000_000
+    collided.table = collided.table.map {
+        ProcessIdentity(pid: $0.pid, parent: $0.parent, group: $0.group, startedAt: handedRoot)
+    }
+    collided.surviving = [root: handedRoot, worker: handedRoot]
+    twentySecond.observe(strays: [root: web, worker: web], processes: collided.table,
+                         sessions: OrphanReclaim.Sessions(checkouts: [web]),
+                         at: t0.addingTimeInterval(OrphanReclaim.roundInterval))
+    check("…and a second tree on the same port is held quiet by the situation key, as designed",
+          collided.delivered.count == 1)
+    // AND WHEN THE SITUATION MOVES, THE SECOND TREE FINALLY GETS ITS MESSAGE. Written before the
+    // gate, its memory now says it was told about and this round says nothing at all.
+    collided.sockets = [OrphanReclaim.Connection(pid: root, localPort: 3100, remotePort: 0,
+                                                 remoteIsLoopback: true, listening: true),
+                        OrphanReclaim.Connection(pid: worker, localPort: 61_004, remotePort: 0,
+                                                 remoteIsLoopback: true, listening: true)]
+    twentySecond.observe(strays: [root: web, worker: web], processes: collided.table,
+                         sessions: OrphanReclaim.Sessions(checkouts: [web]),
+                         at: t0.addingTimeInterval(2 * OrphanReclaim.roundInterval))
+    check("…and is written about once the situation key moves, never having been told about",
+          collided.delivered.count == 2)
+
+    // AND THE OTHER DIRECTION: what a tree was told is forgotten only when the TREE has gone. It
+    // used to be swept against this round's strays, and a stray set is one a live tree leaves and
+    // rejoins on its own - a session adopts it into the group ledger, or the card counting it is
+    // dropped for a pass. Swept on that, a standing leftover lost its memory the moment it briefly
+    // belonged to somebody, and said the whole thing again on the round after.
+    let adopted = FakeMachine()
+    leftoverServer(adopted, project: web)
+    let twentyThird = adopted.store()
+    twentyThird.observe(strays: [root: web, worker: web], processes: adopted.table,
+                        sessions: OrphanReclaim.Sessions(checkouts: [web]), at: t0)
+    check("a standing leftover is written about", adopted.delivered.count == 1)
+    // One round in which a card is counting it: still running, still in the table, not a stray.
+    adopted.times = [root: 103, worker: 0]
+    twentyThird.observe(strays: [:], processes: adopted.table,
+                        sessions: OrphanReclaim.Sessions(checkouts: [web]),
+                        at: t0.addingTimeInterval(OrphanReclaim.roundInterval))
+    // …and back, with the ephemeral port a restart moves, so the situation key cannot be what
+    // keeps this quiet: it is a different string now, and only the tree's memory refuses a repeat.
+    adopted.sockets = [OrphanReclaim.Connection(pid: root, localPort: 3100, remotePort: 0,
+                                                remoteIsLoopback: true, listening: true),
+                       OrphanReclaim.Connection(pid: worker, localPort: 61_004, remotePort: 0,
+                                                remoteIsLoopback: true, listening: true)]
+    adopted.times = [root: 106, worker: 0]
+    twentyThird.observe(strays: [root: web, worker: web], processes: adopted.table,
+                        sessions: OrphanReclaim.Sessions(checkouts: [web]),
+                        at: t0.addingTimeInterval(2 * OrphanReclaim.roundInterval))
+    check("…and a round in which a card was counting it does not make it news again",
+          adopted.delivered.count == 1 && twentyThird.records.count == 1)
+
+    // MARK: a capture never reaches any of this
+
+    // The demo flag fabricates every figure on this board, and a screenshot run that ended a real
+    // process because a fixture said it was busy would be the worst version of this feature. The
+    // flag cannot be turned on here (it is process-wide and the suites after this one would run in
+    // demo mode, which is why demoboardchecks.swift is last), so the guard is pinned in the source.
+    let source = (try? String(contentsOfFile: "UsageBar/Stores/OrphanReclaimStore.swift",
+                              encoding: .utf8)) ?? ""
+    check("a capture takes no round at all",
+          source.contains("func roundDue(at now: Date) -> Bool {\n        !DemoUsage.isActive")
+              && source.contains("guard roundDue(at: now) else { return }"))
+    // AND THE TICK HAS TO HAND THE SESSIONS OVER, which is the one step of this no fixture can
+    // drive: the pass that produces them walks the real process table and reads a real roster. The
+    // 2026-09-02 incident was exactly this shape - the rule was in the design note and the wiring
+    // was nowhere - so the call site is pinned as a string, the way this repo pins the rest of that
+    // pass (`machineloadchecks.swift`).
+    let tick = ["UsageBar/Stores/ProcessFootprintStore.swift", "UsageBar/Stores/ProcessFootprintPass.swift"]
+        .compactMap { try? String(contentsOfFile: $0, encoding: .utf8) }.joined(separator: "\n")
+    // THE LEASES ARE READ OFF THE MAIN THREAD BY THE PASS WHEN A ROUND IS DUE (a field report, 2026-09-26),
+    // and a round handed them does not read them a second time on the main actor.
+    let prefetchedFake = FakeMachine()
+    let prefetchedStore = prefetchedFake.store()
+    check("a round is due on a store that has never taken one",
+          prefetchedStore.leaseReaderIfDue(at: t0) != nil)
+    prefetchedStore.observe(strays: [:], processes: [], sessions: OrphanReclaim.Sessions(), at: t0,
+                            leases: [])
+    check("a round handed its leases does not read them again", prefetchedFake.leaseReads == 0)
+    check("…and no round is due again inside the interval, so the pass reads no leases",
+          prefetchedStore.leaseReaderIfDue(at: t0.addingTimeInterval(1)) == nil)
+    let readingFake = FakeMachine()
+    readingFake.store().observe(strays: [:], processes: [], sessions: OrphanReclaim.Sessions(),
+                                at: t0)
+    check("…while a round with none handed over reads them itself", readingFake.leaseReads == 1)
+    check("the tick hands the reclaim every checkout the ROSTER says a session is working in",
+          !tick.isEmpty
+              && tick.contains("checkouts: Set(rootOfSession.values),"))
+    // 🔴 AND WHETHER THAT SET IS THE WHOLE OF THE ROSTER, which is the other half no fixture can
+    // drive for the same reason: a row that published no directory is dropped by the map the tick
+    // reads, and a dropped row is indistinguishable from a machine with one session fewer
+    // (`ProjectLoadAccounting.boardUnreadable`).
+    check("…and says whether the board could place every row it holds",
+          tick.contains("unreadable: rollup.boardUnreadable)"))
+    // WHY THE ROSTER RATHER THAN THE CARDS, stated as the thing that actually differs between the
+    // two sets. A card is skipped whenever its tree is momentarily empty - a supervisor between
+    // children, a session whose Claude Code has gone home - and two guards in the reading loop drop
+    // exactly those (`ProcessFootprintStore.sample`). The set drawn from the cards then holds no
+    // root for that session at all, and the two rounds below show the difference: the same tree,
+    // the same machine, and one of them written up as "nobody is working here". While the
+    // inference tier is report-only that costs a wrong sentence in somebody's inbox; it is the
+    // sentence that stood behind two ended dev servers on 2026-09-02, and it is what the round
+    // would act on again the day that tier comes back.
+    let board = ["7001": web, "7002": "/Users/x/workspace/geo"]
+    let cards = MachineLoadRollup.readings(
+        of: ["7002": ProcessFootprint(processes: 3, listeningPorts: [])],
+        roots: board, members: [:])
+    let drawnRoots = Set(cards.map(\.root))
+    check("a session whose card was skipped this round is missing from the cards' own roots",
+          drawnRoots == ["/Users/x/workspace/geo"])
+    let byCards = FakeMachine()
+    leftoverServer(byCards, project: web)
+    let fourteenth = byCards.store()
+    fourteenth.observe(strays: [root: web, worker: web], processes: byCards.table,
+                       sessions: OrphanReclaim.Sessions(checkouts: drawnRoots), at: t0)
+    byCards.times = [root: 103, worker: 0]
+    fourteenth.observe(strays: [root: web, worker: web], processes: byCards.table,
+                       sessions: OrphanReclaim.Sessions(checkouts: drawnRoots), at: round2)
+    check("…and a round handed only those roots reads the checkout as empty and says so",
+          fourteenth.records.first?.outcome == .reported(doubts: [])
+              && byCards.delivered.first?.text
+                  .contains("no session is working in its checkout") == true)
+    let byRoster = FakeMachine()
+    leftoverServer(byRoster, project: web)
+    let fifteenth = byRoster.store()
+    fifteenth.observe(strays: [root: web, worker: web], processes: byRoster.table,
+                      sessions: OrphanReclaim.Sessions(checkouts: Set(board.values)), at: t0)
+    byRoster.times = [root: 103, worker: 0]
+    fifteenth.observe(strays: [root: web, worker: web], processes: byRoster.table,
+                      sessions: OrphanReclaim.Sessions(checkouts: Set(board.values)), at: round2)
+    check("…while the roster's own roots report it and leave it alone",
+          byRoster.sent.isEmpty
+              && fifteenth.records.first?.outcome == .reported(doubts: [.sessionPresent]))
+    check("…and the guard sits before the round rather than after the sweep",
+          (source.range(of: "guard roundDue(at: now)")?.lowerBound).map { flag in
+              (source.range(of: "lastRound = now")?.lowerBound).map { flag < $0 } ?? false
+          } == true)
+}
+

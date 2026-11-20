@@ -1,0 +1,240 @@
+import Foundation
+
+// What a launch's own arguments say about how it must be treated, split out of
+// SupervisorRuntime.swift for file size. Every reader here answers a question about the ARGS the
+// child was given, and nothing about the fleet, the quota or the transcript, which is why they can
+// be tested with a string array and no supervisor at all.
+
+// `autoHandoffEnabled`, `autoFollowEnabled`, `printFlags`, `shouldSupervise` and
+// `shouldMonitorCodex` live with the launch decision that reads them (LaunchDecision.swift).
+
+/// `args` minus the given value-taking flags (and their values), with everything from a bare `--`
+/// onward passed through untouched: that part is the prompt, and editing it edits what the user
+/// said.
+func removingFlagPairs(_ args: [String], _ flags: Set<String>) -> [String] {
+    let options = optionsOnly(args)
+    var out: [String] = []
+    var skip = false
+    for argument in options {
+        if skip { skip = false; continue }
+        if flags.contains(argument) { skip = true; continue }
+        out.append(argument)
+    }
+    return out + args[options.count...]
+}
+
+// MARK: - Positionals, and why a relaunch must not carry them
+
+// How many words each claude option consumes, which is the whole difference between a VALUE and a
+// positional.
+//
+// READ OUT OF THE CLI BINARY, not guessed and not asked: `strings` over
+// ~/.local/share/claude/versions/2.1.223 carries the commander registration verbatim
+// (`.option("--add-dir <directories...>", …)`), so every flag's arity is written down in the build
+// itself. Extracted that way 2026-08-06 against 2.1.223. This repo never RUNS `claude` to find out
+// what it does - the stop hook would hijack the session and spend quota - and the binary is the
+// same source `Provider.modelEnvKey` was established from.
+//
+// Commander has three shapes and they map onto three arities: a bare `--flag` consumes nothing,
+// `<value>` and `[value]` consume one (an optional value is still taken when the next word is not
+// itself a flag), and `<values...>` consumes every following word up to the next flag.
+
+/// How many words a flag takes with it.
+enum ChildFlagArity: Equatable {
+    case zero
+    case one
+    case variadic
+}
+
+/// The options that consume NO word, so whatever follows one is a positional. `printFlags` and
+/// `continueFlags` are reused rather than respelled.
+let zeroValueChildFlags: Set<String> = printFlags.union(continueFlags).union([
+    "--verbose", "--bare", "--safe-mode", "--init", "--init-only", "--maintenance",
+    "--include-hook-events", "--include-partial-messages", "--forward-subagent-text",
+    "--session-mirror", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+    "--replay-user-messages", "--enable-auth-status", "--exclude-dynamic-system-prompt-sections",
+    "--fork-session", "--deep-link-origin", "--no-session-persistence", "--reply-on-resume",
+    "--ide", "--strict-mcp-config", "--disable-slash-commands", "--chrome", "--no-chrome",
+    "--tmux", "--enable-auto-mode", "--bg", "--background", "--brief", "--ax-screen-reader",
+    "--plan-mode-required", "--help", "-h", "--version", "-v", "--debug-to-stderr", "-d2e",
+])
+
+/// The options that consume EVERY following word until the next flag (commander's `<values...>`).
+///
+/// Reading one of these as taking a single value throws arguments away: `--add-dir one two` comes
+/// back as `--add-dir one`, silently narrowing what the session may touch, and `two` is then handed
+/// to the child as a prompt on top of that. Both spellings of the two-name options are listed
+/// because commander registers both.
+let variadicChildFlags: Set<String> = [
+    "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools",
+    "--mcp-config", "--betas", "--add-dir", "--channels",
+    "--dangerously-load-development-channels", "--file",
+]
+
+/// How many words this flag takes. A `--flag=value` token carries its own value and consumes
+/// nothing; anything not in either set above is assumed to take one.
+///
+/// THE RESIDUAL, stated rather than papered over. That default is wrong in three known shapes:
+///
+///   - A zero-arity flag from a LATER claude release, or one this table missed: the word after it
+///     is read as a value and survives, so a stray word rides one more relaunch. This is the safe
+///     direction, and the reason the default is "one" rather than "zero": the opposite guess
+///     DELETES an argument the launch was given.
+///   - A new variadic flag: only its first value survives, which does narrow what the child gets.
+///     The fix is a line in the set above, which is why that set is a list read from the binary
+///     rather than a guess at the description text.
+///   - Clustered short flags (`-cp`). Commander accepts them; this reads the cluster as one unknown
+///     option and consumes the next word. Not observed in a UsageBar-launched argv, where flags are
+///     either injected by this repo or typed one at a time.
+func childFlagArity(_ flag: String) -> ChildFlagArity {
+    if flag.hasPrefix("--"), flag.contains("=") { return .zero }
+    if zeroValueChildFlags.contains(flag) { return .zero }
+    return variadicChildFlags.contains(flag) ? .variadic : .one
+}
+
+/// `args` with every POSITIONAL argument removed, keeping the options and the values they take.
+///
+/// A positional handed to `claude` is the session's INITIAL PROMPT: the CLI types it into the input
+/// box and submits it. That is right exactly once, on the launch the user typed. Every relaunch
+/// after it resumes a conversation that already contains that prompt (and its answer), so carrying
+/// the word along means submitting it again, and again, at every cap handoff, switch, reload and
+/// self-update for the life of the session - which is what two live sessions were found doing on
+/// 2026-08-06, re-typing `tj3裡` and `u0v49` (terminal noise that had landed in their argv before
+/// the input drain existed) into every child since. The drain (TerminalHandover.swift) cleans the
+/// TTY; nothing cleaned the argv, and the argv is copied forward across the self-update exec, so
+/// those two would have carried their fossil indefinitely.
+///
+/// The parse follows the convention every other reader here uses (`flagValue`, `optionsOnly`,
+/// `launchPrimaryModel`): a word that is itself a flag is never a value, and a bare `--` ends the
+/// options. Past that marker EVERYTHING is positional (that is what the marker means), so the whole
+/// tail goes, marker included. How many words each flag actually takes comes from the arity table
+/// above, read out of the CLI binary, rather than from a rule of thumb.
+func withoutPositionals(_ args: [String]) -> [String] {
+    let options = optionsOnly(args)
+    var kept: [String] = []
+    var index = 0
+    while index < options.count {
+        let token = options[index]
+        index += 1
+        // A bare "-" is not an option (it is the conventional name for stdin), and anything not
+        // starting with a dash is the prompt.
+        guard token.hasPrefix("-"), token != "-" else { continue }
+        kept.append(token)
+        // The words behind it are its values: none, one, or as many as follow before the next flag
+        // (`childFlagArity`). A word that is itself a flag is never a value, which is the same rule
+        // `launchPrimaryModel` applies to `--model`.
+        let arity = childFlagArity(token)
+        guard arity != .zero else { continue }
+        while index < options.count, !options[index].hasPrefix("-") {
+            kept.append(options[index])
+            index += 1
+            if arity == .one { break }
+        }
+    }
+    return kept
+}
+
+/// The launch args a relaunch runs with. A known session id resumes that conversation. With no id
+/// (the child has not written a transcript yet, so the watcher located nothing) it depends on where
+/// the relaunch lands: a move to ANOTHER account drops `--continue`/`--resume` so it cannot pull up
+/// an unrelated old conversation there, but a relaunch on the SAME account keeps THE START MODE THE
+/// LAUNCH WAS GIVEN - stripping it would open an EMPTY session instead of the one the user resumed
+/// (`usagebar claude --continue` restarted before its first turn, 2026-07-25).
+///
+/// "The start mode it was given" is both spellings now, and that is not symmetry for its own sake.
+/// UsageBar's own injection used to be `--continue` and is now `--resume <id>` (LaunchResume.swift), so
+/// the flag this branch has to hand back is the one it used to throw away: keeping only `--continue`
+/// would blank every session whose first tick relaunched before the watcher had bound a file. The id
+/// is the safer of the two to re-add, being a name for one conversation rather than for "whichever
+/// is newest here"; it is still gated on the same account, because a cross-account move with nothing
+/// located is `usagebar session clear`'s path as well, and that one asked for an empty window.
+///
+/// EVERY relaunch loses the positionals, which is where the initial prompt lives (see
+/// `withoutPositionals` above): the conversation being resumed already contains it, and re-passing
+/// it submits it a second time. The one case that changes anything a user would want is a session
+/// killed before it wrote a transcript at all, whose prompt then has to be retyped instead of being
+/// silently sent again - a visible, one-off cost against a fossil that re-types itself forever.
+func relaunchArgs(_ args: [String], sessionID: String?, sameAccount: Bool,
+                  fork: Bool = false) -> [String] {
+    // The prompt goes first, so a `-c` the user SAID can no longer be read as a request to
+    // continue: the rewriting below only ever meant to touch the options, and what is left is
+    // options and their values (`withoutPositionals`). The old start mode goes with it - `--resume`
+    // through the value-dropping helper next door, `--continue` by name, since it carries none.
+    let options = withoutPositionals(args)
+    let next = removingFlagPairs(options, ["--resume", "-r"])
+        .filter { !continueFlags.contains($0) }
+    // A located id is the file this child is writing, so an earlier launch's `--fork-session` is
+    // dropped: kept, it would fork that file again on every relaunch. Only a handoff that found a
+    // second head on the conversation asks for one (`fork`, HandoffResume.swift).
+    let unforked = next.filter { $0 != "--fork-session" }
+    if let sessionID { return ["--resume", sessionID] + (fork ? ["--fork-session"] : []) + unforked }
+    guard sameAccount else { return unforked }
+    if options.contains(where: { continueFlags.contains($0) }) { return ["--continue"] + next }
+    guard let asked = flagValue(options, "--resume") ?? flagValue(options, "-r") else { return next }
+    return ["--resume", asked] + next
+}
+
+/// The non-print half of `sessionFlags` (Snapshot.swift); `printFlags` is the other
+/// (LaunchDecision.swift).
+let resumeFlags = sessionFlags.subtracting(printFlags)
+
+/// The two spellings of "continue the latest conversation", named because three readers above share
+/// them (what takes no value, what a relaunch strips, what a same-account relaunch re-adds) and
+/// three literal copies of a pair is how they would come to disagree. A named subset of
+/// `resumeFlags` rather than a partition of it: the other half is `--resume`, which takes a value.
+let continueFlags: Set<String> = ["--continue", "-c"]
+
+/// Whether this session may be moved to another account, which is two questions wearing one name:
+/// can the work be CARRIED, and is re-running it safe. A launch answers to one of three classes.
+///
+/// SECOND line of defence as of the entry gate below: a one-shot run is no longer supervised at all,
+/// so nothing should ever ask this about one. It keeps its answer anyway, because "nothing should"
+/// is a statement about today's callers - a supervisor from an older build is still resident on
+/// somebody's machine, and the next entry point has not been written yet.
+///
+///  - A `--print` run: NEVER. There is no conversation to lose, which is exactly what made this one
+///    easy to get wrong. Moving it means killing a command mid-flight and running it AGAIN on the
+///    other account, so every tool call and every external write in it happens twice. Nothing about
+///    a bound transcript makes that safe, so unlike the class below it is not a matter of waiting -
+///    and a print run does write one (241 sit in each account's probe directory right now, which is
+///    why `ClaudeUsageCLI` prunes them), so a rule reading only "is it located" would clear it.
+///  - A `--continue`/`--resume` launch: only once `sessionLocated`. Crossing accounts drops those
+///    flags (`relaunchArgs` above: on the target account they name a different conversation), so the
+///    resumed id is the only way to bring the conversation along, and it comes from the binding.
+///  - Anything else, a plain interactive launch: yes. There is nothing to carry and nothing to
+///    re-run. Gating this one too would strand brand new sessions on a dying account to protect a
+///    conversation that does not exist - `relaunchArgs` hands the move exactly the args a fresh
+///    start would have got anyway.
+///
+/// `launchArgs` is what the CHILD was launched with, so a session that was moved once and now runs
+/// `--resume <id>` reads as resuming, which it is.
+func carryableSession(launchArgs: [String], sessionLocated: Bool) -> Bool {
+    let options = optionsOnly(launchArgs)
+    if options.contains(where: { printFlags.contains($0) }) { return false }
+    return sessionLocated || !options.contains(where: { resumeFlags.contains($0) })
+}
+
+/// Whether the launch-default pair a follow adoption wants is ALREADY what this session runs, judged
+/// against the flags the child actually carries rather than against the pair follow last adopted.
+///
+/// The two can disagree. `followedModel`/`followedEffort` in the loop record what FOLLOW set, and
+/// every other rewrite of the launch args (the quota fallback profile, the safeguard restore)
+/// deliberately leaves that baseline alone so its own change is never mistaken for a Settings change.
+/// The cost is a stale baseline: once the user edits Settings to the very pair one of those rewrites
+/// already put on the command line, follow compares against the old baseline, sees a difference, and
+/// queues an adoption whose relaunch would change nothing ("adopting when this session goes idle" on
+/// a session already running opus/xhigh, then a no-op restart at the next idle moment, 2026-07-27).
+///
+/// Model comparison goes through `modelsAgree`, so the alias a user types in Settings (`opus`) counts
+/// as the full id an earlier rewrite may have written (`claude-opus-4-8`). Both sides nil is a match:
+/// neither declares a model, so there is nothing to adopt. One side nil is not, because adopting
+/// would add or drop the flag. Effort is exact (lowercased): a policy with no effort against args
+/// carrying `--effort` IS a real change, since the adoption takes that flag away.
+func followAlreadySatisfied(desiredModel: String?, desiredEffort: String?,
+                            launchArgs: [String]) -> Bool {
+    let currentModel = flagValue(launchArgs, "--model")
+    let currentEffort = flagValue(launchArgs, "--effort")?.lowercased()
+    let sameModel = (desiredModel == nil && currentModel == nil)
+        || modelsAgree(desiredModel, currentModel)
+    return sameModel && desiredEffort?.lowercased() == currentEffort
+}

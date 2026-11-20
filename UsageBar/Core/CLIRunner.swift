@@ -1,0 +1,246 @@
+import Foundation
+import os
+
+/// Spawns a provider's own CLI and captures its stdout for usage readers.
+///
+/// Those readers use the official clients (`claude -p "/usage"`, `codex app-server`), which
+/// handle their own credentials and vendor requests. This runner does not read credentials
+/// or call vendor endpoints.
+enum CLIRunner {
+    /// GUI apps get a minimal PATH (`/usr/bin:/bin:…`), so the binary is looked for where CLIs
+    /// install to, on the user's login-shell PATH, and on the app's own PATH, never in UsageBar's
+    /// shim directory (`CLISearchPath`).
+    static func resolve(_ name: String) -> String? {
+        CLISearchPath.shared.resolve(name)
+    }
+
+    struct Output: Sendable {
+        var exitCode: Int32
+        var stdout: String
+        /// Captured too, because a CLI's answer is not always on stdout: `codex login status`
+        /// reports the whole of it here. Drained on its own queue rather than after stdout - a
+        /// child that fills the stderr pipe (64 KB) while the parent blocks on stdout deadlocks,
+        /// and the previous version, which never read this pipe at all, could do exactly that.
+        var stderr: String = ""
+        /// The watchdog ended the run, as opposed to the CLI exiting on its own (B-1745): a reader
+        /// can tell "took too long" from "said no" and decide whether a second attempt is worth it.
+        var timedOut = false
+        /// The run was ended because `answerComplete` said the answer was all there (B-3918); the
+        /// CLI's own exit status is then the kill's, not a verdict on the answer.
+        var answered = false
+        /// Seconds from launch to the first byte on stdout; nil when nothing was printed.
+        var firstByteSeconds: TimeInterval?
+        /// The child's own CPU time (user plus system) as last sampled while it ran, a lower bound
+        /// by the last sample's age; nil when `proc_pid_rusage` never answered. With the wall time
+        /// it tells a child starved of CPU (wall long, this short) from one doing the work (B-3918).
+        var cpuSeconds: TimeInterval?
+    }
+
+    /// `ri_user_time` and `ri_system_time` count mach absolute time, not nanoseconds: the timebase
+    /// is 125/3 on Apple Silicon, so reading the ticks as nanoseconds reports a twenty-fourth of the
+    /// truth (`ProcessTreeReaders.swift` measured it against `getrusage`, 2026-08-15).
+    static func seconds(ticks: UInt64, timebaseNumer: UInt32, timebaseDenom: UInt32) -> TimeInterval {
+        guard timebaseDenom > 0 else { return 0 }
+        return Double(ticks) * Double(timebaseNumer) / Double(timebaseDenom) / 1_000_000_000
+    }
+
+    /// One process's CPU time so far, nil when the machine will not answer for it.
+    static func cpuSeconds(of pid: pid_t) -> TimeInterval? {
+        var info = rusage_info_current()
+        let rc = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, $0)
+            }
+        }
+        var base = mach_timebase_info_data_t()
+        guard rc == 0, mach_timebase_info(&base) == KERN_SUCCESS else { return nil }
+        return seconds(ticks: info.ri_user_time + info.ri_system_time,
+                       timebaseNumer: base.numer, timebaseDenom: base.denom)
+    }
+
+    /// What one pipe has delivered so far. Filled from the pipe's readability handler (a dispatch
+    /// queue) and read by the runner once the child has gone, so the lock orders the two.
+    private final class Captured: Sendable {
+        private let data = OSAllocatedUnfairLock(initialState: Data())
+        func append(_ chunk: Data) { data.withLock { $0.append(chunk) } }
+        var value: Data { data.withLock { $0 } }
+    }
+
+    /// After the child is gone, how long its pipes may stay open before the runner stops waiting
+    /// for them. A grandchild that inherited the pipe (a `sleep` or helper the CLI started) holds
+    /// it open after the CLI is killed; waiting for its EOF stretched a 60 second watchdog to
+    /// 108 to 154 seconds (2026-11-04, B-3918). The same value is how long a child that ignores
+    /// SIGTERM gets before the watchdog sends SIGKILL.
+    static let pipeGrace: TimeInterval = 2
+
+    /// How long the runner keeps reading after `answerComplete` first holds, so a last line printed
+    /// right behind the one that completed the answer is still captured.
+    static let answerSettle: TimeInterval = 0.5
+
+    /// Why the runner ended a child itself; at most one per run.
+    private enum EndReason { case timedOut, answered }
+
+    /// Run a CLI to completion off the main actor. `environment` entries overlay the app's env;
+    /// a nil value REMOVES the variable (the default-home rule: `CLAUDE_CONFIG_DIR` must be unset
+    /// for `~/.claude`, or the CLI looks up a hashed Keychain item that doesn't exist).
+    ///
+    /// `answerComplete`, when given, is asked about everything stdout holds after each chunk. Once it
+    /// says yes the watchdog is disarmed and, after `answerSettle`, the child is ended and the run
+    /// returns without waiting for the pipes: a CLI that prints its answer and then lingers (or whose
+    /// grandchildren keep the pipe open) must not hold the round up (B-3918).
+    ///
+    /// `qualityOfService`, when given, is the child's class (`Process.qualityOfService`); nil leaves
+    /// whatever the child inherits from the runner's utility queue. Do not pass `.background`: under
+    /// load it is the class that starves, and a child spawned under it was killed (rc 15) when probed.
+    static func run(
+        _ executable: String,
+        arguments: [String],
+        environment: [String: String?] = [:],
+        currentDirectory: URL? = nil,
+        input: String? = nil,
+        timeout: TimeInterval = 30,
+        qualityOfService: QualityOfService? = nil,
+        answerComplete: (@Sendable (String) -> Bool)? = nil,
+        claudeInstall: ClaudeNativeInstall = .current,
+        searchPath: CLISearchPath = .shared
+    ) async -> Output? {
+        let tracked = BrimRuntime.isProviderExecutable(executable)
+        let generation = BrimRuntime.shared.liveGeneration
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let process = BrimProviderProcess()
+                // Off the main actor: the mapping may re-link the bundle (ClaudeStableExecutable.swift).
+                // BRIM-GATE: `claudeInstall.mayRepair` keeps ClaudeCode.app unwritten.
+                process.executableURL = URL(fileURLWithPath: claudeStableExecutable(executable, install: claudeInstall))
+                process.arguments = arguments
+                // The CLI's own directory and the login shell's PATH: an npm CLI starts with
+                // `#!/usr/bin/env node`, which the app's PATH cannot satisfy (issue #8).
+                var env = searchPath.environment(for: executable)
+                for (key, value) in environment {
+                    if let value { env[key] = value } else { env.removeValue(forKey: key) }
+                }
+                process.environment = env
+                if let currentDirectory { process.currentDirectoryURL = currentDirectory }
+                if let qualityOfService { process.qualityOfService = qualityOfService }
+
+                let stdout = Pipe()
+                let stderr = Pipe()
+                process.standardOutput = stdout
+                process.standardError = stderr
+                let stdin = Pipe()
+                process.standardInput = stdin
+
+                do {
+                    // Dispatch workers can block SIGTERM. The spawned CLI inherits this thread's
+                    // mask, so unblock termination while spawning and restore the worker's mask.
+                    var terminationSignals = sigset_t(0)
+                    sigemptyset(&terminationSignals)
+                    sigaddset(&terminationSignals, SIGTERM)
+                    var previousMask = sigset_t(0)
+                    let maskResult = pthread_sigmask(SIG_UNBLOCK, &terminationSignals, &previousMask)
+                    guard maskResult == 0 else { throw POSIXError(POSIXErrorCode(rawValue: maskResult) ?? .EINVAL) }
+                    defer { pthread_sigmask(SIG_SETMASK, &previousMask, nil) }
+                    // A provider child launches only if the generation it was queued under still
+                    // holds, registered in the same breath (BrimRuntime.launch).
+                    if tracked {
+                        guard try BrimRuntime.shared.launch(process, generation: generation,
+                            start: { try process.run() }, stop: { process.stopTree() }) else {
+                            continuation.resume(returning: nil)
+                            return
+                        }
+                    } else { try process.run() }
+                } catch {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                defer {
+                    process.stopTree()
+                    if tracked { BrimRuntime.shared.release(process) }
+                }
+                if let input {
+                    stdin.fileHandleForWriting.write(Data(input.utf8))
+                }
+                try? stdin.fileHandleForWriting.close()
+
+                let launched = Date()
+                // CPU is sampled while the child runs (once the process is reaped its pid is not ours
+                // to ask about): on each chunk it prints and just before the runner ends it.
+                let cpu = OSAllocatedUnfairLock<TimeInterval?>(initialState: nil)
+                let sampleCPU: @Sendable () -> Void = {
+                    guard process.isRunning, let used = cpuSeconds(of: process.processIdentifier) else { return }
+                    cpu.withLock { $0 = max($0 ?? 0, used) }
+                }
+                // Why the run was ended, if it was: set on the watchdog's or the settle timer's queue and
+                // read once the child has exited; the lock orders them, and whichever comes first wins.
+                let ended = OSAllocatedUnfairLock<EndReason?>(initialState: nil)
+                let end: @Sendable (EndReason) -> Void = { reason in
+                    guard process.isRunning,
+                          ended.withLock({ current in
+                              guard current == nil else { return false }
+                              current = reason
+                              return true
+                          })
+                    else { return }
+                    sampleCPU()
+                    process.stopTree()
+                    // A CLI that ignores SIGTERM is not allowed to outlive its watchdog.
+                    DispatchQueue.global().asyncAfter(deadline: .now() + pipeGrace) {
+                        if process.isRunning { kill(-process.processIdentifier, SIGKILL) }
+                    }
+                }
+                // Watchdog: a wedged CLI must never stall the refresh loop.
+                let watchdog = DispatchWorkItem { end(.timedOut) }
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+
+                // Both pipes are drained concurrently as the child writes: reading one to EOF while
+                // the child is still filling the other is a deadlock waiting for a chatty CLI.
+                let outData = Captured()
+                let errorData = Captured()
+                let draining = DispatchGroup()
+                let firstByte = OSAllocatedUnfairLock<TimeInterval?>(initialState: nil)
+                let settling = OSAllocatedUnfairLock(initialState: false)
+                func drain(_ pipe: Pipe, into captured: Captured, isAnswer: Bool = false) {
+                    draining.enter()
+                    pipe.fileHandleForReading.readabilityHandler = { handle in
+                        let chunk = handle.availableData
+                        if chunk.isEmpty {
+                            handle.readabilityHandler = nil
+                            draining.leave()
+                            return
+                        }
+                        captured.append(chunk)
+                        sampleCPU()
+                        guard isAnswer else { return }
+                        firstByte.withLock { if $0 == nil { $0 = Date().timeIntervalSince(launched) } }
+                        guard let answerComplete,
+                              !settling.withLock({ $0 }),
+                              answerComplete(String(decoding: captured.value, as: UTF8.self))
+                        else { return }
+                        settling.withLock { $0 = true }
+                        DispatchQueue.global().asyncAfter(deadline: .now() + answerSettle) { end(.answered) }
+                    }
+                }
+                drain(stdout, into: outData, isAnswer: true)
+                drain(stderr, into: errorData)
+                process.waitUntilExit()
+                let endReason = ended.withLock { $0 }
+                // EOF normally arrives with the exit; a grandchild still holding a pipe open does
+                // not get to keep this run, whatever the child managed to print is already here.
+                // An answered run does not wait at all: the answer is already in.
+                if endReason != .answered { _ = draining.wait(timeout: .now() + pipeGrace) }
+                stdout.fileHandleForReading.readabilityHandler = nil
+                stderr.fileHandleForReading.readabilityHandler = nil
+                watchdog.cancel()
+                continuation.resume(returning: Output(
+                    exitCode: process.terminationStatus,
+                    stdout: String(data: outData.value, encoding: .utf8) ?? "",
+                    stderr: String(data: errorData.value, encoding: .utf8) ?? "",
+                    timedOut: endReason == .timedOut,
+                    answered: endReason == .answered,
+                    firstByteSeconds: firstByte.withLock { $0 },
+                    cpuSeconds: cpu.withLock { $0 }
+                ))
+            }
+        }
+    }
+}

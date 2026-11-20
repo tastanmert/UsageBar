@@ -1,0 +1,344 @@
+import SwiftUI
+
+/// Everything both account surfaces have to ask about one account: which config home an action
+/// would touch, whether the login is still good, who is signed in, which windows to show, and which
+/// launch affordances apply. The full card (`AccountCardView`) and the compact list row
+/// (`AccountListRowView`) draw very differently but must never ANSWER differently: a row that greys
+/// an action the card offers, or marks a different account as the smart pick, is two answers to one
+/// question and the user has no way to tell which is the true one.
+///
+/// A value built on the spot rather than stored state: every property here reads a shared store, so
+/// holding one would only be a chance to hold a stale copy.
+@MainActor
+struct AccountFacts {
+    let usage: AccountUsage
+    let settings: SettingsStore
+
+    /// The user-facing name: the nickname when there is one, the discovered label otherwise.
+    var label: String {
+        settings.displayLabel(accountID: usage.id, fallback: usage.accountLabel)
+    }
+
+    /// This account as discovery (plus the dormant memory) knows it: where the homes and the
+    /// dormancy behind the launch affordances come from.
+    var discovered: ProviderAccount? {
+        UsageStore.shared.discoveredAccounts.first { $0.id == usage.id }
+    }
+
+    /// The account's config home, or nil when UsageBar has none to act on (a demo fixture, or an
+    /// account discovered without a launchable directory) - which is what greys the expiry chip and
+    /// both context-menu entries (AccountCardMenu). The RENEWAL home: a signed-out account keeps it,
+    /// which is exactly what "Renew login" acts on.
+    var configHome: String? { discovered?.launchHome }
+
+    /// Signed out with its config home still on disk: listed and renewable, never launchable.
+    var isDormant: Bool { discovered?.isDormant == true }
+
+    /// Who is signed in, for the identity tooltip. The ordering (the probe's live answer first, the
+    /// provider's config-derived copy as the fallback) lives in the store, because the Settings row
+    /// asks the same question and the two must not drift apart. Empty string, not nil: this feeds a
+    /// tooltip, and an absent one is what "nothing to say" looks like there.
+    var identityEmail: String { LoginStatusStore.shared.identityEmail(usage) ?? "" }
+
+    /// WHOSE MARK THIS IS, for the first line of a status mark's callout: a triangle hovered in a
+    /// list of eight rows has to answer that before its sentence means anything, and the identity
+    /// it belongs to is at the far end of the row. The signed-in address when there is one, because
+    /// two accounts can share a nickname and never a login; the row's own name otherwise (a demo
+    /// fixture, or an account no probe has named yet).
+    ///
+    /// The line ABOVE the sentence rather than glued to its front, which is the shape every other
+    /// callout in the panel already has (`usageBarTooltip(_:detail:)`).
+    var markOwner: String { identityEmail.isEmpty ? label : identityEmail }
+
+    /// The second line of that tooltip: the plan and the config home, which is what tells two cards
+    /// apart when the address cannot (one ChatGPT address in two workspaces answers with the same
+    /// email on both - see `AccountIdentity.detail`, which owns the rule and the reason).
+    var identityDetail: String? {
+        AccountIdentity.detail(plan: usage.planName, home: identityHome)
+    }
+
+    /// The home that line NAMES, which is not the same question as `configHome`: that one is the
+    /// home an action would touch, and it is deliberately nil for a demo fixture so every affordance
+    /// that would move a real folder stays greyed. Naming one is not touching one, and a marketing
+    /// shot of this feature has to show the very thing it is about.
+    var identityHome: String? {
+        DemoUsage.launchHome(accountID: usage.id) ?? configHome
+    }
+
+    /// Hold the identity callout open with no pointer, for a design capture. Exactly ONE fixture,
+    /// because every card carries this target and forcing them all would leave the capture showing
+    /// whichever the layout traversal reached last (`UsageBarTooltip.previewForced`).
+    var forcesIdentityTooltip: Bool {
+        UsageBarTooltip.previewForced(.identity) && usage.id == DemoUsage.tooltipPreviewAccountID
+    }
+
+    /// Hold the smart-pick callout open on the Claude account the badge marks (B-3570). One
+    /// provider only: Codex has a pick of its own, and two forced at once would race for the slot.
+    var forcesSmartTooltip: Bool {
+        UsageBarTooltip.previewForced(.smart) && usage.providerID == "claude" && isAutoPick
+    }
+
+    /// Whether this is the account the user is also signed into on claude.ai, and the slice of each
+    /// shared window UsageBar's own choices must leave standing (0 on every other account; which
+    /// windows that covers is `PersonalAccount.reserved`, and the meters ask it per bar). Both
+    /// through
+    /// `PersonalAccount`, which is where the fixtures and the "Claude only" rule live, so no surface
+    /// carries a demo branch of its own.
+    var isPersonalAccount: Bool {
+        PersonalAccount.isPersonal(accountID: usage.id, home: identityHome)
+    }
+
+    var reservePercent: Int {
+        PersonalAccount.reserve(accountID: usage.id, home: identityHome)
+    }
+
+    /// Which window is this account's headline one, asked once for every surface that has to tell
+    /// it apart from the rest. Two do: the split below, and the water line - the reserve reaches
+    /// the account's FLAGSHIP model window and not the other tiers "show every model tier" reveals
+    /// (`PersonalAccount.reserved`), and the flagship one is this.
+    var headlineID: String? { usage.headline?.id }
+
+    /// Non-headline windows. Model-scoped rows are hidden unless "show every model tier" is on, so
+    /// by default only the highest-tier model (the headline) is featured.
+    var secondaryMetrics: [UsageMetric] {
+        let headlineID = self.headlineID
+        return usage.metrics.filter { metric in
+            guard metric.id != headlineID else { return false }
+            if metric.isModelScoped && !settings.showAllModels { return false }
+            return true
+        }
+    }
+
+    /// Every window to show, headline first: the order the card reads top to bottom, and the order
+    /// the row reads left to right.
+    var orderedMetrics: [UsageMetric] {
+        (usage.headline.map { [$0] } ?? []) + secondaryMetrics
+    }
+
+    /// A hard error (this account has never loaded) collapses to a compact error + Retry. A stale
+    /// account (a failed refresh over previously-good numbers) keeps its metrics readable - the
+    /// "Outdated" badge carries the state, so the numbers aren't dimmed away.
+    var isHardError: Bool { usage.error != nil && !usage.isStale }
+
+    /// Whether the "Outdated" mark is this account's to show. An EXPIRED LOGIN is why the numbers
+    /// stopped moving, and it already carries a mark of its own beside this one: drawing both puts a
+    /// cause and its own symptom side by side, in two shades of the same warning, and leaves the
+    /// reader to work out they are one thing (owner's report, 2026-08-24). The login mark wins; this
+    /// one stands down and comes back with the login.
+    ///
+    /// A RENEWAL IN FLIGHT IS NOT THAT, and deliberately does not suppress it (codex review,
+    /// 2026-08-24). "Renew login…" is offered on every account with a config home
+    /// (`AccountCardMenu`), so a renewal running says nothing about why a reading went stale: a rate
+    /// limit or a dropped network is not the login, and hiding the only warning about it would be
+    /// hiding a second, unrelated fact. A spinner and a warning triangle side by side is then
+    /// exactly right, because two things really are true.
+    ///
+    /// Here rather than in either surface, like every other answer in this file: a card that spelled
+    /// out "Outdated" while the row beside it did not would be two answers to one question.
+    var showsStaleMark: Bool { usage.isStale && !isLoginExpired }
+
+    /// The plan exposes only a single weekly window (e.g. Codex on ChatGPT Plus) - worth noting so a
+    /// missing session/model row doesn't read as a bug.
+    var isWeeklyOnly: Bool {
+        usage.metrics.count == 1 && usage.metrics.first?.kind == .weeklyAll
+    }
+
+    // MARK: What this account has to spend
+
+    /// Which reset this account carries, if any, asked in one place so the card and the compact row
+    /// cannot come to offer different things (`RedeemAction.Offer` states what the two are).
+    var resetOffer: RedeemAction.Offer { RedeemAction.offer(for: usage) }
+
+    /// The expiry beside a Codex banked-reset count: "expires in 12d 1h", and "expiry unknown" for
+    /// any credit nobody dated (never read as "no expiry"). The exact time is the hover's
+    /// (`resetExpiryClock`).
+    func resetExpiryNote(now: Date = Date()) -> String? {
+        var parts: [String] = []
+        if let expiry = usage.resetCreditsNextExpiry {
+            parts.append(String(format: L("expires in %@"), UsageFormat.countdownBody(expiry, now: now)))
+        }
+        if usage.resetCreditsExpiryUnknown { parts.append(L("expiry unknown")) }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// The soonest expiry's exact time for the redeem hover, "until 10/14 08:06".
+    func resetExpiryClock() -> String? {
+        usage.resetCreditsNextExpiry.map { String(format: L("until %@"), UsageFormat.absoluteBody($0)) }
+    }
+
+    /// Warning colour inside 48 hours of the soonest expiry, critical inside 6.
+    func resetExpiryColor(now: Date = Date()) -> Color? {
+        switch ResetExpiryUrgency.of(usage.resetCreditsNextExpiry, now: now) {
+        case .soon: return UsageBarColor.warning
+        case .final: return UsageBarColor.critical
+        case .unknown, .distant, .thisWeek: return nil
+        }
+    }
+
+    /// Hover text for a Codex account whose resets could not be read this round.
+    var codexResetUnknownHelp: String { L("Couldn't read resets this round") }
+
+    /// A reset was just redeemed here and the provider is still serving the spent numbers. The rows
+    /// then say the reset is landing instead of "Limit reached", which alongside the green "Reset
+    /// redeemed" line read as a redeem that did nothing.
+    var isSettlingReset: Bool { RedeemPropagationStore.shared.isSettling(usage) }
+
+    // MARK: Launch policy affordances (multi-account providers only)
+
+    /// Sibling count decides whether launch affordances appear at all - with one account there is
+    /// nothing to choose.
+    var hasSiblings: Bool {
+        UsageStore.shared.accounts.filter { $0.providerID == usage.providerID }.count > 1
+    }
+
+    var launchMode: LaunchPolicyStore.Mode {
+        // Demo fixtures always demonstrate Smart mode (the real policy's pinned ids can never match
+        // demo accounts, which would leave every marketing card badge-less), except the one
+        // `-UsageBarDemoPinnedAccount` pins.
+        guard DemoUsage.isActive else { return LaunchPolicyStore.shared.mode(usage.providerID) }
+        return DemoUsage.pinnedAccount?.providerID == usage.providerID ? .manual : .auto
+    }
+
+    var isPinnedActive: Bool {
+        if DemoUsage.isActive { return DemoUsage.pinnedAccount?.id == usage.id }
+        return LaunchPolicyStore.shared.isPinned(usage.id, providerID: usage.providerID)
+    }
+
+    /// Whether auto mode would launch THIS account right now (the panel predicts the CLI).
+    ///
+    /// AND IT WEIGHS THE RESERVES, because the launcher does: a badge ranking on raw percentages
+    /// would sit on the personal account while `usagebar` spent a sibling instead, which is the drift
+    /// this prediction exists not to have. Only reached in auto mode - a pinned card wears the
+    /// pinned badge (`AccountCardView`), and nothing on that path asks a reserve anything.
+    var isAutoPick: Bool { Self.autoPickID(providerID: usage.providerID) == usage.id }
+
+    /// The provider's auto pick, for a surface drawing many accounts at once: it walks every
+    /// account, so asking it once per row made a list O(rows²) on every redraw (a field report).
+    /// The list asks once per provider and hands each row its answer (`PopoverRootView.rowStack`).
+    static func autoPickID(providerID: String) -> String? {
+        autoPickDecision(providerID: providerID)?.id
+    }
+
+    /// The same pick with how it was reached; the smart-pick hover reads the tie details.
+    static func autoPickDecision(providerID: String) -> AutoPickDecision? {
+        let store = UsageStore.shared
+        let launchable = DemoUsage.isActive
+            ? Set(store.accounts.map(\.id))   // fixtures are all "launchable" for the demo
+            : Set(store.discoveredAccounts.compactMap { $0.launchableHome != nil ? $0.id : nil })
+        return LaunchPolicyStore.shared.autoPickDecision(
+            providerID: providerID, accounts: store.accounts, launchable: launchable,
+            reserves: PersonalAccount.reserves(store.accounts, discovered: store.discoveredAccounts))
+    }
+
+    /// The window this account's usage layouts print one number for: its tightest, exactly the one
+    /// the smart pick's eligibility gate weighs (`LaunchPolicyStore.bindingWindow`), with the primary
+    /// model read from the same place `smartPickTooltip` reads it. The ONE entry the layouts use, so
+    /// a row cannot print a figure the badge beside it did not judge by.
+    var bindingWindow: UsageMetric? {
+        LaunchPolicyStore.bindingWindow(
+            usage, primaryModel: LaunchPolicyStore.shared.policy(usage.providerID).model)
+    }
+
+    /// How tight that window is, on the product's one ramp (`MetricSeverity.fromUsedPercent`);
+    /// `.unknown` when the account reports no window at all.
+    var bindingSeverity: MetricSeverity {
+        bindingWindow.map { MetricSeverity.fromUsedPercent($0.usedPercent) } ?? .unknown
+    }
+
+    /// The one switch both surfaces offer: hollow circle pins this account, checked releases it back
+    /// to Smart.
+    func togglePin() {
+        let policy = LaunchPolicyStore.shared
+        if isPinnedActive {
+            policy.setMode(usage.providerID, .auto)
+        } else {
+            policy.pin(usage.providerID, accountID: usage.id, home: discovered?.launchableHome)
+        }
+    }
+
+    /// A signed-out account cannot BECOME the launch account: pinning is denormalized into the
+    /// policy file the CLI reads, so a pinned dormant home would have `usagebar` exec a logged-out
+    /// directory long after the panel forgot why.
+    ///
+    /// Releasing an existing pin stays available, though - that is the opposite direction. An
+    /// account pinned BEFORE it signed out is exactly the one the user needs to unpin, and disabling
+    /// the only control that does it left the choice stuck until the login came back.
+    var canTogglePin: Bool { !(isDormant && !isPinnedActive) }
+
+    /// What the circle does from where it is now - all four states, because a pinned dormant card is
+    /// a real one and reads wrong under either of the other two sentences.
+    var pinToggleHelp: String {
+        switch (isPinnedActive, isDormant) {
+        case (true, true):
+            L("Pinned but signed out: launches pick by headroom until the login is renewed. Click to unpin.")
+        case (true, false): L("Pinned. Click again to go back to Smart.")
+        case (false, true): L("Signed out: renew the login before launching with this account.")
+        case (false, false): L("Set as launch account")
+        }
+    }
+
+    /// The consequence AND the why - the binding quota window and its reset - so the pick never
+    /// looks arbitrary.
+    var smartPickTooltip: String {
+        let primary = LaunchPolicyStore.shared.policy(usage.providerID).model
+        // The clearance lane wears the same glyph, so its hover says which pick this is (B-1360).
+        let now = Date()
+        if clearanceLeftover(LaunchPolicyStore.clearanceWindows(
+            usage, primaryModel: primary, reserve: Double(reservePercent), now: now), now: now) != nil {
+            return L("Smart, clearing leftovers: the next new session starts here to use up what this account has left before its weekly reset.")
+        }
+        var lines = [L("Smart: new sessions start on the account that most needs using before its weekly reset.")]
+        if let need = LaunchPolicyStore.smartDailyNeed(usage, primaryModel: primary,
+                                                       reserve: Double(reservePercent), now: now) {
+            lines.append(String(localized: "Needs about \(need)% a day so none of it goes unused.",
+                                bundle: AppLocale.bundle))
+        }
+        if var reason = LaunchPolicyStore.smartReason(usage, primaryModel: primary) {
+            if reservePercent > 0 {
+                reason += " · " + String(localized: "\(reservePercent)% kept for you", bundle: AppLocale.bundle)
+            }
+            lines.append(reason)
+        }
+        if let decision = Self.autoPickDecision(providerID: usage.providerID),
+           decision.id == usage.id, decision.othersTied > 0 {
+            let k = decision.othersTied
+            switch decision.decidedBy {
+            case .earliestReset:
+                lines.append(String(localized: "Others about as urgent: \(k). This one resets soonest.",
+                                    bundle: AppLocale.bundle))
+            case .bankedResets:
+                lines.append(String(localized: "Others about as urgent: \(k). This one has the most banked resets.",
+                                    bundle: AppLocale.bundle))
+            case .listOrder:
+                lines.append(String(localized: "Others about as urgent: \(k).", bundle: AppLocale.bundle))
+            case .alone, .score, nil: break
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Whether this account can start a login renewal right now (a demo fixture cannot: it has no
+    /// config home behind it).
+    var canRenewLogin: Bool {
+        RenewLoginStore.shared.canRenew(accountID: usage.id, providerID: usage.providerID,
+                                        home: configHome)
+    }
+
+    var isRenewingLogin: Bool { RenewLoginStore.shared.isRenewing(usage.id) }
+
+    var sessionLoginProblems: [LoginHealthSession] { LoginHealthStore.shared.problems(usage.id) }
+    var loginExpiryState: ClaudeLoginExpiry.State { LoginHealthStore.shared.expiryState(usage.id) }
+
+    var isLoginExpired: Bool { LoginStatusStore.shared.isExpired(usage.id) }
+
+    /// The kept account of a login another home is also signed into (#6): the duplicate's own card
+    /// says it in its error line, this says it on the account whose numbers both homes share.
+    var sharedLoginNotice: String? {
+        let rows = UsageStore.shared.accounts
+        let duplicates = rows.filter { $0.sameAccountAs == usage.id }.map(\.id).sorted()
+        guard usage.sameAccountAs == nil, !duplicates.isEmpty else { return nil }
+        return UsageStore.sharedLoginMessage([usage.id] + duplicates) { id in
+            rows.first { $0.id == id }?.accountLabel
+        }
+    }
+}

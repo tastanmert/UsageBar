@@ -1,0 +1,233 @@
+import Foundation
+
+// The launch plumbing `usagebar claude` runs THROUGH once an account has been picked: whether the
+// start-mode default is injectable in this directory (UsageBarCLI/ResumePrompt.swift), and what a
+// manual pin resolves to (AccountPick.swift). Split from main.swift for file size; the assertion
+// helper and the account fixtures are shared from there, the way the supervisor suite splits.
+//
+// Neither is burn-rate scoring, which is what main.swift is about - the seam is "which account"
+// versus "launched how".
+
+/// The policy the start-mode checks run under. File scope because the helper below names it as a
+/// default argument, which a value local to the function could not be.
+private let continuePolicy: LaunchPolicy = {
+    var policy = LaunchPolicy()
+    policy.startMode = "continue"
+    return policy
+}()
+
+func runLaunchChecks() {
+    runConversationChecks()
+
+    // MARK: - Start mode: which conversation the injection names
+    //
+    // The injection is `--resume <id>` and never a bare `--continue`: that flag answers out of a
+    // pointer private to the config home the launch lands on, so picking accounts by headroom walked
+    // the conversation backwards one launch at a time (LaunchResume.swift carries the measurements).
+    let startModeRoot = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("usagebar-startmode-\(UUID().uuidString)")
+    let withSession = startModeRoot.appendingPathComponent("home-used")
+    let withoutSession = startModeRoot.appendingPathComponent("home-fresh")
+    let workingDir = startModeRoot.appendingPathComponent("project")
+    let records = startModeRoot.appendingPathComponent("records")
+    try? FileManager.default.createDirectory(at: workingDir, withIntermediateDirectories: true)
+    try? FileManager.default.createDirectory(
+        at: withoutSession.appendingPathComponent("projects"), withIntermediateDirectories: true)
+    let sessionDir = withSession
+        .appendingPathComponent("projects/\(projectSlug(forCwd: workingDir.path))")
+    try? FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+    write(turnTranscript(at: "2026-08-25T09:00:00.000Z"),
+          to: sessionDir.appendingPathComponent("abc.jsonl"))
+
+    func startMode(_ args: [String], home: URL, policy: LaunchPolicy = continuePolicy,
+                   wantsNew: Bool = false, live: Set<String> = [])
+        -> (args: [String], note: String?, cleared: String?) {
+        applyStartMode(args, policy: policy, wantsNew: wantsNew, home: home.path, live: live,
+                       cwd: workingDir.path, recordDir: records)
+    }
+
+    let used = startMode([], home: withSession)
+    check("a directory with a conversation is resumed by id", used.args == ["--resume", "abc"])
+    check("and says nothing about it", used.note == nil)
+    let fresh = startMode([], home: withoutSession)
+    check("a directory with no conversation injects nothing", fresh.args.isEmpty)
+    check("and says so once",
+          fresh.note == "no conversation to pick up in this directory - starting fresh")
+    // A missing home is the same situation as an empty one, not a crash.
+    check("a home that does not exist injects nothing too",
+          startMode([], home: startModeRoot.appendingPathComponent("absent")).args.isEmpty)
+    // THE DEFECT, at the injection: the conversation another live session is writing is not this
+    // launch's to take, and taking it would put two writers on one transcript.
+    check("a live conversation is not resumed",
+          startMode([], home: withSession, live: ["abc"]).args.isEmpty)
+
+    // A hand-typed --continue / -c is answered by UsageBar, not by the CLI's account-private pointer:
+    // it becomes `--resume <id>`, which is also the id the supervisor finds the task list by. Where
+    // nothing resolves it passes as typed, without our note.
+    let typed = startMode(["--continue"], home: withoutSession)
+    check("a hand-typed --continue survives in a fresh directory", typed.args == ["--continue"])
+    check("and is not commented on", typed.note == nil && typed.cleared == nil)
+    let rewritten = startMode(["--continue"], home: withSession)
+    check("a hand-typed --continue is rewritten into a resume by id",
+          rewritten.args == ["--resume", "abc"] && rewritten.note == nil)
+    check("a hand-typed -c is rewritten the same way, never doubled",
+          startMode(["-c"], home: withSession).args == ["--resume", "abc"])
+    check("the rewrite does not depend on the start mode",
+          startMode(["--continue", "--verbose"], home: withSession, policy: LaunchPolicy()).args
+          == ["--verbose", "--resume", "abc"])
+    check("a forked --continue resumes the parent by id and keeps the fork",
+          startMode(["--continue", "--fork-session"], home: withSession).args
+          == ["--fork-session", "--resume", "abc"])
+    check("a fork takes a conversation another session is writing, it writes a new file",
+          startMode(["--continue", "--fork-session"], home: withSession, live: ["abc"]).args
+          == ["--fork-session", "--resume", "abc"])
+    check("--continue next to a hand-typed --resume is left alone",
+          startMode(["--continue", "--resume", "xyz"], home: withSession).args
+          == ["--continue", "--resume", "xyz"])
+    check("a print run's --continue is left alone",
+          startMode(["-p", "--continue"], home: withSession).args == ["-p", "--continue"])
+    check("--continue in the prompt is not rewritten",
+          startMode(["--", "--continue"], home: withSession, policy: LaunchPolicy()).args
+          == ["--", "--continue"])
+    check("a hand-typed --resume is left alone",
+          startMode(["--resume", "xyz"], home: withoutSession).args == ["--resume", "xyz"])
+    check("--print is not a session to continue",
+          startMode(["-p", "hi"], home: withSession).args == ["-p", "hi"])
+    // ...EXCEPT onto a conversation another live session is writing: two writers on one transcript
+    // is what the live set exists to prevent, so the flag goes and a new conversation opens (owner
+    // ruling, 2026-09-26).
+    let runningNote = "that conversation is running in another window - starting a new one"
+    let typedLive = startMode(["--continue"], home: withSession, live: ["abc"])
+    check("a hand-typed --continue onto a live conversation opens a new one", typedLive.args.isEmpty)
+    check("...and says why", typedLive.note == runningNote)
+    let typedLiveID = startMode(["-r", "abc", "--verbose"], home: withSession, live: ["abc"])
+    check("a hand-typed -r <id> onto a live conversation opens a new one",
+          typedLiveID.args == ["--verbose"])
+    check("...and says why too", typedLiveID.note == runningNote)
+    check("only the session flag goes, never the prompt",
+          startMode(["-c", "--", "-c"], home: withSession, live: ["abc"]).args == ["--", "-c"])
+    let typedOther = startMode(["--resume", "xyz"], home: withSession, live: ["abc"])
+    check("a hand-typed resume of a conversation nobody is running passes as typed",
+          typedOther.args == ["--resume", "xyz"] && typedOther.note == nil)
+    check("a --continue that resolves to nothing passes as typed",
+          startMode(["--continue"], home: withoutSession, live: ["abc"]).args == ["--continue"])
+    // The other two ways to say no, unchanged by the lookup.
+    check("--new (wantsNew) still suppresses the injection",
+          startMode([], home: withSession, wantsNew: true).args.isEmpty)
+    check("a policy that does not continue injects nothing",
+          startMode([], home: withSession, policy: LaunchPolicy()).args.isEmpty)
+
+    // Injection lands where the flags will be READ: before the first `--`, never appended after the
+    // prompt. Appended, claude would never parse them (past the marker they are prompt text) and
+    // UsageBar could not see them either, so the launch would run without the default it believed it
+    // had applied. Both words go together, which is what a value-taking flag needs.
+    check("an injected resume goes in front of the prompt",
+          startMode(["--", "summarise this"], home: withSession).args
+          == ["--resume", "abc", "--", "summarise this"])
+    check("and the prompt itself is untouched",
+          startMode(["--", "--continue"], home: withSession).args
+          == ["--resume", "abc", "--", "--continue"])
+    // Which is also why the suppression check reads only the options: a prompt that mentions the flag
+    // is not the user choosing it.
+    check("a session flag inside the prompt does not suppress the injection",
+          startMode(["--", "-p", "hi"], home: withSession).args
+          == ["--resume", "abc", "--", "-p", "hi"])
+    check("with no marker the injection still simply appends",
+          startMode(["--verbose"], home: withSession).args == ["--verbose", "--resume", "abc"])
+
+    // MARK: - The record outranks the directory, at the injection
+    //
+    // What this machine last watched here is a fact reported by the process writing it; the ranking
+    // below it is a guess. A record naming a conversation that is still there wins even when another
+    // file in the directory sorts newer.
+    write(turnTranscript(at: "2026-08-25T11:00:00.000Z"),
+          to: sessionDir.appendingPathComponent("newer.jsonl"))
+    check("with no record the newest conversation is taken",
+          startMode([], home: withSession).args == ["--resume", "newer"])
+    writeLastConversation("abc", cwd: workingDir.path, dir: records)
+    check("a record takes precedence over the newest file",
+          startMode([], home: withSession).args == ["--resume", "abc"])
+    check("…and it round-trips through the file",
+          readLastConversation(cwd: workingDir.path, dir: records) == "abc")
+    let recordedLive = startMode([], home: withSession, live: ["abc"])
+    check("a recorded conversation another window is running is not resumed",
+          recordedLive.args.isEmpty)
+    check("...and the note says so rather than claiming there is nothing here",
+          recordedLive.note == "the last conversation here is running in another window - starting fresh")
+    // A cleared conversation nobody typed into: resumed by nothing, and NEVER a reason to fall back
+    // onto what came before it (owner ruling, 2026-08-25).
+    write(startupOnlyTranscript(at: "2026-08-25T12:00:00.000Z"),
+          to: sessionDir.appendingPathComponent("cleared.jsonl"))
+    writeLastConversation("cleared", cwd: workingDir.path, dir: records)
+    let cleared = startMode([], home: withSession)
+    check("a recorded conversation with no turn starts fresh", cleared.args.isEmpty)
+    check("…and says which one it means",
+          cleared.note == "the last conversation here was cleared and never used - starting fresh")
+    check("…and names it for the supervisor to find its task list by",
+          cleared.cleared == "cleared" && used.cleared == nil)
+    // A record naming a conversation that is GONE is a miss rather than an answer: the directory
+    // still has the truth, and refusing to look would strand the launch.
+    writeLastConversation("deleted-one", cwd: workingDir.path, dir: records)
+    check("a record naming nothing on disk falls back to the directory",
+          startMode([], home: withSession).args == ["--resume", "newer"])
+    try? FileManager.default.removeItem(at: records)
+
+    // The two helpers on their own, including the no-marker case that must stay a plain append.
+    check("injecting with no marker appends",
+          injectingOptions(["--verbose"], ["--model", "fable"]) == ["--verbose", "--model", "fable"])
+    check("injecting with a marker goes before it",
+          injectingOptions(["--verbose", "--", "hi"], ["--model", "fable"])
+          == ["--verbose", "--model", "fable", "--", "hi"])
+    check("injecting into a bare prompt still precedes it",
+          injectingOptions(["--", "hi"], ["--model", "fable"]) == ["--model", "fable", "--", "hi"])
+    check("removing an own flag leaves the prompt alone",
+          removingOption(["--new", "--", "--new"], "--new") == ["--", "--new"])
+    check("and removes every copy before the marker",
+          removingOption(["--new", "-x", "--new"], "--new") == ["-x"])
+    try? FileManager.default.removeItem(at: startModeRoot)
+
+    // MARK: - Resolving a manual pin (AccountPick.swift)
+
+    // A pin carries two things: the account id, and the launch home denormalized beside it so the pin
+    // still works while its account is briefly missing from the snapshot. That fallback asks nothing
+    // about the account, which is how a pin left behind on an account that later SIGNED OUT kept
+    // exec'ing a logged-out config dir (2026-08-03): the app publishes a dormant account without a
+    // launch home, and every other surface skipped it - only this one did not look.
+    func manualPin(id: String?, home: String?) -> LaunchPolicy {
+        LaunchPolicy(mode: "manual", pinnedAccountID: id, pinnedHome: home)
+    }
+    func snap(_ accounts: [Snapshot.Account]) -> Snapshot {
+        Snapshot(version: 2, generatedAt: now, accounts: accounts)
+    }
+    let livePin = account("A", session: (50, inHours(2)), weekly: (60, inHours(48)))
+    var dormantPin = livePin
+    dormantPin.launchHome = nil   // exactly what the app publishes for a signed-out account
+    let pinSibling = account("B", session: (90, inHours(2)), weekly: (95, inHours(48)))
+
+    check("a live pin launches its account's own home",
+          pinnedLaunchHome(snap([livePin, pinSibling]), policy: manualPin(id: "A", home: "/stale"))
+              == "/tmp/A")
+    // THE FIX. The snapshot listing the account WITHOUT a launch home is UsageBar saying the login is
+    // gone; the saved home must not be exec'd behind that statement.
+    check("a pin whose account signed out launches nothing",
+          pinnedLaunchHome(snap([dormantPin, pinSibling]), policy: manualPin(id: "A", home: "/tmp/A"))
+              == nil)
+    check("…and that is recognised as signed out rather than as a missing account",
+          pinnedAccountIsSignedOut(snap([dormantPin]), policy: manualPin(id: "A", home: "/tmp/A")))
+    // The case the fallback was ADDED for stays: absent from the snapshot says only that UsageBar has not
+    // seen the account this round (a refresh mid-flight, an app that has not run yet).
+    check("a pin whose account is simply absent still launches by saved home",
+          pinnedLaunchHome(snap([pinSibling]), policy: manualPin(id: "A", home: "/tmp/A")) == "/tmp/A")
+    check("…and absence is not read as a sign-out",
+          !pinnedAccountIsSignedOut(snap([pinSibling]), policy: manualPin(id: "A", home: "/tmp/A")))
+    check("no snapshot at all keeps the saved home too",
+          pinnedLaunchHome(nil, policy: manualPin(id: "A", home: "/tmp/A")) == "/tmp/A"
+              && !pinnedAccountIsSignedOut(nil, policy: manualPin(id: "A", home: "/tmp/A")))
+    // Only manual mode has a pin to resolve, and a policy with neither half resolves to nothing.
+    check("smart mode resolves no pin",
+          pinnedLaunchHome(snap([livePin]), policy: LaunchPolicy(pinnedAccountID: "A",
+                                                                 pinnedHome: "/tmp/A")) == nil)
+    check("a manual policy with nothing pinned resolves to nothing",
+          pinnedLaunchHome(snap([livePin]), policy: manualPin(id: nil, home: nil)) == nil
+              && !pinnedAccountIsSignedOut(snap([livePin]), policy: manualPin(id: nil, home: nil)))
+}

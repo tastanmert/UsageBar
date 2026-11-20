@@ -1,0 +1,484 @@
+import Foundation
+
+// Assertion harness for FleetMath (compiled with ProviderModels.swift + FleetMath.swift).
+
+var failures = 0
+func expect(_ condition: Bool, _ name: String) {
+    if condition { print("PASS \(name)") } else { failures += 1; print("FAIL \(name)") }
+}
+
+let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+func metric(_ kind: MetricKind, used: Double, label: String? = nil, model: String? = nil,
+            resetIn: TimeInterval? = nil) -> UsageMetric {
+    let name = label ?? (kind == .session ? "Session" : kind == .weeklyAll ? "Weekly" : (model ?? "Model"))
+    return UsageMetric(id: "\(kind.rawValue):\(name)", kind: kind, label: name, modelName: model,
+                       usedPercent: used, severity: .normal,
+                       resetsAt: resetIn.map { now.addingTimeInterval($0) }, isActive: false)
+}
+
+func account(_ id: String, provider: String = "claude", metrics: [UsageMetric]) -> AccountUsage {
+    AccountUsage(id: id, providerID: provider, accountLabel: id, planName: nil,
+                 metrics: metrics, refreshedAt: now)
+}
+
+func summarize(_ accounts: [AccountUsage]) -> [FleetSummary] {
+    FleetMath.summaries(accounts: accounts, now: now) { $0.accountLabel }
+}
+
+// 1. Weekly pool averages remaining with equal weights; weakest account identified.
+do {
+    let s = summarize([
+        account("c1", metrics: [metric(.weeklyAll, used: 94)]),   // 6% left
+        account("c2", metrics: [metric(.weeklyAll, used: 40)]),   // 60% left
+    ])
+    let pool = s.first?.headline
+    expect(s.count == 1 && pool?.kind == .weeklyAll, "weekly pool exists")
+    expect(pool.map { abs($0.averageRemaining - 33) < 0.001 } == true, "average = mean of remaining")
+    expect(pool?.minAccountLabel == "c1" && pool?.minRemaining == 6, "weakest account is c1 at 6%")
+}
+
+// 2. A provider with one account contributes nothing.
+do {
+    let s = summarize([account("c1", metrics: [metric(.weeklyAll, used: 10)])])
+    expect(s.isEmpty, "single-account provider has no fleet")
+}
+
+// 3. A window class held by only one member does not pool; shared classes still do.
+do {
+    let s = summarize([
+        account("c1", metrics: [metric(.session, used: 50), metric(.weeklyAll, used: 50)]),
+        account("c2", metrics: [metric(.weeklyAll, used: 30)]),
+    ])
+    expect(s.first?.pools.count == 1 && s.first?.pools[0].kind == .weeklyAll,
+           "unshared session window does not pool")
+}
+
+// 4. Model pools group by model name; different models never merge.
+do {
+    let s = summarize([
+        account("c1", metrics: [metric(.weeklyModel, used: 80, model: "Fable 5"),
+                                metric(.weeklyModel, used: 10, model: "Opus")]),
+        account("c2", metrics: [metric(.weeklyModel, used: 60, model: "Fable 5")]),
+    ])
+    let models = s.first?.pools.filter { $0.kind == .weeklyModel } ?? []
+    expect(models.count == 1 && models[0].label == "Fable 5", "only the shared model pools")
+    expect(abs(models[0].averageRemaining - 30) < 0.001, "model pool averages its own windows")
+}
+
+// 5. Next refill is the soonest FUTURE reset, with its account; past resets are ignored.
+do {
+    let s = summarize([
+        account("c1", metrics: [metric(.weeklyAll, used: 20, resetIn: -3_600)]),
+        account("c2", metrics: [metric(.weeklyAll, used: 20, resetIn: 7_200)]),
+        account("c3", metrics: [metric(.weeklyAll, used: 20, resetIn: 86_400)]),
+    ])
+    let pool = s.first?.headline
+    expect(pool?.nextReset == now.addingTimeInterval(7_200)
+           && pool?.nextResetAccountLabel == "c2", "soonest future reset wins")
+}
+
+// 6. Headline prefers weekly over session; falls back to session when no weekly exists.
+do {
+    let both = summarize([
+        account("c1", metrics: [metric(.session, used: 10), metric(.weeklyAll, used: 10)]),
+        account("c2", metrics: [metric(.session, used: 10), metric(.weeklyAll, used: 10)]),
+    ])
+    expect(both.first?.headline?.kind == .weeklyAll, "headline prefers weekly")
+    let sessionOnly = summarize([
+        account("x1", provider: "codex", metrics: [metric(.session, used: 10)]),
+        account("x2", provider: "codex", metrics: [metric(.session, used: 10)]),
+    ])
+    expect(sessionOnly.first?.headline?.kind == .session, "headline falls back to session")
+}
+
+// 7. Providers keep account order; error accounts (no metrics) don't count toward the fleet.
+do {
+    let s = summarize([
+        account("x1", provider: "codex", metrics: [metric(.weeklyAll, used: 10)]),
+        account("c1", metrics: [metric(.weeklyAll, used: 10)]),
+        account("c2", metrics: []),
+        account("c3", metrics: [metric(.weeklyAll, used: 30)]),
+    ])
+    expect(s.count == 1 && s.first?.providerID == "claude", "metric-less account excluded; codex stays single")
+    expect(s.first?.accountCount == 2, "fleet counts only accounts with metrics")
+}
+
+// 8. Members keep display order with their own numbers; refills sort soonest-first with gains.
+do {
+    let s = summarize([
+        account("c1", metrics: [metric(.weeklyAll, used: 94, resetIn: 86_400)]),
+        account("c2", metrics: [metric(.weeklyAll, used: 40, resetIn: 3_600)]),
+    ])
+    let pool = s.first!.headline!
+    expect(pool.members.map(\.accountLabel) == ["c1", "c2"], "members keep account order")
+    expect(abs(pool.totalRemaining - 66) < 0.001, "total pools remaining units")
+    expect(pool.refills.map(\.accountLabel) == ["c2", "c1"]
+           && pool.refills.map(\.gain) == [40, 94], "refills soonest-first with gains")
+}
+
+// MARK: FleetForecast
+
+func sample(_ account: String, provider: String = "claude", tsHoursAgo: Double, used: Double,
+            window: String = "weeklyAll", resetInDays: Double? = 3) -> UsageHistory.Sample {
+    UsageHistory.Sample(ts: now.addingTimeInterval(-tsHoursAgo * 3_600), account: account,
+                        provider: provider, window: window, model: nil, used: used,
+                        resetAt: resetInDays.map { now.addingTimeInterval($0 * 86_400) })
+}
+
+// 9. Pace = summed positive deltas across accounts over the sampled hours.
+do {
+    let rates = FleetForecast.weeklyRates(samples: [
+        sample("c1", tsHoursAgo: 10, used: 10), sample("c1", tsHoursAgo: 0, used: 30),
+        sample("c2", tsHoursAgo: 10, used: 50), sample("c2", tsHoursAgo: 0, used: 60),
+    ], now: now)
+    expect(rates["claude|weeklyAll"].map { abs($0.perHour - 3) < 0.001 } == true,
+           "pace sums both accounts (30 units / 10h)")
+}
+
+// 10. A window rollover (resetAt changed, used dropped) contributes nothing to the pace.
+do {
+    let rates = FleetForecast.weeklyRates(samples: [
+        sample("c1", tsHoursAgo: 12, used: 90, resetInDays: 0.1),
+        sample("c1", tsHoursAgo: 6, used: 5, resetInDays: 7),
+        sample("c1", tsHoursAgo: 0, used: 11, resetInDays: 7),
+    ], now: now)
+    expect(rates["claude|weeklyAll"].map { abs($0.perHour - 0.5) < 0.001 } == true,
+           "rollover excluded (6 units / 12h)")
+}
+
+// 11. Too little history → no estimate (the strip says "measuring", not a noise forecast).
+do {
+    let rates = FleetForecast.weeklyRates(samples: [
+        sample("c1", tsHoursAgo: 2, used: 10), sample("c1", tsHoursAgo: 0, used: 20),
+    ], now: now)
+    expect(rates["claude|weeklyAll"] == nil,
+           "under \(Int(FleetForecast.minimumSampleHours))h of history gives no pace")
+}
+
+// 12. Depletion: linear without refills; a refill pushes the dry point out.
+do {
+    let bare = FleetForecast.depletion(remaining: 100, refills: [], perHour: 10,
+                                       steadyRefillPerHour: 0, now: now)
+    expect(bare == now.addingTimeInterval(10 * 3_600), "dry = remaining/pace without refills")
+    let extended = FleetForecast.depletion(
+        remaining: 50, refills: [(at: now.addingTimeInterval(3 * 3_600), gain: 100)],
+        perHour: 10, steadyRefillPerHour: 0, now: now)
+    expect(extended == now.addingTimeInterval(15 * 3_600), "refill extends the dry point")
+}
+
+// 13. A pace under the steady refill budget never dries; over it dries after the listed cycle.
+do {
+    let sustainable = FleetForecast.depletion(remaining: 200, refills: [], perHour: 1,
+                                              steadyRefillPerHour: 1.19, now: now)
+    expect(sustainable == nil, "pace within the weekly budget is sustainable")
+    let dries = FleetForecast.depletion(remaining: 200, refills: [], perHour: 2,
+                                        steadyRefillPerHour: 1, now: now)
+    expect(dries == now.addingTimeInterval(200 * 3_600), "net overspend dries at remaining/net")
+}
+
+// 13b. B-1544 r6: the dry time already counts every listed refill, and a refill is ONE member's
+// window (its used percent), so "runs dry" after the row's next refill is the forecast, not a
+// contradiction. The demo Claude x5 weekly pool: +82 back in 19.2h, still dry at 4d 10h.
+do {
+    let refills = [(0.8, 82.0), (1.2, 39.0), (2.6, 59.0), (4.2, 20.0), (6.4, 8.0)]
+        .map { (at: now.addingTimeInterval($0.0 * 86_400), gain: $0.1) }
+    let dry = FleetForecast.depletion(remaining: 292, refills: refills, perHour: 4.6,
+                                      steadyRefillPerHour: 500.0 / 168, now: now)
+    expect(dry.map { Int($0.timeIntervalSince(now) / 3_600) } == 106,
+           "demo Claude x5 runs dry at 4d 10h, refills counted (2d 15h without them)")
+    let beforeRefill = FleetForecast.depletion(
+        remaining: 30, refills: [(at: now.addingTimeInterval(5 * 3_600), gain: 100)],
+        perHour: 10, steadyRefillPerHour: 0, now: now)
+    expect(beforeRefill == now.addingTimeInterval(3 * 3_600), "dry before the refill stays dry")
+}
+
+// MARK: FleetFocus (gauge focus resolution)
+
+// 14. The primary-following modes lead with the declared primary: a flagship primary focuses
+// its window (alias matches the versioned name), a non-flagship primary focuses nothing
+// (weekly), and no primary is flagship-first - the smart launcher's rule.
+do {
+    let order = ["fable", "opus", "sonnet", "haiku"]
+    let available = ["Fable 5"]
+    expect(FleetFocus.focusedModel(.primary, primaryModel: "fable", available: available,
+                                   flagshipOrder: order) == "Fable 5",
+           "primary mode + fable primary focuses the Fable window")
+    expect(FleetFocus.focusedModel(.all, primaryModel: "fable", available: available,
+                                   flagshipOrder: order) == "Fable 5",
+           "all mode leads with the same resolution")
+    expect(FleetFocus.focusedModel(.primary, primaryModel: "sonnet", available: available,
+                                   flagshipOrder: order) == nil,
+           "sonnet primary focuses the weekly budget")
+    expect(FleetFocus.focusedModel(.primary, primaryModel: nil, available: available,
+                                   flagshipOrder: order) == "Fable 5",
+           "no declared primary is flagship-first")
+    expect(FleetFocus.focusedModel(.primary, primaryModel: "fable", available: [],
+                                   flagshipOrder: order) == nil,
+           "no model windows means nothing to focus")
+}
+
+// 15. Flagship ranking honors tier order; weekly mode always declines to focus.
+do {
+    let order = ["fable", "opus", "sonnet", "haiku"]
+    let available = ["Opus", "Fable 5"]
+    expect(FleetFocus.flagship(available, order: order) == "Fable 5",
+           "flagship ranks by tier order")
+    expect(FleetFocus.focusedModel(.weekly, primaryModel: "fable", available: available,
+                                   flagshipOrder: order) == nil,
+           "weekly focus pins the account-wide budget")
+}
+
+// 15b. displayPools ("All pools") draws every window: focused model pool leads, weekly total
+// follows, the 5-hour session closes (B-1544); a session-only fleet keeps its session pool.
+do {
+    let s = summarize([
+        account("c1", metrics: [metric(.session, used: 10), metric(.weeklyAll, used: 10),
+                                metric(.weeklyModel, used: 40, model: "Fable 5")]),
+        account("c2", metrics: [metric(.session, used: 10), metric(.weeklyAll, used: 20),
+                                metric(.weeklyModel, used: 60, model: "Fable 5")]),
+    ])
+    let pools = s.first?.displayPools(focusedModel: "Fable 5") ?? []
+    expect(pools.map(\.kind) == [.weeklyModel, .weeklyAll, .session],
+           "all-mode order is model pool, weekly total, then session")
+    let sessionOnly = summarize([
+        account("x1", provider: "codex", metrics: [metric(.session, used: 10)]),
+        account("x2", provider: "codex", metrics: [metric(.session, used: 10)]),
+    ])
+    expect(sessionOnly.first?.displayPools(focusedModel: nil).map(\.kind) == [.session],
+           "session-only fleet keeps its session pool")
+}
+
+// 15c. displayPools draws every model pool, focused or not (B-1544): with no focus the weekly total
+// leads and the model pools follow it; a focused pool leads and the other model pools still show;
+// a fleet with only model pools still shows them; an undeclared primary keeps the flagship's pool.
+do {
+    let order = ["fable", "opus", "sonnet"]
+    let s = summarize([
+        account("c1", metrics: [metric(.weeklyAll, used: 10),
+                                metric(.weeklyModel, used: 40, model: "Fable 5")]),
+        account("c2", metrics: [metric(.weeklyAll, used: 20),
+                                metric(.weeklyModel, used: 60, model: "Fable 5")]),
+    ])
+    expect(s.first?.displayPools(focusedModel: nil).map(\.kind) == [.weeklyAll, .weeklyModel],
+           "no focus leads with the weekly total and still draws the model pool")
+    let twoModels = summarize([
+        account("c1", metrics: [metric(.weeklyAll, used: 10),
+                                metric(.weeklyModel, used: 40, model: "Fable 5"),
+                                metric(.weeklyModel, used: 20, model: "Sonnet 5")]),
+        account("c2", metrics: [metric(.weeklyAll, used: 20),
+                                metric(.weeklyModel, used: 60, model: "Fable 5"),
+                                metric(.weeklyModel, used: 30, model: "Sonnet 5")]),
+    ])
+    let focusedFable = twoModels.first?.displayPools(focusedModel: "Fable 5") ?? []
+    expect(focusedFable.compactMap(\.modelName) == ["Fable 5", "Sonnet 5"]
+               && focusedFable.map(\.kind) == [.weeklyModel, .weeklyAll, .weeklyModel],
+           "a focused pool leads the weekly total and the other model pool follows")
+    let modelOnly = summarize([
+        account("c1", metrics: [metric(.weeklyModel, used: 40, model: "Fable 5")]),
+        account("c2", metrics: [metric(.weeklyModel, used: 60, model: "Fable 5")]),
+    ])
+    expect(modelOnly.first?.displayPools(focusedModel: nil).map(\.kind) == [.weeklyModel],
+           "a fleet with only model pools never draws an empty strip")
+    let opus = FleetFocus.focusedModel(.all, primaryModel: "opus",
+                                       available: s.first?.modelPoolNames ?? [], flagshipOrder: order)
+    expect(opus == nil
+               && s.first?.displayPools(focusedModel: opus).contains { $0.modelName == "Fable 5" } == true
+               && s.first?.displayPools(focusedModel: opus).first?.kind == .weeklyAll,
+           "an opus launch model with only a Fable window still draws it, after the weekly total")
+    let undeclared = FleetFocus.focusedModel(.all, primaryModel: nil,
+                                             available: s.first?.modelPoolNames ?? [],
+                                             flagshipOrder: order)
+    expect(undeclared == "Fable 5" && s.first?.displayPools(focusedModel: undeclared)
+               .contains { $0.modelName == "Fable 5" } == true,
+           "an unreadable launch model keeps the flagship's pool")
+}
+
+// 15f. Drawing every pool does not move the leading pool: for each fleet shape the first row is the
+// focus-resolved headline (the menu-bar number and the next-refill line follow it), so the session
+// pool never leads unless it is the only pool (B-1544).
+do {
+    let threeWindows = summarize([
+        account("c1", metrics: [metric(.session, used: 10), metric(.weeklyAll, used: 10),
+                                metric(.weeklyModel, used: 40, model: "Fable 5"),
+                                metric(.weeklyModel, used: 20, model: "Sonnet 5")]),
+        account("c2", metrics: [metric(.session, used: 10), metric(.weeklyAll, used: 20),
+                                metric(.weeklyModel, used: 60, model: "Fable 5"),
+                                metric(.weeklyModel, used: 30, model: "Sonnet 5")]),
+    ]).first
+    let sessionOnly = summarize([
+        account("x1", provider: "codex", metrics: [metric(.session, used: 10)]),
+        account("x2", provider: "codex", metrics: [metric(.session, used: 10)]),
+    ]).first
+    var leads = true
+    for focus in ["Fable 5", "Sonnet 5", nil] as [String?] {
+        leads = leads && threeWindows?.displayPools(focusedModel: focus).first
+            == threeWindows?.headline(focusedModel: focus)
+    }
+    leads = leads && sessionOnly?.displayPools(focusedModel: nil).first == sessionOnly?.headline
+    expect(leads && threeWindows?.displayPools(focusedModel: nil).count == 4,
+           "every pool is drawn and the leading pool is still the resolved headline")
+}
+
+// 16. headline(focusedModel:) returns the named model pool, and degrades to the weekly budget
+// when the name matches no pool (schema drift / missing window).
+do {
+    let s = summarize([
+        account("c1", metrics: [metric(.weeklyAll, used: 10),
+                                metric(.weeklyModel, used: 40, model: "Fable 5")]),
+        account("c2", metrics: [metric(.weeklyAll, used: 20),
+                                metric(.weeklyModel, used: 60, model: "Fable 5")]),
+    ])
+    expect(s.first?.headline(focusedModel: "Fable 5")?.kind == .weeklyModel,
+           "focused headline is the model pool")
+    expect(s.first?.modelPoolNames == ["Fable 5"], "model pool names are exposed for resolution")
+    expect(s.first?.headline(focusedModel: "Ghost")?.kind == .weeklyAll,
+           "unknown focus degrades to the weekly pool")
+    expect(s.first?.headline(focusedModel: nil)?.kind == .weeklyAll,
+           "nil focus is the weekly pool")
+}
+
+// 17. Model-scoped samples get their own rate series, keyed by rateKey.
+do {
+    let fable = { (account: String, hoursAgo: Double, used: Double) in
+        UsageHistory.Sample(ts: now.addingTimeInterval(-hoursAgo * 3_600), account: account,
+                            provider: "claude", window: "weeklyModel", model: "Fable 5",
+                            used: used, resetAt: now.addingTimeInterval(3 * 86_400))
+    }
+    let rates = FleetForecast.weeklyRates(samples: [
+        sample("c1", tsHoursAgo: 10, used: 10), sample("c1", tsHoursAgo: 0, used: 20),
+        fable("c1", 10, 0), fable("c1", 0, 40),
+    ], now: now)
+    expect(rates["claude|weeklyAll"].map { abs($0.perHour - 1) < 0.001 } == true,
+           "weekly series unchanged by model samples")
+    expect(rates["claude|weeklyModel|fable 5"].map { abs($0.perHour - 4) < 0.001 } == true,
+           "model series keyed separately (lowercased)")
+}
+
+// 18. The gauge's hover (FleetTooltip): what the pooled average structurally hides.
+do {
+    let s = summarize([
+        account("c1", metrics: [metric(.weeklyAll, used: 40, resetIn: 3 * 86_400),
+                                metric(.weeklyModel, used: 97, model: "Fable")]),
+        account("c2", metrics: [metric(.weeklyAll, used: 20, resetIn: 5 * 86_400),
+                                metric(.weeklyModel, used: 30, model: "Fable")]),
+    ])
+    let summary = s[0]
+    let weekly = summary.pools.first { $0.kind == .weeklyAll }!
+    let model = FleetTooltip.model(summary, displayed: [weekly])
+    // The capacity line is about the pool the gauge is LEADING with, not some other one: hovering a
+    // weekly bar and being told about the Fable pool would explain the wrong number.
+    expect(model?.poolKind == .weeklyAll && model?.poolAccountCount == 2,
+           "the hover is about the pool the gauge is showing")
+    expect(model.map { abs($0.unitsRemaining - 140) < 0.001 } == true,
+           "capacity is the pool's units left (60 + 80)")
+    expect(model?.accountCount == 2, "the title counts the fleet")
+    // The weekly pool averages a healthy 70%, and the fleet's real weak spot is in another window
+    // entirely. Naming only the displayed pool's own worst member would hide exactly that.
+    expect(model?.tightest?.accountLabel == "c1" && model?.tightest?.remaining == 3,
+           "the tightest member is found across every pool, not just the displayed one")
+    expect(model?.tightest?.poolKind == .weeklyModel && model?.tightest?.modelName == "Fable",
+           "and it names the window that owns it")
+    expect(model?.tightest?.severity == .critical, "3% left is critical")
+    // The refill shown belongs to the same pool as the capacity figure above it.
+    expect(model?.nextRefill?.accountLabel == "c1"
+            && model?.nextRefill?.at == weekly.refills.first?.at,
+           "the refill is the displayed pool's own next one")
+}
+
+// 18a. A session window is never the "tightest": it is nearly always the lowest and it always
+// comes back on its own, so reading it would crowd out everything the line exists to say.
+do {
+    let s = summarize([
+        account("c1", metrics: [metric(.session, used: 95), metric(.weeklyAll, used: 60)]),
+        account("c2", metrics: [metric(.session, used: 10), metric(.weeklyAll, used: 20)]),
+    ])
+    let tightest = FleetTooltip.tightest(s[0].pools)
+    expect(tightest?.poolKind == .weeklyAll && tightest?.remaining == 40,
+           "a 5% session loses to a 40% weekly")
+    // Unless the session pool is the only budget the fleet has, which is the same fallback the
+    // gauge itself makes.
+    let sessionOnly = summarize([
+        account("c1", metrics: [metric(.session, used: 95)]),
+        account("c2", metrics: [metric(.session, used: 10)]),
+    ])
+    expect(FleetTooltip.tightest(sessionOnly[0].pools)?.poolKind == .session,
+           "a session-only fleet still gets an answer")
+}
+
+// 18c. The refill hover carries both readings: how long, then when (B-650). There is no
+// preference any more that could make it answer one without the other.
+do {
+    let now = Date(timeIntervalSince1970: 1_000_000)
+    let at = now.addingTimeInterval(2 * 86_400 + 3_600)
+    let refill = FleetPool.Refill(at: at, accountLabel: "c1", gain: 40, poolSize: 1)
+    let value = FleetTooltip.refillValue(refill, now: now)
+    expect(value.countdown == 2 * 86_400 + 3_600 && value.clock == at,
+           "the hover reads the time remaining and the instant itself")
+    // A refill already due (or seconds away) still reads as a minute rather than counting to zero,
+    // which is the floor the strip's own label uses; the clock stays the instant.
+    let due = FleetTooltip.refillValue(FleetPool.Refill(at: now, accountLabel: "c1", gain: 40, poolSize: 1), now: now)
+    expect(due.countdown == 60, "a refill inside the next minute floors at one minute")
+    expect(due.clock == now, "and the floor does not move the clock reading")
+}
+
+// 18b. Degenerate inputs answer nothing rather than trapping.
+do {
+    let s = summarize([
+        account("c1", metrics: [metric(.weeklyAll, used: 10)]),
+        account("c2", metrics: [metric(.weeklyAll, used: 10)]),
+    ])
+    expect(FleetTooltip.model(s[0], displayed: []) == nil, "no displayed pool, no hover")
+    expect(FleetTooltip.tightest([]) == nil, "no pools, no tightest")
+    // Every member equal: still an answer, and it is one of them rather than nil.
+    expect(FleetTooltip.tightest(s[0].pools)?.remaining == 90, "a flat fleet still has a tightest")
+}
+
+runPlanSplitTests()
+runCapWeightTests()
+
+// F1: a home signed into another home's Claude login is published as a failure
+// row with no numbers, so the pool counts that login once without a check of its own.
+do {
+    var duplicate = AccountUsage.failure(
+        account: ProviderAccount(id: "AM", providerID: "claude", label: "AM", locator: [:]),
+        providerID: "claude", message: "AM and GM are signed into the same Claude account")
+    duplicate.sameAccountAs = "GM"
+    let gm = account("GM", metrics: [metric(.weeklyAll, used: 2)])
+    expect(summarize([duplicate, gm]).isEmpty, "F1 one login is no panel pool (a pool needs two accounts)")
+    let pooled = FleetMath.summaries(accounts: [duplicate, gm], now: now, minMembers: 1) { $0.accountLabel }
+    expect(pooled.first?.accountCount == 1, "F1 the pool counts one account, not two")
+    expect(FleetMath.weighted(accounts: [duplicate, gm], codexProMultiple: nil)["claude"]?
+        .remainingPercent == 98, "F1 the weighted remaining is GM's own")
+}
+
+// B-2027: a refill reads as a share of the whole pool, not one account's own units.
+do {
+    func share(_ gain: Double, _ size: Int) -> FleetPool.Refill {
+        FleetPool.Refill(at: now, accountLabel: "a", gain: gain, poolSize: size)
+    }
+    expect(share(100, 8).poolShareText == "12.5%", "B-2027 8-account pool, gain 100 -> 12.5%")
+    expect(share(24, 1).poolShareText == "24%", "B-2027 1-account pool, gain 24 -> 24%")
+    expect(share(50, 4).poolShareText == "12.5%", "B-2027 4-account pool, gain 50 -> 12.5%")
+    expect(share(100, 4).poolShareText == "25%", "B-2027 whole numbers drop the .0")
+    expect(share(0, 8).poolShareText == "0%", "B-2027 gain 0 -> 0%")
+    expect(share(100, 0).poolShare == 0 && share(100, 0).poolShareText == "0%",
+           "B-2027 pool capacity 0 does not divide by zero")
+    expect(share(.nan, 3).poolShareText == "0%" && share(.infinity, 1).poolShareText == "0%",
+           "B-2027 non-finite gain reads 0%")
+    expect(share(82.4, 1).poolShareText == "82.4%" && share(100, 8).gainText == "100%",
+           "B-2027 one decimal kept; gainText stays the account's own figure")
+    let eight = (1...8).map { account("c\($0)", metrics: [metric(.weeklyAll, used: 100, resetIn: 3_600 * Double($0))]) }
+    let pool = summarize(eight).first?.pools.first { $0.kind == .weeklyAll }
+    expect(pool?.refills.count == 8 && pool?.refills.allSatisfy { $0.poolSize == 8 } == true,
+           "B-2027 FleetMath stamps the member count on every refill")
+    expect(pool?.refills.first?.poolShareText == "12.5%", "B-2027 first refill of the 8-account pool is +12.5%")
+    let solo = FleetMath.summaries(accounts: [account("c1", metrics: [metric(.weeklyAll, used: 24, resetIn: 3_600)])],
+                                   now: now, minMembers: 1) { $0.accountLabel }
+    expect(solo.first?.pools.first?.refills.first?.poolSize == 1
+               && solo.first?.pools.first?.refills.first?.poolShareText == "24%",
+           "B-2027 a one-account pool refills as +24%")
+}
+
+if failures > 0 { print("\(failures) failure(s)"); exit(1) }
+print("all fleet tests passed")

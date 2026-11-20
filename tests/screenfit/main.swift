@@ -1,0 +1,363 @@
+import AppKit
+import Foundation
+import SwiftUI
+
+// Assertions for the surface height cap (UsageBar/Views/ScreenFitStack.swift): how tall a surface may
+// become on a given display AND at a given position on it. The position half exists because the
+// pinned panel and the dashboard window keep their top left as they grow, so content that outgrows
+// the room below that edge gets the whole window shoved back up by clampOnScreen - which moves the
+// row out from under the pointer that just clicked it.
+
+var failures = 0
+func check(_ condition: Bool, _ message: String) {
+    if condition { print("  ok: \(message)") } else { print("  FAIL: \(message)"); failures += 1 }
+}
+func section(_ title: String) { print("\n\(title)") }
+func near(_ a: CGFloat, _ b: CGFloat, _ tol: CGFloat = 0.001) -> Bool { abs(a - b) < tol }
+
+// A 1152pt display with the menu bar taken out, the shape the incident was measured on.
+let visible = CGRect(x: 0, y: 0, width: 2048, height: 1120)
+
+section("no top edge: the screen rule alone")
+
+let screenOnly = ScreenFitStack.cap(visible: visible, topEdge: nil)
+check(screenOnly == visible.height - ScreenFitStack.screenMargin,
+      "a host that does not grow downward (the popover) is capped by the display only")
+check(ScreenFitStack.cap(visible: CGRect(x: 0, y: 0, width: 800, height: 200), topEdge: nil)
+        == ScreenFitStack.minSurfaceHeight,
+      "an absurdly short display gets the floor, not a slit")
+
+section("with a top edge: whichever rule is tighter")
+
+// Top edge high on the screen: the room below it exceeds the screen rule, so nothing changes.
+check(ScreenFitStack.cap(visible: visible, topEdge: visible.maxY) == screenOnly,
+      "a surface at the top of the display is capped exactly as before")
+// The incident's geometry: content top 552pt above the bottom of the visible area.
+let low = ScreenFitStack.cap(visible: visible, topEdge: visible.minY + 552)
+check(low == 552, "a surface placed low may only be as tall as the room beneath its own top edge")
+check(low < screenOnly, "and that is tighter than the screen rule, which is the whole point")
+// Dragged so low that the room is less than a usable surface: the floor wins, and the caller
+// accepts that the overflow (and the clamp) comes back down there.
+check(ScreenFitStack.cap(visible: visible, topEdge: visible.minY + 100) == ScreenFitStack.minSurfaceHeight,
+      "below the floor the floor wins, deliberately")
+
+section("the cap never exceeds the room below the top edge")
+
+// The invariant the fix is really about, swept rather than sampled: for every position where the
+// room is between the floor and the screen rule, the cap fits under the top edge.
+var overflow = 0
+for offset in stride(from: Int(ScreenFitStack.minSurfaceHeight), through: Int(visible.height), by: 7) {
+    let topEdge = visible.minY + CGFloat(offset)
+    if ScreenFitStack.cap(visible: visible, topEdge: topEdge) > topEdge - visible.minY { overflow += 1 }
+}
+check(overflow == 0, "no position between the floor and the top of the display can overflow downward")
+
+section("a screen whose origin is not zero")
+
+// A second display sits at a negative origin in this rig; the arithmetic is relative, never
+// absolute, and reading `minY` as "zero" would silently uncap every surface on such a screen.
+let offscreen = CGRect(x: 2048, y: -288, width: 2560, height: 1400)
+check(ScreenFitStack.cap(visible: offscreen, topEdge: offscreen.minY + 500) == 500,
+      "the room is measured from the display's own bottom, not from y = 0")
+
+section("whole points only (the ratchet's source)")
+
+// The cap and the flexible child's height both have to be whole points. The panel's own numbers
+// from the incident: a cap of exactly 480 with the old arithmetic reported 480.00000000000006,
+// AppKit rounded the frame up to 481, the top edge rose a point, and the cap - measured from that
+// edge - grew a point with it. Once per expand, forever.
+check(ScreenFitStack.cap(visible: CGRect(x: 0, y: 0, width: 2048, height: 1120.4), topEdge: nil)
+        == (1120.4 - ScreenFitStack.screenMargin).rounded(.down),
+      "a fractional display height still yields a whole-point cap")
+check(ScreenFitStack.cap(visible: visible, topEdge: visible.minY + 479.6) == 479,
+      "a fractional top edge is floored, never rounded up into the room it does not have")
+
+// The residue itself, with child heights that are not exact in binary (a real surface's never
+// are: they come out of text metrics). The old form took the excess off the CHILD, which means
+// summing a dozen such numbers and subtracting; the new one subtracts from the cap and floors.
+let others: [CGFloat] = [22.2, 0.5, 186.7, 0.5, 32.8]
+let othersTotal = others.reduce(0, +)
+let flexibleIdeal: CGFloat = 418.1
+let cap: CGFloat = 480
+
+let naive = flexibleIdeal - ((othersTotal + flexibleIdeal) - cap)
+let naiveTotal = othersTotal + naive
+check(naiveTotal > cap,
+      "the old arithmetic overshoots the cap by a residue (\(naiveTotal - cap)), which a window frame rounds up into a whole point")
+
+let fixed = ScreenFitStack.flexibleHeight(others: othersTotal, maxHeight: cap)
+let fixedTotal = othersTotal + fixed
+check(fixed == fixed.rounded(.down),
+      "the flexible child is given WHOLE points, because a window frame can only hold whole points")
+check(fixedTotal <= cap, "subtracting from the cap and flooring lands at or below it, never above")
+check(cap - fixedTotal < 1, "and not so far below that the surface gives up a visible strip")
+
+// Swept rather than sampled: no fractional layout with room above the floor may exceed the cap.
+var overshoots = 0
+for step in 0 ..< 400 {
+    let fixedPart = 240 + CGFloat(step) * 0.37
+    guard cap - fixedPart >= 120 else { continue }
+    if fixedPart + ScreenFitStack.flexibleHeight(others: fixedPart, maxHeight: cap) > cap { overshoots += 1 }
+}
+check(overshoots == 0, "no fractional split of the fixed rows can push the total past the cap")
+
+// The one case that is ALLOWED to overshoot, and does so by design: a cap so tight that the
+// flexible child would be a slit, where the floor wins and the surface overflows instead.
+check(440 + ScreenFitStack.flexibleHeight(others: 440, maxHeight: 480) > 480,
+      "the minimum flexible height still wins over the cap, which is the documented overflow case")
+
+section("a size difference worth acting on")
+
+check(!ResizeAnchor.needsResize(from: CGSize(width: 504, height: 480),
+                                to: CGSize(width: 504, height: 480.00000000000006)),
+      "the residue that started the ratchet is not a resize")
+check(ResizeAnchor.needsResize(from: CGSize(width: 504, height: 480),
+                               to: CGSize(width: 504, height: 481)),
+      "a whole point still is")
+check(ResizeAnchor.needsResize(from: CGSize(width: 504, height: 480),
+                               to: CGSize(width: 520, height: 480)),
+      "and so is a width change on its own")
+
+section("which corner the surface waits on, and who may wait at all")
+
+// `TopAnchored` reports whatever size it is proposed, which is what stops `NSHostingView` centring
+// the page while the window catches up - and which is also a fixpoint at ANY size. A host that
+// takes its size from this view's own layout constraints therefore keeps whatever degenerate size
+// it started with: the dashboard window opened 1x32 instead of 504x548 (measured 2026-08-05).
+//
+// The hosts that are safe are exactly the ones that size themselves from what the surface REPORTS,
+// which they say by passing an `onContentSize`. Pinned here because nothing about the collapse is
+// visible in a build, a type-check or any other test: the window simply comes up empty.
+let rootSource = (try? String(contentsOfFile: "UsageBar/Views/PopoverRootView.swift",
+                              encoding: .utf8)) ?? ""
+// There is no corner to name any more - the surface holds its top left through every resize
+// (`ResizeAnchor`, and the view-options card that used to claim the other one is a window of its own
+// now) - so what is left to pin is the gate: anchoring is only for a host that sizes itself from
+// what this view reports.
+check(rootSource.contains(".anchoredInHost(enabled: onContentSize != nil)"),
+      "the surface is anchored only where the host sizes itself from what it reports")
+
+// The transition and its destination must be the SAME corner, on BOTH axes. Waiting against the
+// wrong edge leaves whatever hangs off the opposite one a whole size-change out of place until the
+// window lands: measured 34-235pt of card movement per control on the vertical axis, under a header
+// that never budged (2026-08-05, found by review) - and the horizontal half of the same mistake was
+// still in the fix that followed, worth up to 728pt on a column-count click.
+//
+// Which edges the window keeps still is DERIVED here from `ResizeAnchor.origin` rather than
+// restated. That is the whole point: the version of this test that restated it ("leading under both
+// corners") agreed with the code, and the code was wrong.
+let start = CGRect(x: 300, y: 200, width: 500, height: 500)
+let resized = CGRect(x: 300, y: 200, width: 620, height: 640)   // wider AND taller: both axes move
+let bounds = CGRect(x: 10, y: 20, width: 100, height: 200)
+
+let landed = CGRect(origin: ResizeAnchor.origin(for: resized, topEdge: start.maxY),
+                    size: resized.size)
+let holdsLeft = near(landed.minX, start.minX), holdsRight = near(landed.maxX, start.maxX)
+let holdsTop = near(landed.maxY, start.maxY), holdsBottom = near(landed.minY, start.minY)
+let (point, anchor) = HostAnchored.placement(in: bounds)
+check(holdsLeft == (anchor.x == 0) && holdsRight == (anchor.x == 1),
+      "the transition waits on the same HORIZONTAL edge the window will hold")
+check(holdsTop == (anchor.y == 0) && holdsBottom == (anchor.y == 1),
+      "…and on the same vertical edge")
+check(point.x == (anchor.x == 0 ? bounds.minX : bounds.maxX)
+        && point.y == (anchor.y == 0 ? bounds.minY : bounds.maxY),
+      "…at that corner of the bounds it was given")
+
+// Matched against CODE, never comments: the version of this check that read raw source went green
+// on a doc comment that MENTIONED `sizingOptions = []` while the statement itself had moved to
+// another file (2026-08-05).
+func code(of path: String) -> String {
+    let text = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+    return text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> Substring in
+        var quotes = 0
+        for index in line.indices {
+            if line[index] == "\"" { quotes += 1 }
+            if quotes % 2 == 0, line[index] == "/", line.index(after: index) < line.endIndex,
+               line[line.index(after: index)] == "/" {
+                return line[..<index]
+            }
+        }
+        return line
+    }.joined(separator: "\n")
+}
+
+// The two surfaces that place themselves get the whole contract from one object, so the thing to
+// check is that they use it. The popover states its own, because it has no frame to write.
+for (name, path) in [("pinned panel", "UsageBar/MenuBar/PinnedPanelController.swift"),
+                     ("dashboard window", "UsageBar/MenuBar/MainWindowController.swift")] {
+    check(code(of: path).contains("SurfaceSizer(window:"),
+          "the \(name) is one of those hosts: its size comes from the shared measured-sizing contract")
+}
+let sizer = code(of: "UsageBar/MenuBar/SurfaceSizer.swift")
+check(sizer.contains("sizingOptions = []"),
+      "…and that contract is where the no-second-authority rule is actually stated")
+check(code(of: "UsageBar/MenuBar/StatusItemController.swift").contains("onContentSize:")
+        && code(of: "UsageBar/MenuBar/StatusItemController.swift").contains("sizingOptions = []"),
+      "the menu-bar popover reports-and-sizes too, on the only terms AppKit leaves it")
+
+section("what the content reports is a content size, not a frame")
+
+// The seam the shared contract exists to absorb: one of its two surfaces has a titlebar and the
+// other has no chrome at all. Writing the reported size straight into `setFrame` would take the
+// titlebar out of the CONTENT on every pass, so the surface would report a shorter size, which
+// would be written again, and the window would walk itself shut a titlebar at a time.
+let sample = CGRect(x: 0, y: 0, width: 400, height: 300)
+let titled = NSWindow(contentRect: sample, styleMask: [.titled, .closable, .miniaturizable],
+                      backing: .buffered, defer: true)
+let borderless = NSWindow(contentRect: sample, styleMask: [.borderless], backing: .buffered,
+                          defer: true)
+check(titled.frameRect(forContentRect: sample).height > sample.height,
+      "a titled window's frame is taller than the content it was asked for")
+check(borderless.frameRect(forContentRect: sample) == sample,
+      "…and a borderless one's is the same rectangle, which is why one conversion serves both")
+check(sizer.contains("frameRect(forContentRect:"),
+      "so the reported size is converted before it is written as a frame")
+
+section("placing a child reuses the measurement it was sized with")
+
+// a field report: 17 main-thread hangs inside `placeSubviews`, each one a fresh measurement of a
+// child's whole subtree under a definite height. Laid out for real in a hosting view, with children
+// that log every proposal they are asked to size for.
+final class ProposalLog { var heights: [CGFloat?] = [] }
+struct ProposalProbe: Layout {
+    let log: ProposalLog
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        log.heights.append(proposal.height)
+        return CGSize(width: 100, height: 300)
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews,
+                       cache: inout ()) {}
+}
+func layOut(maxHeight: CGFloat) -> (fixed: ProposalLog, flexible: ProposalLog) {
+    let fixed = ProposalLog(), flexible = ProposalLog()
+    let host = NSHostingView(rootView: ScreenFitStack(maxHeight: maxHeight) {
+        ProposalProbe(log: fixed) { Color.clear }
+        ProposalProbe(log: flexible) { Color.clear }.screenFitFlexible()
+    })
+    host.frame = CGRect(x: 0, y: 0, width: 100, height: min(maxHeight, 600))
+    host.layoutSubtreeIfNeeded()
+    return (fixed, flexible)
+}
+let fits = layOut(maxHeight: 10_000)
+check(!fits.fixed.heights.isEmpty && !fits.flexible.heights.isEmpty,
+      "both children were measured (the probe is reached at all)")
+check(fits.fixed.heights.allSatisfy { $0 == nil } && fits.flexible.heights.allSatisfy { $0 == nil },
+      "a stack that fits never asks a child to size for a definite height")
+let squeezed = layOut(maxHeight: 400)
+check(squeezed.fixed.heights.allSatisfy { $0 == nil },
+      "a stack that has to fit still places its fixed children as measured")
+check(squeezed.flexible.heights.contains(ScreenFitStack.minFlexibleHeight),
+      "and hands only the flexible child the definite height it must fit")
+check(ScreenFitStack.placement(width: 100, height: 300, squeezed: false)
+        == ProposedViewSize(width: 100, height: nil)
+        && ScreenFitStack.placement(width: 100, height: 120, squeezed: true)
+        == ProposedViewSize(width: 100, height: 120),
+      "the placement rule itself: measured proposal, or the squeezed height")
+
+section("the machine strip never leaves the surface and never gives way (B-1570, B-3570)")
+
+// Folding a provider is what carries a fleet back under the cap. While it was over, the tab's stack
+// was handed a definite height and a VStack shares that among ALL its children, so a machine strip
+// standing there gave way (its table rows are `frame(minHeight:)`, which yields under a definite
+// height) and sprang back when the fold let the surface fit (B-1570). Holding it at its own height
+// fixed that and broke the other way (B-3570): a strip taller than the room (cards two to a row)
+// was drawn past the cap, under the footer, where no scrolling could bring it back. The strip now
+// sits inside the scroll view, which is handed the definite height and shows the rest by scrolling.
+// Laid out for real, as above.
+final class HeightLog { var placed: [CGFloat] = []; var scrollRegion: [CGFloat] = [] }
+/// Yields under a definite height down to 100, the way the machine table's rows do.
+struct Compressible: Layout {
+    let log: HeightLog
+    var ideal: CGFloat = 200
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        CGSize(width: 100, height: proposal.height.map { max(100, min($0, ideal)) } ?? ideal)
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews,
+                       cache: inout ()) { log.placed.append(bounds.height) }
+}
+/// The card region: its content's height when asked for an ideal, whatever it is given otherwise.
+struct CardRegion: Layout {
+    let ideal: CGFloat
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        CGSize(width: 100, height: proposal.height ?? ideal)
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews,
+                       cache: inout ()) {}
+}
+/// A scroll view's layout: its content's ideal height when asked for one, the height it is given
+/// otherwise, and its children always offered no height at all, so they keep their own.
+struct ScrollRegion: Layout {
+    let log: HeightLog
+    private func ideals(_ subviews: Subviews) -> [CGFloat] {
+        subviews.map { $0.sizeThatFits(ProposedViewSize(width: 100, height: nil)).height }
+    }
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        CGSize(width: 100, height: proposal.height ?? ideals(subviews).reduce(0, +))
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews,
+                       cache: inout ()) {
+        log.scrollRegion.append(bounds.height)
+        var y = bounds.minY
+        for (subview, height) in zip(subviews, ideals(subviews)) {
+            subview.place(at: CGPoint(x: bounds.minX, y: y), anchor: .topLeading,
+                          proposal: ProposedViewSize(width: 100, height: nil))
+            y += height
+        }
+    }
+}
+enum StripMode { case bare, held, scrolled }
+/// The strip's placed height and the scroll region's, in a surface capped at 300.
+func stripHeights(strip: CGFloat = 200, cards: CGFloat, mode: StripMode) -> (strip: CGFloat?, region: CGFloat?) {
+    let log = HeightLog()
+    let host = NSHostingView(rootView: ScreenFitStack(maxHeight: 300) {
+        VStack(spacing: 0) {
+            switch mode {
+            case .bare:
+                Compressible(log: log, ideal: strip) { Color.clear }
+                CardRegion(ideal: cards) { Color.clear }
+            case .held:
+                VStack(spacing: 0) { Compressible(log: log, ideal: strip) { Color.clear } }
+                    .fixedSize(horizontal: false, vertical: true)
+                CardRegion(ideal: cards) { Color.clear }
+            case .scrolled:
+                ScrollRegion(log: log) {
+                    Compressible(log: log, ideal: strip) { Color.clear }
+                    CardRegion(ideal: cards) { Color.clear }
+                }
+            }
+        }
+        .screenFitFlexible()
+    })
+    host.frame = CGRect(x: 0, y: 0, width: 100, height: 300)
+    host.layoutSubtreeIfNeeded()
+    return (log.placed.last, log.scrollRegion.last)
+}
+let bareFolded = stripHeights(cards: 50, mode: .bare).strip, bareOpen = stripHeights(cards: 2_000, mode: .bare).strip
+check(bareFolded == 200 && (bareOpen ?? 200) < 200,
+      "control: a bare strip gives way while the cards overflow (\(String(describing: bareFolded)) folded, \(String(describing: bareOpen)) open)")
+let scrolledFolded = stripHeights(cards: 50, mode: .scrolled), scrolledOpen = stripHeights(cards: 2_000, mode: .scrolled)
+check(scrolledFolded.strip == 200 && scrolledOpen.strip == 200,
+      "a strip inside the scroll view is the same folded and open (\(String(describing: scrolledFolded.strip)), \(String(describing: scrolledOpen.strip)))")
+// A strip taller than the whole surface (large cards two to a row, 487 in a 300 pt room).
+let heldTall = stripHeights(strip: 487, cards: 50, mode: .held), scrolledTall = stripHeights(strip: 487, cards: 50, mode: .scrolled)
+check((heldTall.strip ?? 0) > 300,
+      "control: a strip held outside the scroll view runs past the cap (\(String(describing: heldTall.strip)) in 300)")
+check(scrolledTall.strip == 487 && (scrolledTall.region ?? 999) <= 300,
+      "a strip taller than the room scrolls: it keeps its height and its scroll view stays within the cap (\(String(describing: scrolledTall.strip)), region \(String(describing: scrolledTall.region)))")
+// The source: the account title, the cards and then the strip are all inside the scroll view (B-4169
+// moved the strip from above the cards to below them), after the notices that stay fixed.
+let aroundStrip = rootSource.components(separatedBy: "overlayStrip")
+let beforeStrip = aroundStrip.first ?? ""
+let afterStrip = aroundStrip.dropFirst().first ?? ""
+let scrollOpen = beforeStrip.range(of: "ScrollView(.vertical) {", options: .backwards)
+let openToStrip = scrollOpen.map { String(beforeStrip[$0.upperBound...]) } ?? ""
+let stripToClose = afterStrip.components(separatedBy: ".frame(width: popoverWidth, alignment: .leading)").first ?? ""
+check(scrollOpen != nil && openToStrip.contains("accountPoolTitle") && openToStrip.contains("content }")
+        && !stripToClose.contains("ScrollView(.vertical)") && afterStrip.contains(".frame(width: popoverWidth, alignment: .leading)"),
+      "the panel puts its machine strip inside the scroll view, after the account title and the cards")
+let noticesPart = beforeStrip.components(separatedBy: "ScrollView(.vertical) {").dropLast().last ?? ""
+check(noticesPart.contains("earlyStartNotice") && noticesPart.contains(".fixedSize(horizontal: false, vertical: true)"),
+      "the panel holds its notices at their own height, above the scroll view")
+
+print(failures == 0 ? "\nAll screen-fit cap tests passed." : "\n\(failures) screen-fit cap test(s) failed.")
+exit(failures == 0 ? 0 : 1)

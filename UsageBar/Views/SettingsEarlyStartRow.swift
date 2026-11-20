@@ -1,0 +1,169 @@
+import SwiftUI
+
+/// "Early start": whether UsageBar keeps each Claude account's 5-hour window turning over, and the
+/// hours it is asked to stay quiet in. It sits in the Launch pane's quota-windows card, because it
+/// is about something happening without anybody pressing anything.
+///
+/// The pane also stands in for the panel notice: a user who found this row has been told what the
+/// feature does, which is the whole job the notice exists to do, so opening the pane arms the
+/// schedule exactly as dismissing the notice does (`EarlyStartStore.acknowledgeNotice`).
+///
+/// The day's usagebar is the relay row's own subtitle rather than a tooltip: a relay that runs while
+/// nobody is watching has to be able to show what it did, and a feature whose CLI is missing says
+/// so here rather than reading as "on" and doing nothing.
+struct SettingsEarlyStartRow: View {
+    @Bindable var store: EarlyStartStore
+    /// Whether the pane this row sits on is the one Settings is showing. Passed in for the reason
+    /// `SettingsLaunchAtLoginRow` gives: every pane is laid out together so the window can size
+    /// itself, so a lifecycle hook here runs whether or not anybody opened this section.
+    let isVisible: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            headerRow
+            if store.isEnabled {
+                quietHoursRow
+            }
+        }
+        .onChange(of: isVisible, initial: true) { _, visible in
+            guard visible else { return }
+            store.acknowledgeNotice()
+        }
+    }
+
+    /// The relay switch. Its subtitle is the day's usagebar while it is on: a relay that runs while
+    /// nobody is watching has to be able to show what it did, and a day whose only content is a
+    /// failure says that rather than reading as idle. The full explanation rides in the hover.
+    private var headerRow: some View {
+        SettingsRow(
+            title: L("Window relay"),
+            subtitle: store.isEnabled
+                ? usageBarText
+                : L("Opens each closed 5-hour window early so your next reset lands sooner."),
+            icon: "arrow.triangle.2.circlepath",
+            info: L("Whenever a Claude account's 5-hour window is closed, UsageBar opens it with one short message, so the next reset lands earlier in your day. At most one message per account every 5 hours, and any account already working is left alone. Leaving this on costs very little and always moves the reset earlier."),
+            tooltipPreview: .settingsrelay) {
+            Toggle(isOn: Binding(get: { store.isEnabled }, set: { store.setEnabled($0) })) {
+                EmptyView()
+            }
+            .labelsHidden()
+            .toggleStyle(.switch)
+            // BRIM-GATE: do not offer an action the runtime disables.
+            .disabled(!BrimFeatures.earlyStart)
+        }
+    }
+
+    /// Quiet hours belong to the relay above, so they are its sub-row: the switch, and while it is on
+    /// the two clock fields beside it. The explanation of either state is the title's hover.
+    private var quietHoursRow: some View {
+        SettingsSubRow(title: L("Quiet hours"),
+                       info: store.quietHours.isEnabled
+                        ? L("Nothing is sent between these times.")
+                        : L("Off, so windows are opened at any hour. Turn this on to keep UsageBar silent overnight."),
+                       tooltipPreview: .settingsquiet) {
+            HStack(spacing: 8) {
+                if store.quietHours.isEnabled {
+                    Text(L("From")).font(.system(size: SettingsType.body)).foregroundStyle(.secondary)
+                    picker(hour: store.quietHours.startHour, minute: store.quietHours.startMinute) {
+                        hour, minute in
+                        let held = store.quietHours
+                        store.setQuietHours(EarlyStartQuietHours(
+                            isEnabled: held.isEnabled, startHour: hour, startMinute: minute,
+                            endHour: held.endHour, endMinute: held.endMinute))
+                    }
+                    Text(L("to")).font(.system(size: SettingsType.body)).foregroundStyle(.secondary)
+                    picker(hour: store.quietHours.endHour, minute: store.quietHours.endMinute) {
+                        hour, minute in
+                        let held = store.quietHours
+                        store.setQuietHours(EarlyStartQuietHours(
+                            isEnabled: held.isEnabled, startHour: held.startHour,
+                            startMinute: held.startMinute, endHour: hour, endMinute: minute))
+                    }
+                }
+                Toggle(isOn: Binding(
+                    get: { store.quietHours.isEnabled },
+                    // Turning it ON adopts the suggested overnight stretch rather than a range of zero
+                    // length, which `EarlyStartQuietHours.contains` reads as no quiet time at all and
+                    // would present as a control that does nothing.
+                    //
+                    // ASKED OF THE RANGE, NOT OF THE SWITCH. Reading "off" as "has no range" is wrong
+                    // on the only machine where the difference shows: the range survives the switch
+                    // being turned off (`EarlyStartStore.setQuietHours` writes all five defaults
+                    // whatever `isEnabled` says), so somebody who set 22:30 to 06:30, turned this off
+                    // and turned it back on the next day got 23:00 to 07:00 and no way back. A fresh
+                    // install already holds the suggested range, so the old test bought nothing there
+                    // either.
+                    set: { on in
+                        var next = store.quietHours
+                        if on, next.startMinutes == next.endMinutes { next = .suggested }
+                        next.isEnabled = on
+                        store.setQuietHours(next)
+                    })) {
+                    EmptyView()
+                }
+                .labelsHidden()
+                .toggleStyle(.switch)
+            // BRIM-GATE: do not offer an action the runtime disables.
+            .disabled(!BrimFeatures.earlyStart)
+            }
+        }
+    }
+
+    /// One clock field. The picker edits an hour and a minute; the date around them is only a
+    /// carrier, anchored on today so the field opens somewhere sensible.
+    private func picker(hour: Int, minute: Int,
+                        onChange: @escaping (Int, Int) -> Void) -> some View {
+        DatePicker("", selection: Binding(
+            get: {
+                var parts = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+                parts.hour = hour
+                parts.minute = minute
+                parts.second = 0
+                return Calendar.current.date(from: parts) ?? Date()
+            },
+            set: { picked in
+                let parts = Calendar.current.dateComponents([.hour, .minute], from: picked)
+                onChange(parts.hour ?? hour, parts.minute ?? minute)
+            }), displayedComponents: .hourAndMinute)
+            .labelsHidden()
+            .datePickerStyle(.field)
+            .fixedSize()
+            // THE ONE CONTROL IN SETTINGS THAT FORMATS ITSELF. Everything else on these panes is a
+            // string that has already been through `L()`, so nothing had ever needed to hand
+            // SwiftUI the app's language before. Left alone this field takes the SYSTEM locale
+            // instead: the first capture of this row printed its meridiem marker in the machine's
+            // language inside a window that was otherwise entirely in English. The app's own answer
+            // is `AppLocale.current`, which is what every date UsageBar formats by hand already uses.
+            .environment(\.locale, AppLocale.current)
+    }
+
+    /// What today has done, or an honest blank. Never a made-up number: a day with nothing on it
+    /// says so, and a day whose only content is a failure says that rather than reading as idle.
+    private var usageBarText: String {
+        // One number for "could not start", from two fields: an attempt that failed and an account
+        // no attempt could be made for read the same way here, and only one of them is a count
+        // (`EarlyStartToday.couldNotStartTotal`).
+        guard let today = store.today,
+              today.day == EarlyStartLogic.dayKey(Date(), calendar: Calendar.current),
+              today.started > 0 || today.couldNotStartTotal > 0 || today.skippedCount > 0 else {
+            return L("Nothing sent today yet.")
+        }
+        let blocked = today.couldNotStartTotal
+        guard let at = today.lastAttemptAt else {
+            // No message went out at all, so there is no time to name - what there is, is the
+            // reason: an account that could not be reached, or a CLI that is not installed.
+            if blocked > 0 {
+                return String(format: L("Today: %1$d skipped, %2$d could not start."),
+                              today.skippedCount, blocked)
+            }
+            return String(format: L("Today: %1$d skipped."), today.skippedCount)
+        }
+        let stamp = AppLocale.shortTime(at)
+        if blocked > 0 {
+            return String(format: L("Today: %1$d started, %2$d skipped, %3$d could not start. Last message at %4$@."),
+                          today.started, today.skippedCount, blocked, stamp)
+        }
+        return String(format: L("Today: %1$d started, %2$d skipped. Last message at %3$@."),
+                      today.started, today.skippedCount, stamp)
+    }
+}

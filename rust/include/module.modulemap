@@ -1,0 +1,6 @@
+module UsageBarRustCore {
+    header "usagebar_core.h"
+    header "usagebar_uniffi.h"
+    link "usagebar_ffi"
+    export *
+}

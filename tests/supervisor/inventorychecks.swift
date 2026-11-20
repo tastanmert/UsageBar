@@ -1,0 +1,414 @@
+import Foundation
+
+// The session inventory (SessionInventory.swift): the `sessions` block of `usagebar status --json`,
+// which is what lets one session find another across accounts. Claude Code's own peer roster is
+// partitioned by config home, so the answer has to come from the process that supervises every
+// account, and the whole assembly is asserted here rather than only its pieces: the join is where a
+// live address can turn into a stale one.
+
+func runSessionInventoryChecks() {
+    runCodexMonitoringChecks()
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("usagebar-inventory-\(UUID().uuidString)")
+    // Short, and under /tmp: a unix socket's whole path has to fit in `sun_path` (104 bytes), and
+    // the per-user temp directory alone is most of that. A bind that failed for length would leave
+    // these assertions passing on a socket that was never made.
+    let socketDir = "/tmp/usagebar-inv-\(UUID().uuidString.prefix(8))"
+    let empty = "/tmp/usagebar-inv-none-\(UUID().uuidString.prefix(8))"
+    try? FileManager.default.createDirectory(atPath: socketDir, withIntermediateDirectories: true)
+    let at = Date(timeIntervalSince1970: 1_800_000_000)
+    let transcript = "00000000-0000-0000-0000-000000000001"
+    let nextTranscript = "00000000-0000-0000-0000-000000000002"
+
+    // Real usagebar-named owners, including a real parent/child pair for the child witness.
+    let lineProcess = legacySupervisorFixture()
+    let freshProcess = legacySupervisorFixture()
+    defer {
+        lineProcess.terminate(); lineProcess.waitUntilExit()
+        freshProcess.terminate(); freshProcess.waitUntilExit()
+    }
+    let child = lineProcess.processIdentifier
+    guard let childStamp = processStamp(child) else {
+        check("the inventory fixture can read its live child's process stamp", false)
+        return
+    }
+    let trunkSupervisor = String(getpid())
+    let lineSupervisor = String(lineProcess.processIdentifier)
+    let freshSupervisor = String(freshProcess.processIdentifier)
+    let deadPid = String(deadFixturePid())
+
+    // THE PRESENCE ENTRY IS THE ROSTER, written before a supervisor spawns anything, so every
+    // fixture here registers the way a real one does (`markSupervisorLive`, Supervisor.swift).
+    for pid in [trunkSupervisor, lineSupervisor, freshSupervisor, deadPid] {
+        markSupervisorLive(pid: pid, dir: dir)
+    }
+    writeSessionContext(SupervisedSession(accountID: "claude:.claude", contextTokens: 400_000,
+                                          updatedAt: at, transcriptSessionID: transcript),
+                        pid: trunkSupervisor, dir: dir)
+    writeSupervisorChild(child, pid: trunkSupervisor, dir: dir)
+    writeSupervisorCwd("/x/repo", pid: trunkSupervisor, dir: dir)
+    writeSupervisorAccount("claude:.claude", pid: trunkSupervisor, dir: dir)
+    writeTranscriptIdentity(TranscriptIdentity(id: transcript, claudeCode: childStamp),
+                            pid: trunkSupervisor, dir: dir)
+    // The parallel line, on the SAME account: two lines of one repository is the case the whole
+    // block exists for, and it is also the case the per-account reading cannot express. NO account
+    // document, deliberately: this is what a supervisor from a build before that file looks like,
+    // and its reading is all such a session can be attributed by.
+    writeSessionContext(SupervisedSession(accountID: "claude:.claude", contextTokens: 12_000,
+                                          updatedAt: at, transcriptSessionID: nextTranscript),
+                        pid: lineSupervisor, dir: dir)
+    writeSupervisorCwd("/x/repo-cart", pid: lineSupervisor, dir: dir)
+    // The session with nothing published about it yet, launched from a SUBDIRECTORY of its
+    // checkout, which is the ordinary way `usagebar claude` is typed inside a repository.
+    writeSupervisorCwd("/x/other/deep", pid: freshSupervisor, dir: dir)
+    writeSupervisorAccount("claude:.claude3", pid: freshSupervisor, dir: dir)
+    // A session whose supervisor has exited: swept eventually, but a reader running before the
+    // sweep must not publish an address for a conversation that is over.
+    writeSessionContext(SupervisedSession(accountID: "claude:.claude2", contextTokens: 90_000,
+                                          updatedAt: at), pid: deadPid, dir: dir)
+    writeSupervisorCwd("/x/gone", pid: deadPid, dir: dir)
+
+    // Git's answers, stubbed, so the rule can be asserted without a repository on disk - and
+    // counted, because asking per session rather than per directory multiplies the subprocesses on
+    // a machine running ten agents in one project. Under a lock because these answers are gathered
+    // concurrently, which is the same reason the real ones are.
+    let usagebar = NSLock()
+    nonisolated(unsafe) var asked: [String] = []
+    let identity: SessionDirectoryIdentity = { cwd in
+        usagebar.lock()
+        asked.append(cwd)
+        usagebar.unlock()
+        switch cwd {
+        case "/x/repo-cart": return (mainRepo: "/x/repo", checkout: "/x/repo-cart")
+        // A directory INSIDE a checkout: git answers with the checkout, which is what the session
+        // has to be published at.
+        case "/x/other/deep": return (mainRepo: "/x/other", checkout: "/x/other")
+        default: return (mainRepo: "/x/repo", checkout: "/x/repo")
+        }
+    }
+    /// Both shapes, from the one scan that produced them: asking for either alone is what this
+    /// assembly is not allowed to do.
+    func readings(sockets: String) -> SessionReadings {
+        sessionReadings(dir: dir, socketDir: sockets, identity: identity)
+    }
+    func inventory(sockets: String) -> [StatusReport.Session] { readings(sockets: sockets).sessions }
+
+    let first = readings(sockets: empty)
+    let listed = first.sessions
+    // What ONE pass asked git, captured before any later pass adds to it.
+    let askedOnce = asked
+    check("every live session is listed, including two on one account",
+          listed.count == 3
+              && listed.filter { $0.accountID == "claude:.claude" }.count == 2)
+    check("a supervisor that has exited is not listed at all",
+          !listed.contains { $0.directory == "/x/gone" })
+    // THE ROSTER IS THE PRESENCE ENTRY, NOT THE READING. A session publishes no context until its
+    // conversation has had a turn with usage in it, and the commonest moment to ask what is running
+    // is right after starting one - so a roster keyed on the reading answers with everything except
+    // the session being asked about (codex review of d2d620e).
+    let fresh = listed.first { $0.accountID == "claude:.claude3" }
+    check("a session that has not written a turn yet is on the roster all the same",
+          fresh != nil && listed.count == liveSupervisorPids(dir: dir).count)
+    check("…named by the account its spawn published, which exists from that instant",
+          fresh?.accountID == "claude:.claude3")
+    check("…and a supervisor too old to publish one is still attributed by its reading",
+          listed.first { $0.directory == "/x/repo-cart" }?.accountID == "claude:.claude")
+    // THE CHECKOUT, WHICH IS WHAT THE FIELD PROMISES. `usagebar claude` typed in a subdirectory
+    // supervises the session from there, and publishing that cwd would put two sessions of one
+    // checkout at two addresses - so a peer matching on checkout finds neither.
+    check("a session launched inside its checkout is published at the checkout, not at its cwd",
+          fresh?.directory == "/x/other" && fresh?.project == "/x/other")
+    // The per-account reading is the same scan folded, and it keeps ONE of those two: the assertion
+    // is that the two shapes disagree by design, which is why a reader asking "which sessions are
+    // running" has to start from the list.
+    check("…while the per-account reading keeps only the largest of them",
+          first.accountSessions["claude:.claude"]?.contextTokens == 400_000)
+    // …and the session with nothing published is in the roster without being on that map at all:
+    // there is no reading to attribute, which is not the same as there being no session.
+    check("a session with no reading is on the roster and on no account row",
+          first.accountSessions["claude:.claude3"] == nil)
+    // ONE SCAN FOR BOTH BLOCKS, asserted where the report is actually assembled, because that is
+    // the only place the invariant can be broken: a supervisor exiting, starting, or handing its
+    // session to another account between two scans is a report saying a session is on an account in
+    // one block and does not exist in the other (codex review of d2d620e). The type makes the whole
+    // of it available at once; this is what keeps the caller from going around it.
+    let cli = (try? String(contentsOfFile: "UsageBarCLI/main.swift", encoding: .utf8)) ?? ""
+    check("the report is handed both blocks out of a single scan",
+          cli.contains("let live = sessionReadings()")
+              && cli.contains("accountSessions: live.accountSessions")
+              && cli.contains("sessions: live.sessions"))
+    check("the list is ordered by supervisor pid, not by whatever the directory returned",
+          listed.map(\.directory) == [(getpid(), "/x/repo"),
+              (lineProcess.processIdentifier, "/x/repo-cart"),
+              (freshProcess.processIdentifier, "/x/other")].sorted { $0.0 < $1.0 }.map { $0.1 })
+
+    let trunk = listed.first { $0.directory == "/x/repo" }
+    let line = listed.first { $0.directory == "/x/repo-cart" }
+    // THE TWO PROJECT FIELDS ARE NOT ONE FIELD TWICE. A worktree keeps its own inbox, so a caller
+    // that could only match the repository would deliver to the trunk; a caller that could only
+    // match the checkout could not ask about the repository at all.
+    check("a parallel line reports its own checkout beside the repo it belongs to",
+          line?.project == "/x/repo" && line?.worktree == "cart")
+    check("…and the trunk reports the two as the same directory, with no line name",
+          trunk?.project == "/x/repo" && trunk?.worktree == nil)
+    check("git is asked once per directory, not once per session",
+          askedOnce.sorted() == ["/x/other/deep", "/x/repo", "/x/repo-cart"])
+
+    // THE PID, and the reason it is only on one of them: the other supervisor published no child, so
+    // there is nothing proved to address. Absent reads as "cannot say" rather than as a guess.
+    check("the Claude Code pid is published for the session that has one",
+          trunk?.pid == Int(child) && line?.pid == nil)
+
+    // THE ADDRESS, TWO STATES ON ONE FIXTURE. Same sessions, same pids, two socket directories: the
+    // field appears only when a socket is really there, which is what keeps a reader from dialling
+    // an address nothing is behind once Claude Code moves where it listens.
+    check("no socket on disk, no address published",
+          trunk?.messagingSocket == nil && line?.messagingSocket == nil)
+    check("a transcript without a socket is not published as a message address",
+          trunk?.transcriptSessionID == nil && line?.transcriptSessionID == nil)
+    // THE FIXTURE ANSWERS FOR ITSELF FIRST. Everything below asserts what the inventory does with a
+    // socket that is really there, so "there is no socket" has to fail as a fixture rather than as
+    // the publisher: `sun_path` is 104 bytes and a temporary directory spends most of them.
+    check("the fixture bound a real socket for the session to publish",
+          bindTestSocket(at: "\(socketDir)/\(child).sock"))
+    let addressed = inventory(sockets: socketDir)
+    check("a socket that is really there is published, whole",
+          addressed.first { $0.directory == "/x/repo" }?.messagingSocket
+              == "\(socketDir)/\(child).sock")
+    check("…and the session with no pid still gets none",
+          addressed.first { $0.directory == "/x/repo-cart" }?.messagingSocket == nil)
+    check("the roster publishes the socket's matching transcript UUID",
+          addressed.first { $0.directory == "/x/repo" }?.transcriptSessionID == transcript)
+    check("a transcript without a live child is not published",
+          addressed.first { $0.directory == "/x/repo-cart" }?.transcriptSessionID == nil)
+    for value in [nextTranscript, "invalid", ""] {
+        writeTranscriptIdentity(TranscriptIdentity(id: value, claudeCode: childStamp),
+                                pid: trunkSupervisor, dir: dir)
+        writeSessionContext(SupervisedSession(accountID: "claude:.claude", contextTokens: 400_000,
+                                              updatedAt: at, transcriptSessionID: value),
+                            pid: trunkSupervisor, dir: dir)
+        check("the published transcript follows changes and rejects invalid UUIDs",
+              inventory(sockets: socketDir).first { $0.directory == "/x/repo" }?.transcriptSessionID
+                  == (value == nextTranscript ? nextTranscript : nil))
+    }
+    writeSessionContext(SupervisedSession(accountID: "claude:.claude", contextTokens: 400_000,
+                                          updatedAt: at, transcriptSessionID: nextTranscript),
+                        pid: trunkSupervisor, dir: dir)
+    writeTranscriptIdentity(TranscriptIdentity(id: nextTranscript,
+        claudeCode: ProcessStamp(pid: child, startedAt: childStamp.startedAt - 1)),
+        pid: trunkSupervisor, dir: dir)
+    check("a previous child generation cannot pair the cached UUID with a live socket",
+          inventory(sockets: socketDir).first { $0.directory == "/x/repo" }?.transcriptSessionID == nil)
+    writeTranscriptIdentity(TranscriptIdentity(id: transcript, claudeCode: childStamp),
+                            pid: trunkSupervisor, dir: dir)
+    check("a current child reporting a different conversation cannot endorse the cached UUID",
+          inventory(sockets: socketDir).first { $0.directory == "/x/repo" }?.transcriptSessionID == nil)
+    clearTranscriptIdentity(pid: trunkSupervisor, dir: dir)
+    check("an absent stamped report cannot establish the transcript pair",
+          inventory(sockets: socketDir).first { $0.directory == "/x/repo" }?.transcriptSessionID == nil)
+    writeTranscriptIdentity(TranscriptIdentity(id: nextTranscript, claudeCode: childStamp),
+                            pid: trunkSupervisor, dir: dir)
+    // The path itself is the tripwire, so the shape it composes is pinned rather than eyeballed:
+    // Claude Code names each socket for the pid listening on it, in one machine-wide directory.
+    check("the address is the socket Claude Code names for that pid",
+          claudeMessagingSocket(childPid: Int(child), dir: socketDir)
+              == "\(socketDir)/\(child).sock"
+              && claudeMessagingSocketDir == "/tmp/cc-socks")
+    // …and the three ways a composed path is NOT an address, asserted on the resolver directly
+    // because the inventory can only reach the first of them through a real supervisor.
+    check("a pid with no socket resolves to nothing",
+          claudeMessagingSocket(childPid: 9_999, dir: socketDir) == nil)
+    try? "".write(toFile: "\(socketDir)/7777.sock", atomically: true, encoding: .utf8)
+    check("a regular file at a socket's name is not published as one",
+          claudeMessagingSocket(childPid: 7_777, dir: socketDir) == nil)
+    check("and neither is a directory that has never held Claude Code",
+          claudeMessagingSocket(childPid: Int(child), dir: empty) == nil)
+
+    // MARK: - A HANDOFF THE READING DID NOT KEEP UP WITH
+
+    // Both documents naming this session's account move at the handoff itself now (Supervisor.swift
+    // writes the sidecar beside `accountChanged`, asserted in contextchecks), so on the ordinary
+    // path they agree and there is no window to land in. What is left is the reading going STALE ON
+    // ITS OWN: it is published best-effort through a writer holding an in-memory copy of what it
+    // believes is on disk, so a write that silently fails leaves the old account in the file while
+    // the copy moves on - and the thousand-token delta then suppresses every retry, so an idle
+    // session keeps the old account for as long as it runs (codex review of ff5b2a0). The sidecar
+    // has no memory to disagree with: each write replaces the whole of it. The fixture is that
+    // failure: sidecar moved, reading did not.
+    writeSupervisorAccount("claude:.claudeMOVED", pid: trunkSupervisor, dir: dir)
+    check("a stale account reading cannot publish a transcript beside the new account",
+          inventory(sockets: socketDir).first { $0.directory == "/x/repo" }?.transcriptSessionID == nil)
+    let afterHandoff = readings(sockets: empty)
+    check("a session whose reading went stale is reported on the account the sidecar names",
+          afterHandoff.sessions.first { $0.directory == "/x/repo" }?.accountID
+              == "claude:.claudeMOVED")
+    // …and a session with no sidecar at all is still attributed by its reading, which is the whole
+    // of what a supervisor from an older build published. The two rules are one rule: ask the
+    // document written for this question, and fall back to the one that has to answer it in passing.
+    check("…while a supervisor with no sidecar is still named by its reading",
+          afterHandoff.sessions.first { $0.directory == "/x/repo-cart" }?.accountID
+              == "claude:.claude")
+
+    let sidecar = supervisorAccountFile(pid: trunkSupervisor, dir: dir)
+    try? FileManager.default.removeItem(at: sidecar)
+    check("the stale reading fixture has no account sidecar",
+          !FileManager.default.fileExists(atPath: sidecar.path))
+    let withoutSidecar = inventory(sockets: socketDir).first { $0.directory == "/x/repo" }
+    check("a missing sidecar preserves account fallback but cannot publish a transcript pair",
+          withoutSidecar?.accountID == "claude:.claude"
+              && withoutSidecar?.messagingSocket == "\(socketDir)/\(child).sock"
+              && withoutSidecar?.transcriptSessionID == nil)
+    try? Data([0xff]).write(to: sidecar)
+    check("an unreadable sidecar cannot establish a transcript pair",
+          readSupervisorAccount(pid: trunkSupervisor, dir: dir) == nil
+              && inventory(sockets: socketDir).first { $0.directory == "/x/repo" }?
+                  .transcriptSessionID == nil)
+    writeSupervisorAccount("claude:.claude", pid: trunkSupervisor, dir: dir)
+    check("restoring a matching sidecar restores the transcript pair",
+          inventory(sockets: socketDir).first { $0.directory == "/x/repo" }?.transcriptSessionID
+              == nextTranscript)
+    writeSupervisorAccount("claude:.claudeMOVED", pid: trunkSupervisor, dir: dir)
+
+    // MARK: - WHAT EACH SESSION IS DOING, AND WHY
+
+    // The state record's own fields, carried through the join rather than re-decided here: only the
+    // supervisor can decide one (SessionState.swift), so everything this block does is pass it on.
+    //
+    // ASSERTED HERE RATHER THAN IN tests/statusjson, and that gap is why this block exists: the JSON
+    // suite builds `StatusReport.Session` values by hand, so it pins the CONTRACT while saying
+    // nothing about whether anything fills it. A mutant that dropped all three of the "why" fields
+    // on the floor in this file passed that suite untouched (caught by mutation, 2026-08-15).
+    writeSessionState(SessionStateRecord(state: "blocked", since: at, updatedAt: at,
+                                         reason: "Claude is waiting for your input",
+                                         noticeType: "idle_prompt", quiet: true),
+                      pid: trunkSupervisor, dir: dir)
+    writeSessionState(SessionStateRecord(state: "working", since: at, updatedAt: at, quiet: false),
+                      pid: lineSupervisor, dir: dir)
+    let doing = readings(sockets: empty).sessions
+    check("a session publishes what it is doing, and since when",
+          doing.first { $0.directory == "/x/repo" }?.state == "blocked"
+              && doing.first { $0.directory == "/x/repo" }?.stateSince == at)
+    // THE THREE THAT ANSWER "WHY", which a state word alone cannot: which sentence Claude Code said,
+    // which of the events it was, and how quiet the conversation was when it was judged.
+    check("…and what it is waiting for, from which event, against which quiet reading",
+          doing.first { $0.directory == "/x/repo" }?.reason == "Claude is waiting for your input"
+              && doing.first { $0.directory == "/x/repo" }?.noticeType == "idle_prompt"
+              && doing.first { $0.directory == "/x/repo" }?.quiet == true)
+    check("a session that is not waiting still publishes the reading it was judged by",
+          doing.first { $0.directory == "/x/repo-cart" }?.quiet == false
+              && doing.first { $0.directory == "/x/repo-cart" }?.reason == nil
+              && doing.first { $0.directory == "/x/repo-cart" }?.noticeType == nil)
+    // A supervisor from before the board shipped publishes no record at all, and absence has to stay
+    // "this UsageBar cannot say" rather than becoming a reading of its own.
+    check("a session whose supervisor published no state says nothing about any of it",
+          doing.first { $0.directory == "/x/other" }.map {
+              $0.state == nil && $0.stateSince == nil && $0.reason == nil && $0.noticeType == nil
+                  && $0.quiet == nil
+          } == true)
+
+    // MODEL, EFFORT AND TASK LIST (B-907): filled from the supervisor's own files, the observed model
+    // winning over the launch one, and absent where nothing was published.
+    writeSessionContext(SupervisedSession(accountID: "claude:.claude", contextTokens: 400_000,
+                                          updatedAt: at, observedModel: "claude-opus-5-5",
+                                          runningModel: "opus", runningEffort: "high",
+                                          transcriptSessionID: transcript),
+                        pid: trunkSupervisor, dir: dir)
+    writeSessionContext(SupervisedSession(accountID: "claude:.claude", contextTokens: 12_000,
+                                          updatedAt: at, runningModel: "sonnet",
+                                          transcriptSessionID: nextTranscript),
+                        pid: lineSupervisor, dir: dir)
+    publishTaskListPin(TaskListPin(id: "session-8f2f46fd", dir: "/x/tasks/session-8f2f46fd"),
+                       pid: trunkSupervisor, dir: dir)
+    let axes = readings(sockets: empty).sessions
+    let axesTrunk = axes.first { $0.directory == "/x/repo" }
+    let axesLine = axes.first { $0.directory == "/x/repo-cart" }
+    let axesFresh = axes.first { $0.directory == "/x/other" }
+    check("a session publishes the model seen on its last turn and its launch effort",
+          axesTrunk?.model == "claude-opus-5-5" && axesTrunk?.effort == "high")
+    check("…the launch model when no turn has been observed",
+          axesLine?.model == "sonnet" && axesLine?.effort == nil)
+    check("a session publishes the task list its supervisor pinned",
+          axesTrunk?.taskList?.id == "session-8f2f46fd"
+              && axesTrunk?.taskList?.dir == "/x/tasks/session-8f2f46fd")
+    check("a session with none of the three published says nothing about them",
+          axesFresh?.model == nil && axesFresh?.effort == nil && axesFresh?.taskList == nil
+              && axesLine?.taskList == nil)
+
+    // A Codex registration only gains the one action its runtime can prove: its own exact
+    // terminal. The same live child the inventory already verified supplies the generation
+    // witness, so this tests the status contract rather than a hand-built Session value.
+    let codexGeneration = SessionMonitoring.generation(getpid())!
+    var codex = SessionMonitoring(provider: "codex", supervisorPID: getpid(),
+                                  supervisorStart: codexGeneration, childPID: child,
+                                  childStart: SessionMonitoring.generation(child),
+                                  inputTTY: "/dev/ttys001", nonce: "inventory-send", home: "/tmp/codex")
+    try? codex.write(dir: dir)
+    try? (SessionMonitoring.presencePrefix + String(codexGeneration)).write(
+        to: dir.appendingPathComponent(trunkSupervisor), atomically: true, encoding: .utf8)
+    let codexSend = inventory(sockets: empty).first { $0.directory == "/x/repo" }
+    check("a current Codex registration advertises direct send and no broader control",
+          codexSend?.provider == "codex" && codexSend?.supportedActions == ["send"])
+    codex.inputTTY = nil
+    try? codex.write(dir: dir)
+    let codexLegacy = inventory(sockets: empty).first { $0.directory == "/x/repo" }
+    check("a monitoring-only Codex registration advertises no fabricated send capability",
+          codexLegacy?.provider == "codex" && codexLegacy?.supportedActions == [])
+
+    // A project settings file that replaces UsageBar's status line is named on the session that runs
+    // under it (ProjectStatusLine.swift), and the key is absent otherwise. This process is the one
+    // live supervisor in a directory of its own, started in a scratch folder.
+    let overrideDir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("usagebar-inventory-psl-\(UUID().uuidString)")
+    let overrideScratch = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("usagebar-inventory-psl-cwd-\(UUID().uuidString)").resolvingSymlinksInPath()
+    let overrideFile = overrideScratch.appendingPathComponent(".claude/settings.local.json")
+    try? FileManager.default.createDirectory(at: overrideScratch.appendingPathComponent(".claude"),
+                                             withIntermediateDirectories: true)
+    markSupervisorLive(pid: trunkSupervisor, dir: overrideDir)
+    writeSupervisorCwd(overrideScratch.path, pid: trunkSupervisor, dir: overrideDir)
+    func overridden() -> String? {
+        sessionReadings(dir: overrideDir, socketDir: empty, identity: identity).sessions.first?.statusLineOverride
+    }
+    check("no project settings file, no statusLineOverride", overridden() == nil)
+    try? #"{"statusLine":{"command":"my-line"}}"#.write(to: overrideFile, atomically: true, encoding: .utf8)
+    check("a project file with its own status line is named on the session", overridden() == overrideFile.path)
+    try? FileManager.default.removeItem(at: overrideFile)
+    check("…and the key is gone once the file's statusLine is", overridden() == nil)
+    try? FileManager.default.removeItem(at: overrideDir)
+    try? FileManager.default.removeItem(at: overrideScratch)
+
+    try? FileManager.default.removeItem(at: dir)
+    try? FileManager.default.removeItem(atPath: socketDir)
+}
+
+/// A real listening socket, because what is under test is a file TYPE check: a stand-in regular file
+/// would pass a check that only asked whether something is there.
+///
+/// WHETHER IT WORKED IS RETURNED RATHER THAN DROPPED. `bind` can fail for reasons that have nothing
+/// to do with the code under test - `sun_path` is 104 bytes and a temporary directory eats most of
+/// them, a sandbox may refuse the family - and the rc used to be assigned to `_`. The two checks
+/// that follow the call then went red saying "a socket that is really there is not published",
+/// which reads as a defect in the publisher and is a missing PRECONDITION: the fixture never built
+/// the thing those checks are about. Same rule as every other read whose result decides a verdict
+/// (`docs` on producer rcs): a fixture that did not happen must be told apart from a rule that did
+/// not hold.
+func bindTestSocket(at path: String) -> Bool {
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return false }
+    defer { close(fd) }
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let room = MemoryLayout.size(ofValue: addr.sun_path)
+    // Refused rather than truncated: a path silently cut to 104 bytes binds a socket at a DIFFERENT
+    // address, and the check downstream would then compare the name it asked for against a file
+    // that is not there and report the publisher.
+    guard strlen(path) < room else { return false }
+    withUnsafeMutablePointer(to: &addr.sun_path) { field in
+        field.withMemoryRebound(to: CChar.self, capacity: room) { _ = strlcpy($0, path, room) }
+    }
+    return withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    } == 0
+}

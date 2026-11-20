@@ -1,0 +1,550 @@
+import Foundation
+import Observation
+
+/// Owns the live usage snapshots and the periodic refresh loop. Shared singleton.
+///
+/// Refresh model: Claude accounts are probed one at a time on a per-account cadence
+/// (ProbeCadence.swift), other providers concurrently, on a user-configurable interval. `onChange`
+/// lets the AppKit status item update its title without SwiftUI observation. Claude's usage
+/// endpoint rate-limits aggressively, so the default interval is conservative and manual refresh
+/// is available on demand.
+@MainActor
+@Observable
+final class UsageStore {
+    var refreshFailureLog = RefreshFailureLog()
+    static let shared = UsageStore()
+
+    private(set) var accounts: [AccountUsage] = []
+    /// Every account that EXISTS on this machine (all providers, including disabled ones) - the
+    /// Settings list renders from this, so a switched-off account stays visible and can be
+    /// switched back on. Refreshed on every poll; discovery is local and cheap.
+    private(set) var discoveredAccounts: [ProviderAccount] = []
+    /// Whether a discovery pass has finished at least once this launch - a different question from
+    /// whether it found anything, and the one a surface has to ask before it renders "no accounts"
+    /// (AccountListState.swift). The pass lands at the END of a refresh round, behind every provider
+    /// CLI that round polls, so on the cold start every self-update performs, an empty
+    /// `discoveredAccounts` means "not asked yet" for as long as that takes.
+    private(set) var hasDiscovered = false
+    var arrivedThisLaunch: Set<String> = []  // B-1702, UsageStore+NewArrivals.swift
+    private(set) var isRefreshing = false
+    private(set) var lastRefreshedAt: Date?
+    /// Set only when a refresh produced at least one non-error account - drives the "updated …" header
+    /// so it never reads fresh while everything actually failed.
+    private(set) var lastSuccessfulRefreshAt: Date?
+
+    /// Called on the main actor after every refresh.
+    var onChange: (() -> Void)?
+
+    /// Burn rate per pooled weekly-cycle window (keyed by `FleetForecast.rateKey`), recomputed from the usage history after each
+    /// refresh - what the fleet strip's "lasts about …" forecast runs on.
+    private(set) var fleetRates: [String: FleetRate] = [:]
+
+    /// The usage advisor's per-provider "do I need another account?" verdict, recomputed from the
+    /// 28-day burn history after each refresh - what the advisor strip renders. Empty until the
+    /// first history read completes; demo mode fills it from fixtures instead, since a demo launch
+    /// has no history to read.
+    private(set) var advisorReadings: [UsageAdvisor.Reading] = []
+
+    /// Where the recompute next door lands (UsageStoreAdvisor.swift). A method rather than a wider
+    /// setter so the property stays read-only to everything else, and so the demo guard is written
+    /// once: demo mode never reaches the read at all (its refresh returns before it), and this keeps
+    /// the fixture readings the only ones a demo panel can show even if that early return moves.
+    func publishAdvisorReadings(_ readings: [UsageAdvisor.Reading]) {
+        guard !DemoUsage.isActive else { return }
+        advisorReadings = readings
+    }
+
+    private let providers = ProviderCatalog.all
+    private var timer: DispatchSourceTimer?
+    /// Held for the app's lifetime: the watcher tears its stream down when it is released.
+    private var accountWatcher: AccountDirWatcher?
+    private var discoveryEpoch = 0  // bumped per adopt, so a background discovery landing late drops
+
+    /// When the next automatic poll fires (main timer or an earlier failure retry) - drives the
+    /// header's "updates in Xs" countdown.
+    var nextRefreshAt: Date? {
+        [mainTimerNextFire, retryFireAt].compactMap { $0 }.min()
+    }
+    private var mainTimerNextFire: Date?
+
+    /// The snapshot this store last published (`~/.usagebar/snapshot.json`), which the UsageBar
+    /// panel, menu and settings draw from.
+    private(set) var publishedSnapshot: UsageSnapshot?
+    /// Whether a snapshot has been published this launch.
+    private(set) var publishedOnce = false
+
+    private init() {
+        (accounts, lastGood) = Self.cachedLastGood()
+    }
+
+    func adoptPublished(_ snapshot: UsageSnapshot) {
+        publishedSnapshot = snapshot
+        publishedOnce = true
+    }
+
+    func start() {
+        // First launch counts as user-initiated: the app was just opened, so the one-time credential
+        // prompt is expected here rather than on a later silent background tick.
+        Task { await refresh(userInitiated: true) }
+        scheduleTimer()
+        startAccountWatcher()
+    }
+
+    /// Watches the provider config dirs so an account that finishes logging in shows up now rather
+    /// than on the next tick (AccountDirWatcher.swift). Only a change in the SET of discoverable
+    /// accounts reaches `refresh`; the discovery pass in between is local and cheap, which is what
+    /// keeps a busy `.claude.json` from turning into usage-API traffic.
+    private func startAccountWatcher() {
+        // FSEvents over the config dirs only; the home itself gets a non-recursive watch so a new
+        // account dir is still seen, without a stream over the home's protected folders.
+        let watcher = AccountDirWatcher(
+            roots: accountWatchRoots(),
+            shallowRoots: [FileManager.default.homeDirectoryForCurrentUser],
+            reroot: { accountWatchRoots() },
+            discoverChanged: { [weak self] in await self?.adoptFreshDiscovery() ?? false },
+            onChange: { [weak self] in Task { await self?.refresh(userInitiated: false, trigger: .watcher) } })
+        watcher.start()
+        accountWatcher = watcher
+    }
+
+    /// Discover now and adopt the set if it changed (returned), without waiting for a refresh round:
+    /// the watcher's path, and the add-account flow's once its login lands (AddAccountStore.land).
+    @discardableResult
+    func adoptFreshDiscovery() async -> Bool {
+        // THE LISTING AND THE KEYCHAIN PROBES RUN OFF THE MAIN THREAD (2026-09-26, App Hanging).
+        let (providers, epoch) = (self.providers, discoveryEpoch)
+        let found = await Task.detached(priority: .utility) {
+            KnownAccountsStore.discoverClearingMarkers(providers)
+        }.value
+        guard epoch == discoveryEpoch else { return false }  // a newer adopt wins
+        // A signed-out account is not discoverable, so the dormant ones are merged back in BEFORE
+        // anything compares sets; otherwise every event would read as "an account disappeared".
+        let all = KnownAccountsStore.shared.reconcile(discovered: found).all
+        guard accountSetChanged(from: discoveredAccounts, to: all) else { return false }
+        // Adopted here so Settings is right while a refresh is queued, and news is reported once.
+        adoptDiscovered(all)
+        onChange?()
+        return true
+    }
+
+    /// Adopt a freshly discovered account set as what this store knows, from either of the two
+    /// passes that produce one (the watcher above and the refresh below).
+    ///
+    /// An account that was dormant and is discoverable again has a credential on disk once more,
+    /// and discovery is credential-shaped: that is stronger evidence than the verdict the card's
+    /// "Login expired" chip is read off, which was written by a probe that ran BEFORE the login
+    /// landed. Saying so here is what takes the chip down the moment the credential appears, rather
+    /// than at the probe's own five-minute interval - the tail of the Terminal-handoff path, where
+    /// UsageBar cannot see the login finish at all (codex review, 2026-08-03).
+    private func adoptDiscovered(_ accounts: [ProviderAccount]) {
+        discoveryEpoch += 1
+        let dormantBefore = Set(discoveredAccounts.filter(\.isDormant).map(\.id))
+        noteArrivals(accounts)
+        discoveredAccounts = accounts
+        // Every route that produces a set passes through here, so this is the one place that can
+        // say the question has been asked - including when the answer is "none".
+        hasDiscovered = true
+        guard !dormantBefore.isEmpty else { return }
+        LoginStatusStore.shared.loginLanded(
+            dormantBefore.intersection(accounts.lazy.filter { !$0.isDormant }.map(\.id)))
+    }
+
+    /// Every account on this machine, discovered on the spot while the first refresh has not
+    /// filled the list yet. For the launch flags, which fire from `applicationDidFinishLaunching`
+    /// with that refresh only just queued: reading the empty list there is how the expiry flag's
+    /// sample alert ended up naming no account at all. Discovery is local and cheap - the same
+    /// pass the config-dir watcher runs on every event.
+    func discoveredAccountsNow() -> [ProviderAccount] {
+        guard discoveredAccounts.isEmpty else { return discoveredAccounts }
+        return KnownAccountsStore.shared
+            .reconcile(discovered: KnownAccountsStore.discoverClearingMarkers(providers)).all
+    }
+
+    /// …and the same pass ADOPTED, for a surface that opens before the first refresh has produced
+    /// one: the Settings account list, which draws from nothing else. Without it that list waits
+    /// out every provider CLI the first round polls (10-20s on the relaunch an update performs)
+    /// before it can show a single account.
+    ///
+    /// Once per launch (the flag it sets is what stops the second caller), and never on a demo
+    /// instance: a screenshot run does not discover at all - its refresh returns before the pass -
+    /// and must not start reading this machine's real config homes because a pane opened.
+    func ensureDiscovered() {
+        guard !hasDiscovered, !DemoUsage.isActive else { return }
+        adoptDiscovered(discoveredAccountsNow())
+    }
+
+    /// Rebuild the background timer from the current interval setting.
+    func rescheduleRefresh() {
+        scheduleTimer()
+    }
+
+    private func scheduleTimer() {
+        timer?.cancel()
+        let interval = TimeInterval(max(1, SettingsStore.shared.refreshIntervalMinutes) * 60)
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + interval, repeating: interval)
+        timer.setEventHandler { [weak self] in
+            Task { @MainActor in
+                self?.mainTimerNextFire = Date().addingTimeInterval(interval)
+                await self?.refresh(userInitiated: false, trigger: .timer)
+            }
+        }
+        timer.resume()
+        self.timer = timer
+        mainTimerNextFire = Date().addingTimeInterval(interval)
+    }
+
+    // MARK: Fast retry after a failed poll (UsageStore+FailureRetry.swift)
+
+    var retryTimer: DispatchSourceTimer?
+    var retryDelay: TimeInterval = 60
+    var retryFireAt: Date?
+
+    /// Optimistically drop rows the user just switched off (an account or a whole provider) so
+    /// every surface reacts instantly; the refresh right behind converges the snapshot too.
+    func hideAccounts(where predicate: (AccountUsage) -> Bool) {
+        let filtered = accounts.filter { !predicate($0) }
+        guard filtered.count != accounts.count else { return }
+        accounts = filtered
+        onChange?()
+    }
+
+    /// Instantly restore the last-good rows of a just re-enabled provider, so Settings doesn't sit
+    /// on a blank group while the CLIs re-fetch (10-20s). The refresh right behind this call
+    /// overwrites them with live data.
+    func showCachedAccounts(providerID: String) {
+        let cached = lastGood.values.filter { usage in
+            usage.providerID == providerID
+                && SettingsStore.shared.isAccountEnabled(usage.id)
+                && !accounts.contains { $0.id == usage.id }
+        }
+        guard !cached.isEmpty else { return }
+        accounts = (accounts + cached).sorted {
+            ($0.providerID, $0.accountLabel) < ($1.providerID, $1.accountLabel)
+        }
+        onChange?()
+    }
+
+    /// A refresh requested while one is in flight runs right after it (coalesced to one). Without
+    /// this, rapidly re-enabling a provider lost its follow-up fetch: the in-flight refresh (started
+    /// while the provider was still off) finished, wiped the provider's rows, and nothing re-fetched
+    /// until the next timer tick.
+    private var refreshQueued = false
+    /// …and the coalesced refresh inherits the strongest reason any of the merged ones had. A
+    /// renewal that lands while a poll is running asks for a USER-INITIATED refresh, which is what
+    /// makes the login probe skip its five-minute throttle; dropping the flag here left a
+    /// just-renewed account wearing its red "Login expired" chip for the rest of that interval.
+    private var queuedUserInitiated = false
+
+    /// When a click last forced a full read (`ProbeCadence.clickFloor`).
+    @ObservationIgnored private var lastClickForcedAt: Date?
+
+    /// The refresh button and the card's Retry. A full read at most once a minute; a click inside
+    /// that runs an ordinary round, so the spinner still answers it.
+    func refreshClicked(now: Date = Date()) async {
+        let forced = ProbeCadence.clickForcesRead(lastForced: lastClickForcedAt, now: now)
+        if forced { lastClickForcedAt = now }
+        await refresh(userInitiated: forced, trigger: .user)
+    }
+
+    func refresh(userInitiated: Bool = false, trigger: RefreshTrigger? = nil) async {
+        guard !isRefreshing else {
+            refreshQueued = true
+            queuedUserInitiated = queuedUserInitiated || userInitiated
+            return
+        }
+        // Screenshot fixtures replace the whole poll: no CLI runs, no snapshot write (so a demo
+        // instance can't steer the `usagebar` CLI), no retry ladder.
+        if DemoUsage.isActive {
+            accounts = demoSharedLogin(DemoUsage.accounts())
+            fleetRates = DemoUsage.fleetRates
+            advisorReadings = DemoUsage.advisorReadings
+            // This branch REPLACES the discovery pass, so a demo run's answer about which accounts
+            // exist is as final as it will ever get. Saying so keeps the Settings list from sitting
+            // on a "still looking" placeholder that nothing is ever going to resolve - and the
+            // fixtures answer it, rather than an empty list, because the Settings account list draws
+            // from existence rather than from usage and would otherwise be the one pane a capture
+            // cannot photograph. Assigned rather than adopted: `adoptDiscovered` is the real pass's
+            // bookkeeping (dormancy notices, removal rounds), and none of it is about fixtures.
+            discoveredAccounts = DemoUsage.discoveredAccounts()
+            hasDiscovered = true
+            lastRefreshedAt = Date()
+            lastSuccessfulRefreshAt = lastRefreshedAt
+            onChange?()
+            return
+        }
+        isRefreshing = true
+        let startedAt = Date()
+        landedRows = [:]
+        // Everything below is captured BEFORE the awaits, so a removal landing mid-round has to be
+        // filtered back out at the commit (AccountRemovals.swift).
+        let round = removals.beginRound()
+        let epochAtStart = discoveryEpoch
+        onChange?()
+
+        let enabled = SettingsStore.shared.enabledProviders
+        var results: [AccountUsage] = []
+        var allDiscovered: [ProviderAccount] = []
+        var launchHomes: [String: String] = [:]   // account id → CLI config home, for the snapshot
+        var shared = SharedLoginRound()           // homes on another home's login (#6)
+        var rounds: [ProbeCadence.ProviderRound] = []
+        for provider in providers {
+            // Off the main thread: the home listing and Keychain probes hung the app (a field report).
+            let found = await Task.detached(priority: .utility) {
+                KnownAccountsStore.discoverClearingMarkers([provider])
+            }.value
+            allDiscovered.append(contentsOf: found)
+            guard enabled.contains(provider.id) else { continue }
+            // Disabled accounts are discovered (Settings shows them) but never polled - and never
+            // reach the snapshot, so the `usagebar` CLI skips them too.
+            var active = found.filter { SettingsStore.shared.isAccountEnabled($0.id) }
+            // Two homes on one Claude login are one account (#6, UsageStore+UnpolledRows.swift).
+            if provider.id == ClaudeAccounts.providerID { (active, shared) = await splitSharedLogins(active) }
+            for account in active {
+                // The LAUNCHABLE home: this map is what the `usagebar` CLI picks and execs from, so a
+                // signed-out account must not reach it even if it kept a home to be renewed at.
+                if let home = account.launchableHome { launchHomes[account.id] = home }
+            }
+            // Claude one probe at a time on its own cadence (a second beside a slow one), other
+            // providers concurrently.
+            rounds.append(.init(provider: provider, active: active,
+                                serial: provider.id == ClaudeAccounts.providerID))
+        }
+        // Every provider at once, each row on screen the moment its probe returns (B-1745): Codex no
+        // longer waits out the Claude accounts, and a slow Claude account holds only its own row:
+        // the next one starts beside it once it is slow (`ProbeCadence.lanes`).
+        results = await ProbeCadence.fetchRounds(rounds, previous: accounts, userInitiated: userInitiated,
+                                                 onResult: { [weak self] in await self?.landRow($0, round: round) })
+        // An account the user removed while this round was out fetching: its home went to the Trash
+        // after the discovery above read it, so everything this round holds about it is an echo.
+        let removed = removals.removedIDs(inRound: round)
+        if !removed.isEmpty {
+            allDiscovered.removeAll { removed.contains($0.id) }
+            results.removeAll { removed.contains($0.id) }
+            launchHomes = launchHomes.filter { !removed.contains($0.key) }
+            shared.homes.removeAll { removed.contains($0.account.id) }
+        }
+        // An account that signed OUT stops being discoverable at all - Claude's logout deletes the
+        // Keychain item, Codex's deletes auth.json - so discovery alone drops it from the app at
+        // the exact moment the expiry alert is about it. The remembered accounts whose home is
+        // still on disk come back here as dormant ones: listed, probed, renewable. A home that is
+        // GONE is a removal instead, and is forgotten (KnownAccounts.swift).
+        let (known, dormant) = KnownAccountsStore.shared.reconcile(discovered: allDiscovered)
+        // A discovery adopted MID-ROUND (a login just seen) is newer than this round's pass, which
+        // listed Claude before polling it; adopting ours would drop that account again (B-1033).
+        if discoveryEpoch == epochAtStart { adoptDiscovered(known) }
+        // A pin on an account that has signed out must stop steering launches: the launch home is
+        // denormalized into the policy file the `usagebar` CLI reads, and nothing there asks whether
+        // the login is still good. Every dormant account, not just the enabled ones - a switched-off
+        // account is not a launchable one either.
+        let dormantIDs = Set(dormant.map(\.id))
+        LaunchPolicyStore.shared.releasePinnedHome(dormant: dormantIDs)
+        // Discovery is the witness a settling renewal is waiting for: an account that is no longer
+        // dormant is signed in again, so the "renewing" it is still showing everywhere ends here
+        // rather than running out its deadline (RenewLoginStore.discoveryReported).
+        RenewLoginStore.shared.discoveryReported(dormant: dormantIDs)
+
+        // The enablement set may have changed while the CLIs ran: keep rows of providers enabled
+        // NOW that this round didn't fetch (the queued follow-up replaces them with live data),
+        // and drop rows of providers disabled mid-flight.
+        let enabledNow = SettingsStore.shared.enabledProviders
+        // Dormant and shared-login homes get rows rather than fetches (UsageStore+UnpolledRows.swift).
+        for id in shared.kept.keys { lastGood[id] = nil; failureStreak[id] = nil }
+        let merged = results.map { landedRows[$0.id] ?? applyLastGood($0) }
+            + dormantRows(dormant, enabledProviders: enabledNow).map(applyLastGood)
+            + sharedLoginRows(shared, enabledProviders: enabledNow)
+        let carried = carriedAccountRows(previous: accounts, fetched: Set(merged.map(\.id)),
+                                         known: Set(known.map(\.id)), enabledProviders: enabledNow)
+            .map { Self.markHeldOver($0, now: Date()) }
+        accounts = (merged + carried)
+            .filter { enabledNow.contains($0.providerID) && SettingsStore.shared.isAccountEnabled($0.id) }
+            .map { ProbeCadence.overlay($0, fact: readLiveRateFact(accountID: $0.id), now: Date()) }
+            .sorted { ($0.providerID, $0.accountLabel) < ($1.providerID, $1.accountLabel) }
+        persistLastGood(lastGood, known: known)
+        rememberIdentities(merged, round: shared)
+        isRefreshing = false
+        logRound(trigger ?? (userInitiated ? .user : .other), since: startedAt, results: results)
+        lastRefreshedAt = Date()
+        if results.contains(where: { $0.error == nil }) {
+            lastSuccessfulRefreshAt = Date()
+        }
+        onChange?()
+        // Publish the non-secret snapshot the `usagebar` CLI reads to pick a launch account.
+        // Publish DISPLAY labels (the user's nicknames, default names as fallback) so the CLI
+        // side - status line, pick messages, usagebar status - speaks the same names as the panel.
+        let labeled = accounts.map { usage in
+            var copy = usage
+            copy.accountLabel = SettingsStore.shared.displayLabel(accountID: usage.id,
+                                                                  fallback: usage.accountLabel)
+            return copy
+        }
+        // A build nobody installed never publishes: one poller owns the shared ~/.usagebar files, and
+        // it is the installed release app. The dev variant is the obvious case; a locally built
+        // Release is the one that hurt, because it wears the release bundle id and so wrote a second,
+        // older set of numbers into the same snapshot the CLI picks accounts from (`isUnshipped`).
+        if BuildVariant.publishesOwnState {
+            lastPublishedAccounts = labeled
+            lastLaunchHomes = launchHomes
+            republishSnapshot()
+            // Sample fresh results into the burn-rate history (change-only, off-main-queue).
+            UsageHistory.shared.record(results)
+            // Alert when the claude flagship fleet pool crosses the low/dry tripwire. Installed
+            // app only: a build nobody installed never owns the shared surfaces, so it never alerts.
+            // BRIM-GATE: UsageBar owns user notifications while UsageBar mirrors it.
+            if BrimFeatures.userNotifications {
+                notifyFlagshipDryness(accounts: labeled)
+                // And when a banked reset is worth spending: the user has to REMEMBER to look at a credit
+                // otherwise. Same rule as every other surface here - it names the account, it never redeems.
+                ResetHintNotifier.shared.evaluate(accounts: labeled)
+                // BRIM-GATE: browser delegation and its prompts remain disabled.
+                if BrimFeatures.chromeStep { ChromeSettingNotifier.shared.evaluate(accounts: labeled) }
+                ClearanceIdleNotifier.shared.evaluate(accounts: labeled)
+            }
+        }
+        // And the morning schedule, which reads this round's windows to decide whether any account
+        // still needs its 5-hour window opened (EarlyStartStore says why the decision rides the
+        // refresh rather than a timer). OUTSIDE the installed-app gate above because it keeps its
+        // own, one clause wider: a dev build pointed at a stand-in CLI spends nothing and is how
+        // the whole path gets reviewed (`EarlyStartStore.mayRun`).
+        EarlyStartStore.shared.evaluate(accounts: labeled, launchHomes: launchHomes)
+        // And each account's weekly session-limit reset, re-read on the same cycle rather than per
+        // redraw: supervisors write those records and this app only reads them (LimitResetStore).
+        LimitResetStore.shared.refresh()
+        // And the token scan behind ~/.usagebar/project-cost.json, throttled (TokenScanCadence).
+        TokenStatsStore.shared.refreshIfStale()
+        let now = Date()
+        let planKeys = FleetMath.planTiers(accounts: labeled).mapValues(\.key) // split gauges' plans
+        UsageHistory.shared.samples(
+            since: now.addingTimeInterval(-FleetForecast.lookbackHours * 3_600)) { samples in
+            let rates = FleetForecast.weeklyRates(samples: samples, now: now, planOf: { planKeys[$0] })
+            Task { @MainActor in
+                UsageStore.shared.fleetRates = rates
+                UsageStore.shared.republishSnapshot() // the snapshot's fleet forecast reads these rates
+            }
+        }
+        // And the usage advisor, which needs a wider window than the pace forecast above (weekly
+        // demand needs weeks, not hours) and so reads the history for itself (UsageStoreAdvisor.swift).
+        recomputeAdvisor(known: known, now: now)
+        // Ask the provider CLIs whether each account is still signed in. Detached rather than
+        // awaited: it throttles itself to its own (much longer) interval, and a refresh must not
+        // hold the snapshot behind a question about credentials. Only the accounts actually being
+        // polled are asked - a switched-off account is not one the user wants processes spawned for.
+        // `known` (every account that EXISTS, dormant ones included) goes along separately because
+        // the dedup state is pruned against it and must not shrink when an account is switched off
+        // - see `LoginStatusStore.announce`.
+        let polled = known.filter {
+            enabledNow.contains($0.providerID) && SettingsStore.shared.isAccountEnabled($0.id)
+        }
+        Task { await LoginStatusStore.shared.evaluate(accounts: polled,
+                                                      known: Set(known.map(\.id)),
+                                                      userInitiated: userInitiated) }
+        // The Console's organization credits ride the same cycle. Detached for the same reason as
+        // the login check: a slow Console must not hold the snapshot. It skips itself when the user
+        // never connected, and throttles its own repeats (ConsoleCreditsStore.minimumInterval, per account).
+        let claudeIDs = known.filter { $0.providerID == ClaudeAccounts.providerID }.map(\.id)
+        Task { await ConsoleCreditsStore.shared.refresh(accountIDs: claudeIDs, force: userInitiated) }
+        // Any failed account → probe again soon (backoff) instead of waiting the full interval.
+        scheduleRetryIfNeeded(anyFailure: results.contains { $0.error != nil },
+                              soon: retriesSoon(results, streaks: failureStreak))
+        // This round has now published a world without the removed accounts, so the tombstones that
+        // predate it are spent - and a config home recreated under the same name is a new account
+        // again rather than one this store refuses to show.
+        removals.endRound(round)
+
+        if refreshQueued {
+            refreshQueued = false
+            let inherited = queuedUserInitiated
+            queuedUserInitiated = false
+            Task { await refresh(userInitiated: inherited, trigger: .queued) }
+        }
+    }
+
+    /// Inputs of the last published snapshot, so a settings flip (display mode, status line
+    /// options) can rewrite ~/.usagebar/snapshot.json immediately WITHOUT refetching usage. Read by
+    /// the publishing half of the store (UsageStorePublishing.swift), written only here.
+    private(set) var lastPublishedAccounts: [AccountUsage] = []
+    private(set) var lastLaunchHomes: [String: String] = [:]
+
+    /// Accounts the user removed, and the rounds that must not resurrect them (AccountRemovals).
+    private var removals = AccountRemovals()
+
+    /// Forget everything this store remembers about one account, because the user removed it
+    /// (RemoveAccountAction). Every cache below is keyed by an id that a recreated `~/.claude3`
+    /// takes again, so a first fetch failing in the NEW account's home would otherwise show the
+    /// previous account's numbers, publish them, and let smart pick route on them.
+    func forgetAccount(_ accountID: String) {
+        lastGood[accountID] = nil
+        persistLastGood(lastGood, known: nil)
+        failureStreak[accountID] = nil
+        arrivedThisLaunch.remove(accountID)
+        lastPublishedAccounts.removeAll { $0.id == accountID }
+        lastLaunchHomes[accountID] = nil
+        removals.remove(accountID)
+        LoginStatusStore.shared.forgetIdentity(accountID: accountID)
+        hideAccounts { $0.id == accountID }
+        // The snapshot the CLI launches from still names this account until the refresh behind the
+        // removal lands - which is 10-20 seconds of `usagebar` being able to exec into the Trash.
+        republishSnapshot()
+    }
+
+    /// Last successful snapshot per account, so a failed refresh can keep showing the numbers.
+    private var lastGood: [String: AccountUsage] = [:]
+    /// Consecutive failed polls per account, so a single transient failure doesn't flip the badge.
+    private var failureStreak: [String: Int] = [:]
+    /// Rows this round already folded as their probes landed (`landRow`), which the commit reuses:
+    /// folding one again would count a single failure twice.
+    private var landedRows: [String: AccountUsage] = [:]
+
+    /// One probe's row on screen the moment it returns (B-1745), every other row as it was. The
+    /// snapshot the CLI reads still moves once a round, at the commit.
+    private func landRow(_ usage: AccountUsage, round: Int) {
+        guard BrimFeatures.liveProbes else { return }
+        let settings = SettingsStore.shared
+        guard !removals.removedIDs(inRound: round).contains(usage.id),
+              settings.enabledProviders.contains(usage.providerID), settings.isAccountEnabled(usage.id)
+        else { return }
+        let row = applyLastGood(usage)
+        landedRows[usage.id] = row
+        accounts = ProbeCadence.landing(row, into: accounts, fact: readLiveRateFact(accountID: row.id),
+                                        now: Date())
+        onChange?()
+    }
+
+    /// On success, record the snapshot. On a failure hand the round to `foldLastGood`
+    /// (Core/LastGoodFold.swift), which decides what the card shows and what the CLI is told: the
+    /// last-good numbers either way, flagged as held over from the first failure, and badged
+    /// "Outdated" only once the failures are sustained (≥ staleAfterFailures in a row). An account
+    /// that never succeeded reads "retrying" until bareErrorAfterFailures, then its bare error.
+    ///
+    /// The streak counters stay here because they are this store's state across rounds; the fold
+    /// itself is a function of one round, which is what lets a suite assert it (tests/lastgood).
+    /// A row carried for an account inside a server-stated 429 wait (`ProbeCadence.UsageReadHold`)
+    /// is its last reading, not a fresh one. After a restart the seed comes from the last-good cache,
+    /// which holds the numbers without the failure, so the card showed an hour-old reading with
+    /// nothing saying so (2026-11-17, Claude 2). The row says it could not refresh until the wait ends.
+    static func markHeldOver(_ row: AccountUsage, now: Date) -> AccountUsage {
+        guard !row.lastRefreshFailed, row.error == nil,
+              ProbeCadence.UsageReadHold.shared.firmUntil(row.id, now: now) != nil else { return row }
+        var held = row
+        held.lastRefreshFailed = true
+        held.lastRefreshError = L("Claude is limiting usage reads: showing the last reading")
+        held.lastRefreshErrorDetail = L("Anthropic limits how often this account's usage is read and said when to ask again. UsageBar waits until then, manual refreshes included, and keeps the last reading. Your Claude sessions are not affected.")
+        return held
+    }
+
+    private func applyLastGood(_ usage: AccountUsage) -> AccountUsage {
+        if usage.error == nil {
+            failureStreak[usage.id] = 0
+            let fresh = foldLastGood(usage, previous: nil, failureStreak: 0,
+                                     staleAfterFailures: LastGoodThresholds.staleAfterFailures,
+                                     bareErrorAfterFailures: LastGoodThresholds.bareErrorAfterFailures)
+            lastGood[usage.id] = fresh
+            return fresh
+        }
+        let streak = (failureStreak[usage.id] ?? 0) + 1
+        failureStreak[usage.id] = streak
+        return foldLastGood(usage, previous: lastGood[usage.id], failureStreak: streak,
+                            staleAfterFailures: LastGoodThresholds.staleAfterFailures,
+                            bareErrorAfterFailures: LastGoodThresholds.bareErrorAfterFailures)
+    }
+}

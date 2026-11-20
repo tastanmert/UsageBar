@@ -1,0 +1,480 @@
+import Foundation
+
+// `usagebar completion zsh` - the shell completion script, and the third way into what this binary
+// can do. `usagebar help` answers somebody who already knows there is a list; the line at the foot of
+// `usagebar status` tells them there is one; this one answers the hand that never asks, because the
+// list arrives at the cursor of the command they were already typing.
+//
+// A CONSTANT RATHER THAN A `print` IN THE DISPATCH, for the reason Usage.swift gives for the usage
+// text: main.swift is top-level code that execs on nearly every path, so nothing in it can be
+// linked into an assertion harness. What the tests pin (tests/statusline) is that this script and
+// the dispatch agree about which commands exist, because that is the one way this file goes wrong:
+// a command renamed or removed while the completion goes on offering it, which is worse than
+// offering nothing at all - a suggested word that the binary answers with usage and exit 2.
+//
+// The lists below are STATIC where the answer belongs to this binary (its subcommands, its own
+// flags, the names a launch axis takes) and ASKED where the answer belongs to this machine (which
+// accounts exist, which worktrees exist). The static half is interpolated from the same constants
+// the commands themselves validate against, so there is no second copy to drift.
+/// The marker line becomes the commands a private build adds, or nothing.
+var usageBarCompletionZsh: String {
+    usageBarCompletionZshTemplate.replacingOccurrences(of: "    @OVERLAY_COMMANDS@\n", with: OverlayCLI.completionLines)
+}
+
+let usageBarCompletionZshTemplate = #"""
+#compdef usagebar
+
+# usagebar-completion: tab completion for usagebar, printed by `\#(BrandPaths.cliName) completion zsh`. Installing the
+# command line tool (UsageBar.app, Settings -> Integrations) writes this file into the zsh
+# site-functions directory beside it, and removing that command deletes it again; the marker on this
+# line is how the app tells a file it wrote from one somebody else put there. Yours to delete.
+#
+# By hand, either way:
+#
+#   eval "$(\#(BrandPaths.cliName) completion zsh)"                 in ~/.zshrc, after compinit has run
+#   \#(BrandPaths.cliName) completion zsh > "${fpath[1]}/_usagebar"    picked up by compinit through the tag above
+#
+# EVERYTHING ASKED OF THE MACHINE DEGRADES TO NO SUGGESTIONS, never to an error: a Tab press lands
+# in the middle of a line somebody is typing, so a helper that prints a diagnostic there has broken
+# the thing it was helping with. The binary it would ask can be absent from PATH, mid-update, or
+# newer than this script, and a stale copy of this file can outlive the binary entirely.
+
+_usagebar_bin() {
+  # The binary BEING COMPLETED rather than whatever `usagebar` in PATH resolves to: somebody
+  # completing /opt/usagebar/usagebar has to be answered by that one. `_usagebar` captures the command word
+  # before `_arguments` shifts `words` out from under these helpers.
+  local bin=${_usagebar_command:-usagebar}
+  command -v -- "$bin" > /dev/null 2>&1 || return 1
+  print -r -- "$bin"
+}
+
+_usagebar_accounts() {
+  # $1 is the provider whose accounts may be named HERE. It is not optional in spirit: `\#(BrandPaths.cliName) claude
+  # --account` offering a Codex account offers a word `accountMatching` refuses by construction
+  # (AccountPick.swift filters on the provider first), and an account you cannot pick is worse than
+  # one you had to type out.
+  #
+  # ASKED OF THE BINARY RATHER THAN PARSED OUT OF `status --json`. A label is free text somebody
+  # typed into the rename popover, so it can carry a quote or a backslash, which `JSONEncoder` then
+  # escapes; a shell reader that stops at the next `"` hands the cursor a name no account answers to.
+  # The binary already owns the matcher that decides which names resolve, so it says which words are
+  # answers and this asks. The cost is that script and binary must be of one version, which they are:
+  # this script comes out of that binary, and a mismatch prints nothing rather than the wrong thing.
+  local bin provider=${1:-claude}
+  local -a names
+  bin=$(_usagebar_bin) || return 0
+  names=(${(f)"$("$bin" completion data accounts $provider 2>/dev/null)"})
+  names=(${(M)names:#?*})
+  (( $#names )) || return 0
+  _wanted accounts expl account compadd -a names
+}
+
+_usagebar_worktrees() {
+  # The branch column of `\#(BrandPaths.cliName) worktree list`, which is the machine-readable report and a stable
+  # stdout contract. Outside a git repository it exits 1 with nothing on stdout, which is already
+  # the no-suggestions case.
+  local bin line tab
+  local -a lines branches
+  bin=$(_usagebar_bin) || return 0
+  tab=$'\t'
+  lines=(${(f)"$("$bin" worktree list 2>/dev/null)"})
+  for line in $lines; do
+    branches+=("${line%%$tab*}")
+  done
+  branches=(${(M)branches:#?*})
+  (( $#branches )) || return 0
+  _wanted worktrees expl worktree compadd -a branches
+}
+
+# SUGGESTIONS, NEVER A GATE: the model axis is open (anything the provider accepts is legal, from a
+# dated snapshot id to a Bedrock arn), so these are the aliases the pickers offer, and typing past
+# them stays legal. The effort axis is the closed one, and this is the list the CLI validates
+# against.
+_usagebar_models() {
+  local -a models
+  models=(\#(claudeModelAliases.joined(separator: " ")))
+  _wanted models expl model compadd -a models
+}
+
+_usagebar_model_targets() {
+  # `\#(BrandPaths.cliName) model` takes one word the launch axis does not: `auto`, which releases the pin rather
+  # than naming a model. A SECOND FUNCTION rather than one taking the extra word as an argument:
+  # `_arguments` calls an action function with compadd options of its own in `$@`, so a list built
+  # from `$@` offers `-J` and `-default-` at the cursor (seen, at the cursor, 2026-08-11).
+  local -a targets
+  targets=(\#(claudeModelAliases.joined(separator: " ")) auto)
+  _wanted models expl model compadd -a targets
+}
+
+_usagebar_efforts() {
+  local -a efforts
+  efforts=(\#(claudeEffortNames().joined(separator: " ")))
+  _wanted efforts expl effort compadd -a efforts
+}
+
+_usagebar_providers() {
+  local -a ids
+  ids=(\#(providers.map(\.id).joined(separator: " ")))
+  _wanted providers expl provider compadd -a ids
+}
+
+_usagebar_teach() {
+  # The flags a command has, shown as a group of their own with what each one is for.
+  #
+  # WHY THIS EXISTS RATHER THAN LEAVING IT TO `_arguments`: at a word that a rest-args spec can also
+  # match, zsh stops offering option names, so `\#(BrandPaths.cliName) claude <TAB>` answered with a listing of the
+  # current directory. Everything the command can do was one keystroke away and invisible, and -w -
+  # the reason most people come to this binary - was reachable only by already knowing it was there
+  # (Albert, 2026-08-11: "I expect \#(BrandPaths.cliName) claude to tell me what I can do, especially worktrees").
+  #
+  # BUILT FROM THE VERY SPEC STRINGS `_arguments` IS GIVEN, handed in by the caller, so what is
+  # taught cannot drift from what works: a flag renamed in the spec is renamed in the lesson.
+  # TWO SPELLINGS OF ONE FLAG ARE ONE LESSON. `-w` and `--worktree` reach this function as a spec
+  # each (the caller writes them as one brace expansion), carrying the same sentence, and listing
+  # both was the same sentence twice in a lesson five lines long (Albert, seeing it, 2026-08-11).
+  # They are recognised by the exclusion group every alias set already carries for `_arguments`,
+  # so nothing has to be declared twice to say they belong together. Shown `-w, --worktree` the way
+  # gh and docker show theirs: the spelling you type first, the one that says what it means second.
+  local label=$1 spec group name desc alias
+  local -a names displays seen aliases short long
+  shift
+  for spec in "$@"; do
+    group=''
+    if [[ $spec == \(*\)* ]]; then
+      group=${${spec#\(}%%\)*}
+      spec=${spec#\(*\)}
+    fi
+    name=${spec%%\[*}
+    # Anything without a description is not a lesson: positional specs and bare flags are skipped
+    # rather than listed with an empty explanation.
+    [[ $name == -* && $name != $spec ]] || continue
+    desc=${spec#*\[}
+    desc=${desc%%\]*}
+    # ALREADY ON THE LINE, UNDER ANY OF ITS SPELLINGS: not a lesson any more. `_arguments` drops a
+    # flag once it has been used and drops a whole exclusion group with it, and this path went round
+    # that, so a second `--account` was offered - and the launcher strips only the FIRST one
+    # (main.swift), so the extra reaches the child (review, 2026-08-11).
+    for alias in ${(z)group} $name; do
+      (( ${words[(Ie)$alias]} )) && continue 2
+    done
+    # A group that does not contain this flag is an exclusion of OTHER flags, not an alias set.
+    if [[ -n $group ]] && (( ${${(z)group}[(Ie)$name]} )); then
+      (( ${seen[(Ie)$group]} )) && continue
+      seen+=("$group")
+      short=()
+      long=()
+      for alias in ${(z)group}; do
+        [[ $alias == --* ]] && long+=("$alias") || short+=("$alias")
+      done
+      aliases=($short $long)
+      # The long spelling is what gets inserted: a line somebody reads back a week later says what
+      # it does, and both spellings mean the same thing to the binary.
+      names+=("${long[1]:-${short[1]}}")
+      displays+=("${(j:, :)aliases}  --  $desc")
+      continue
+    fi
+    names+=("$name")
+    displays+=("$name  --  $desc")
+  done
+  (( $#names )) || return 0
+  _wanted usagebar-options expl $label compadd -d displays -a names
+}
+
+_usagebar_rest() {
+  # Teach at an empty word, and offer nothing at all once the word has a shape: `_arguments` is
+  # already answering anything that starts with a dash, and the rest of a launch line is a prompt or
+  # a flag belonging to the child CLI, which this script does not pretend to know.
+  #
+  # Launch prompts do not get file completion. Explicit harness and inbox path options have
+  # their own file completers in HarnessCompletion.swift.
+  #
+  # AN EMPTY WORD IS NOT ENOUGH TO MEAN "WHAT IS THERE". It is also what the word after somebody
+  # else's flag looks like while it waits for a value, and the lesson is not just shown but INSERTED
+  # (the menu below), so `\#(BrandPaths.cliName) claude --add-dir <Tab>` handed the child `--add-dir --account` and a
+  # launch that fails for want of a directory (review, 2026-08-11).
+  #
+  # THE TEST IS A HEURISTIC AND WORTH NAMING AS ONE: the nearest flag to the LEFT decides, and it
+  # decides on one question - is it ours. Ours are fully described to `_arguments`, which binds each
+  # one's value position itself, so reaching this function at all means whatever it wanted has been
+  # given and the position is free. Anything else is a flag belonging to the child CLI, whose arity
+  # this script does not know, so we stay quiet until one of ours ends the run. It is deliberately
+  # biased toward silence, because the two mistakes are not the same size: a lesson withheld costs a
+  # keystroke, a lesson inserted costs a launch.
+  #
+  # THE WHOLE RUN OF ITS VALUES, not just the first. A child flag can take several words: claude's
+  # `--add-dir a b` and `--allowedTools Read Write` keep consuming until the next flag
+  # (LaunchFlags.swift lists eleven as variadic). Looking only at the word immediately before the
+  # cursor made the second value a place to teach, so `\#(BrandPaths.cliName) claude --add-dir one <TAB>` inserted
+  # `--account` into the middle of the directory list and truncated it (review, 2026-08-11).
+  #
+  # THE NAMES ARE READ OFF THE SAME SPECS `_arguments` IS GIVEN, so they cannot drift from what is
+  # actually bound: a flag renamed there is renamed here, and one added there is recognised here
+  # without anything being written down twice.
+  [[ -n ${words[CURRENT]} ]] && return 0
+  local previous='' spec ours=0
+  integer i
+  for (( i = CURRENT - 1; i > 1; i-- )); do
+    [[ ${words[i]} == -* ]] && { previous=${words[i]}; break }
+  done
+  if [[ -n $previous ]]; then
+    for spec in $_usagebar_specs; do
+      spec=${spec#\(*\)}
+      [[ ${spec%%\[*} == "$previous" ]] && { ours=1; break }
+    done
+    (( ours )) || return 0
+  fi
+  # `_usagebar_specs` is the caller's array, reached the way this whole system reaches `words` and
+  # `CURRENT`: an action runs inside the function that called `_arguments`.
+  _usagebar_teach "launch option" $_usagebar_specs
+  return 0
+}
+
+_usagebar_menu_wanted() {
+  # Whether the user's `menu` style asks for a menu UNCONDITIONALLY, which is the only answer that
+  # lets the line below force one: forcing over any other value is overriding them, and this whole
+  # style block exists to avoid that.
+  #
+  # THE VALUE IS A LIST, NOT A WORD, and zsh's own vocabulary for it is wider than the four words
+  # this used to compare against (man zshcompsys, `menu`): `no` `false` `off` `0` turn it off, their
+  # `=num` forms turn it off above a match count, `yes` `true` `on` `1` turn it on and have the same
+  # `=num` and `=long` forms, and `select` `no-select` `interactive` `search` may sit alongside any
+  # of them. So `menu no=1` and `menu no no-select` are both a user saying no, and both got a menu
+  # anyway (review, 2026-08-11).
+  #
+  # EVERY CONDITIONAL FORM IS A REFUSAL HERE, including the `yes=num` ones. This runs before any
+  # match exists (it is `_usagebar` itself, above `_arguments`), so the count those conditions are about
+  # is not knowable at this point. Refusing to force leaves the user's own setting to do exactly what
+  # it says on the press that follows; forcing on a guess is the one outcome that cannot be undone.
+  local word
+  integer wanted=0
+  for word in ${=${1:l}}; do
+    case $word in
+      (no|false|off|0) return 1 ;;
+      (no=*|false=*|off=*|0=*) return 1 ;;
+      (yes=*|true=*|on=*|1=*) return 1 ;;
+      (yes|true|on|1|select) wanted=1 ;;
+    esac
+  done
+  return $(( ! wanted ))
+}
+
+_usagebar_model_effort() {
+  # `auto` releases the pin and takes nothing after it: `modelIntent` returns nil for two words when
+  # either is the release, so `\#(BrandPaths.cliName) model auto high` is usage and exit 2 (run, 2026-08-11). Both
+  # spellings, because both are accepted (`auto` and `--auto`, ModelCommand.swift).
+  [[ ${(L)words[2]} == (auto|--auto) ]] && return 0
+  _usagebar_efforts
+}
+
+\#(usageBarRepoCompletionZsh)
+
+\#(usageBarHarnessCompletionZsh)
+_usagebar() {
+  local curcontext="$curcontext" state line
+  # Captured before `_arguments` rewrites `words`, because every helper that asks this machine a
+  # question has to ask THIS binary (see `_usagebar_bin`).
+  local _usagebar_command=${words[1]}
+  # How this command's answers are PRESENTED: each kind of answer in its own titled group, and an
+  # arrow-key menu to walk them. Scoped to `usagebar`, so these are statements about this completion
+  # rather than about the user's shell.
+  #
+  # ASKED BEFORE SET, and asked with `-s` rather than `-t`: `-t` tests whether a style is TRUE, and
+  # `menu select` is not a boolean, so a `-t` probe reads "unset" for somebody who set `menu no` on
+  # purpose and would then have the menu forced back on. `-s` answers the question actually being
+  # asked, which is whether anything the user wrote already applies here.
+  zmodload -i zsh/complist 2>/dev/null
+  local _usagebar_style _usagebar_menu
+  # The menu's answer is kept, because one line below it decides more than a style does.
+  zstyle -s ':completion:*:*:usagebar:*' menu _usagebar_menu \
+    || { zstyle ':completion:*:*:usagebar:*' menu select; _usagebar_menu=select }
+  zstyle -s ':completion:*:*:usagebar:*' group-name _usagebar_style \
+    || zstyle ':completion:*:*:usagebar:*' group-name ''
+  zstyle -s ':completion:*:*:usagebar:*:descriptions' format _usagebar_style \
+    || zstyle ':completion:*:*:usagebar:*:descriptions' format '%B%d%b'
+  # AND SHOW IT ON THE PRESS THAT ASKED. At an empty word there is no prefix to grow, so zsh grows
+  # the longest common one instead and waits: with the file fallback gone every candidate here
+  # starts with a dash, so Tab inserted "-" and displayed nothing - the same "it told me nothing"
+  # this whole change is about. Asked for only where the word is empty, which is the press that
+  # means "what is there"; once something is typed, the ordinary prefix behaviour is what a person
+  # is expecting.
+  #
+  # AND ONLY WHERE THE MENU IS ACTUALLY WANTED. This line is the one that decides, so respecting the
+  # user's preference in the zstyle above and then forcing the behaviour here was respecting nothing
+  # at all: `menu no` kept its value and got a menu anyway (review, 2026-08-11). Read off the same
+  # answer the probe above already has, so there is one judgement rather than two that can disagree.
+  # Somebody who turned the menu off gets their shell's ordinary behaviour here and nothing forced:
+  # the common prefix grows and the list arrives on the next press, exactly as it does for every
+  # other command they complete. (A `compstate[list]=list` to show it a press earlier was tried and
+  # dropped: `_main_complete` settles that value after this runs, so the line was dead code that
+  # looked like a promise.) What counts as "off" is the whole of zsh's vocabulary for this style
+  # rather than the four words it started as (`_usagebar_menu_wanted`).
+  [[ -z ${words[CURRENT]} ]] && _usagebar_menu_wanted "$_usagebar_menu" && compstate[insert]=menu
+  local -a commands
+  commands=(
+    "claude:launch Claude Code on the account with the most headroom"
+    "codex:launch Codex on the account with the most headroom"
+    "resume:continue this directory's latest Claude session on the best account"
+    "start:launch this directory's default provider"
+    "worktree:the main repo and its worktrees, and the teardown of a merged one"
+    "project:declare what this project launches, overriding the app defaults"
+    "prespawn:run your own check before every supervised claude start or restart"
+    "status:every account's remaining windows, with --json for scripts"
+    "cost:what each project's tokens cost, with --json for scripts"
+    "reap:reclaim idle build folders, worktrees and sessions under the scratch root"
+    "redeem:spend one Codex banked reset on an account"
+    "best-dir:print the export line for the best account"
+    "launch-dir:like best-dir, but honouring the app's launch policy"
+    "add:log in one more account in the next free config home"
+    "share:put an account you already have on the main account's harness"
+    "account:pin THIS session to another account, keeping the conversation"
+    "model:run THIS conversation on another model and depth, for the rest of its life"
+    "type:type a line into a supervised session, named by provider"
+    "session:send a line into a supervised session, or clear its context window"
+    "message:hand one message to a session's own native transport"
+    "chrome:run one Claude in Chrome step on the account set for it"
+    "events:read or manage the session wait event stream"
+    "harness:inspect and adapt a Claude harness to Codex"
+    "inbox:handle provider-scoped offline messages"
+    "reload:restart every supervised session at its next idle moment"
+    "keychain-repair:heal the Claude Code Keychain items UsageBar 0.64.0 left needing a dialog"
+    @OVERLAY_COMMANDS@
+    "update:check for app updates now"
+    "completion:print the shell completion script"
+    "help:print the list of commands"
+  )
+  _arguments -C '1: :->command' '*:: :->args'
+
+  case $state in
+    (command) _describe -t commands "usagebar command" commands ;;
+    (args)
+      case $words[1] in
+        # usagebar's own flags only, and the accounts of the provider being launched. Everything else
+        # on the line belongs to the child CLI, which has its own dozens and publishes them itself,
+        # so the rest of the line falls back to the default completer rather than to a hand-copied
+        # half of somebody else's flag list.
+        #
+        # THE WORKTREE ARGUMENT IS WRITTEN AS REQUIRED (`:worktree:`, not `::worktree:`) EVEN THOUGH
+        # A BARE -w IS LEGAL, and that is the whole protection: with an optional argument zsh
+        # completes this position twice, once as the worktree name and once as though the name were
+        # already given, and the union put every file in the directory among the branch names. A file
+        # name accepted there is not passed to claude at all - `extractWorktreeFlag` takes any
+        # non-flag word as a worktree NAME, so the launch goes and creates a branch and a directory
+        # called `README.md` (Worktree.swift; leak reported by review 2026-08-11, and the second
+        # parse is invisible to any guard the fallback could carry - it looks exactly like the
+        # ordinary next position). Bare `-w` still works; it is completion, not validation.
+        (claude)
+          local -a _usagebar_specs
+          _usagebar_specs=(
+            "--account[pin a specific account, by label or config-dir name]:account: _usagebar_accounts claude"
+            "(-w --worktree)"{-w,--worktree}"[launch in a git worktree: bare lists the lines this repo already has, a new name opens one]:worktree:_usagebar_worktrees"
+            "--new[start a fresh conversation, ignoring a continue-by-default setting]"
+            "--no-handoff[run unsupervised, with no automatic move when this account caps]"
+            "--no-follow[keep this session on its model when the Settings default changes]"
+            "--spend-reserve[launch on an account under its reserve]"
+          )
+          _arguments $_usagebar_specs "*: :_usagebar_rest"
+          ;;
+        (codex)
+          local -a _usagebar_specs
+          _usagebar_specs=(
+            "--account[pin a specific account, by label or config-dir name]:account: _usagebar_accounts codex"
+          )
+          _arguments $_usagebar_specs "*: :_usagebar_rest"
+          ;;
+        # Named with nothing to say, on purpose. Everything typed after `resume` is appended to the
+        # claude invocation `runResume` execs (main.swift) and usagebar has no flag of its own there,
+        # so there is nothing to suggest - and the branch says so out loud, because the last reader
+        # to find it empty filled it with file completion.
+        (resume) ;;
+        (worktree) _usagebar_worktree_command ;;
+        (project) _usagebar_project_command ;;
+        # The command itself is free text, so nothing is offered for it (no file names).
+        (prespawn) _arguments '1:subcommand:(set show clear)' '*:command: ' ;;
+        (harness) _usagebar_harness_command ;;
+        (inbox) _usagebar_inbox_command ;;
+        (status) _arguments "--json[versioned machine-readable report for scripts and hooks]" ;;
+        (cost) _arguments "--json[versioned machine-readable report for scripts]" \
+          "(--range)--days[the last N days, 1 to 90]:days:" "(--days)--range[a preset range]:range:(today 7d 30d all)" ;;
+        (reap) _arguments "--dry-run[print what would be removed, remove nothing]" \
+          "--report[daily size, growth and reclaimed space per project]" "--project[limit --report to projects containing this]:project:" ;;
+        (redeem) _arguments "--account[the Codex account, by label or config-dir name]:account: _usagebar_accounts codex" \
+          "--timeout[seconds to wait for the app's answer]:seconds:" ;;
+        # `switch` is the name `account` shipped under. Still answered here, as the dispatch still
+        # answers it, but deliberately absent from the list above: it is not the name to learn.
+        (account|switch)
+          # Claude only, as the command is: a codex launch gets a monitor that never moves the
+          # session between accounts (SwitchCommand.swift takes `providers[0]`).
+          _arguments \
+            "--auto[release the pin, following automatic account selection again]" \
+            ":account: _usagebar_accounts claude"
+          ;;
+        (model) _arguments ":model:_usagebar_model_targets" ":effort:_usagebar_model_effort" ;;
+        # The verbs and the flags only. NOTHING is offered for the text itself - it is free content
+        # typed into somebody's live conversation, and the default completer would offer the file
+        # names in this directory, every one of which is a plausible-looking thing to send by
+        # accident. The pid is likewise left blank rather than completed from the live registry: a
+        # menu of other people's sessions at this cursor is an invitation to type into one.
+        (session)
+          _arguments \
+            ":verb:(send clear)" \
+            "--session[the session to send into, by supervisor pid]:pid:"
+          ;;
+        # The same send, spelled provider-first. The provider IS completed, being a closed pair the
+        # command refuses anything else in; text, pid and project stay blank for the reasons the
+        # branch above gives, a project name being a menu of other people's sessions just as a pid
+        # would be.
+        (type|send)
+          _arguments ":provider:_usagebar_providers" \
+            "--project[the session to send into, by launch directory or project name]:project:" \
+            "--session[the session to send into, by pid]:pid:" \
+            "--no-queue[withdraw the line if it is not typed at once]"
+          ;;
+        # The native sibling, addressed the same three ways. --file and the explicit address flags
+        # are offered; the message itself, the pid and the project stay blank for the reasons the
+        # two branches above give.
+        (message)
+          _arguments ":provider:_usagebar_providers" \
+            "--file[the message to send, by absolute path]:file:_files" \
+            "--project[the session to message, by launch directory or project name]:project:" \
+            "--session[the session to message, by pid, or the transcript UUID of an explicit address]:session:" \
+            "--socket[an explicit Claude socket, by absolute path]:socket:_files" \
+            "--home[an explicit Codex home, by absolute path]:home:_files -/" \
+            "--thread[an explicit Codex thread UUID]:thread:" \
+            "--dry-run[report the address and write nothing]"
+          ;;
+        (add)
+          _arguments \
+            ":provider:_usagebar_providers" \
+            "--no-share[do not share the main account's harness and conversations]"
+          ;;
+        # The provider is the word before the account, so the accounts offered are that provider's:
+        # `usagebar share codex <TAB>` offering claude names would be offering words the command
+        # refuses (`accountMatching` filters on the provider first, AccountPick.swift). Read
+        # positionally rather than by flag name, because here it IS a position.
+        (share)
+          local provider=${words[2]:-claude}
+          _arguments \
+            ":provider:_usagebar_providers" \
+            ":account: _usagebar_accounts $provider" \
+            "--all[share every account of that provider, not one named account]"
+          ;;
+        (best-dir|launch-dir) _arguments ":provider:_usagebar_providers" ;;
+        (reload) _arguments "--now[wait only for a 5s quiet gap rather than for idle]" "--self[restart only the session this runs in, when its turn ends]" ;;
+        (completion) _arguments ":shell:(zsh)" ;;
+      esac
+      ;;
+  esac
+}
+
+# Both installations end here. Autoloaded from fpath, this file IS the body of `_usagebar` on its
+# first call, so it defines the real one above and then calls it; eval'd into a running shell, it
+# binds instead. compinit is what puts `compdef` there, so a shell that has not run it is told
+# rather than left with a Tab key that silently does nothing.
+if [[ $funcstack[1] == _usagebar ]]; then
+  _usagebar "$@"
+elif (( $+functions[compdef] )); then
+  compdef _usagebar usagebar
+else
+  print -u2 -- "usagebar: run compinit (autoload -Uz compinit && compinit) before this script"
+fi
+"""#

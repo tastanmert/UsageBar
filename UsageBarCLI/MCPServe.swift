@@ -1,0 +1,423 @@
+import Darwin
+import Foundation
+
+// `usagebar mcp-serve` - the MCP server behind the native `/usagebar` panel.
+//
+// WHY A SERVER AT ALL, when both commands are already answered for free by a command-type hook
+// (SwitchHook.swift, ModelHook.swift): a command hook can only PRINT. A bare `/usagebar` lists
+// the fleet as text and the person then types a second command with a name in it. Claude Code will
+// call an MCP tool from the same hook event, and a tool may raise the same native dialog the
+// built-in `/mcp` uses - so the same reading becomes a list they answer with the arrow keys, in one
+// step, still without waking a model.
+//
+// The protocol used here is the small corner of MCP that this needs, measured against Claude Code
+// 2.1.224 (probe transcripts, 2026-08-07):
+//
+//   - stdio, one JSON object per LINE (newline-delimited; no Content-Length framing).
+//   - `initialize` / `notifications/initialized` / `tools/list` / `tools/call`.
+//   - `elicitation/create`, sent BY the server, from inside a `tools/call` it has not answered yet.
+//   - the tool's text result is read as a hook decision, so `{"decision":"block","reason":...}`
+//     stops the expansion and shows the reason (MCPPicker.swift).
+//
+// THE ONE STRUCTURAL RULE: while an elicitation is outstanding, the client keeps talking. It sends
+// pings, it lists tools, it may notify. A server that read only for its own reply would leave those
+// unanswered and both sides would wait for each other, with a dialog open on the user's screen and
+// nothing behind it. So the wait re-dispatches everything that is not the reply (`ask` below), which
+// is what the probe server had to do before any of this worked.
+
+/// The two ends of one stdio conversation. Injected so the whole round trip - initialize, a tool
+/// call, the dialog, the decision - can be driven in a test without a client to talk to.
+struct MCPConnection {
+    /// One message line, or nil at end of input.
+    var read: () -> String?
+    var write: (String) -> Void
+    /// Whether a whole line is ALREADY IN HAND, without touching the descriptor.
+    ///
+    /// THIS EXISTS BECAUSE A BUFFERED READ AND A POLLED DESCRIPTOR DO NOT SEE THE SAME THING, which
+    /// is the classic way of mixing the two and it cost a real defect here (review of ee77152). A
+    /// client that writes several messages in one go leaves them in ONE pipe write; the read that
+    /// takes the first line pulls the whole chunk into user space, and from then on `poll(fd 0)`
+    /// says - correctly - that the descriptor has nothing on it. The second message would then sit
+    /// unanswered until the person finished choosing or the wait timed out, which is precisely the
+    /// deafness the wait is built to avoid.
+    ///
+    /// Defaulted to false so every injected connection reads exactly as it did: a test that scripts
+    /// its own messages has no buffer of its own to speak for.
+    var buffered: () -> Bool = { false }
+
+    /// The real one: this process's own stdin and stdout, one line per message.
+    static var stdio: MCPConnection {
+        let reader = StdioLineReader()
+        return MCPConnection(read: { reader.line() },
+                             write: { line in
+                                 FileHandle.standardOutput.write(Data((line + "\n").utf8))
+                             },
+                             buffered: { reader.hasCompleteLine })
+    }
+}
+
+/// Lines off a file descriptor, buffered where WE can see the buffer.
+///
+/// `readLine` keeps its buffer inside the C library, where nothing can ask whether it is holding
+/// anything - and a wait that also polls the descriptor has to be able to ask (see `buffered`
+/// above). So the buffering is done here instead: `read(2)` into a `Data`, split on newlines, and a
+/// question anybody can put to it.
+///
+/// The general path is unchanged by construction: `line()` returns the same lines in the same order
+/// and nil at end of input, which is all `serve()` ever asked of `readLine`.
+final class StdioLineReader {
+    private var buffer = Data()
+    private var ended = false
+    private let descriptor: Int32
+    private let chunkSize = 4096
+
+    init(descriptor: Int32 = 0) { self.descriptor = descriptor }
+
+    /// A whole line is in hand already. Asked BEFORE the descriptor is polled, never instead of
+    /// reading it.
+    var hasCompleteLine: Bool { buffer.contains(0x0A) }
+
+    /// The next line, reading only when there is not one buffered. nil at end of input, including
+    /// the case where the last line arrived without a newline behind it.
+    func line() -> String? {
+        while true {
+            if let newline = buffer.firstIndex(of: 0x0A) {
+                let line = buffer[buffer.startIndex ..< newline]
+                buffer.removeSubrange(buffer.startIndex ... newline)
+                return String(decoding: line, as: UTF8.self)
+            }
+            if ended {
+                guard !buffer.isEmpty else { return nil }
+                defer { buffer.removeAll() }
+                return String(decoding: buffer, as: UTF8.self)
+            }
+            var chunk = [UInt8](repeating: 0, count: chunkSize)
+            let count = Darwin.read(descriptor, &chunk, chunkSize)
+            if count > 0 {
+                buffer.append(contentsOf: chunk[0 ..< count])
+            } else if count < 0 && errno == EINTR {
+                continue   // a signal, not an end: ask again
+            } else {
+                ended = true   // 0 is end of input; anything else is unreadable, which reads the same
+            }
+        }
+    }
+}
+
+/// The protocol version this server speaks when the client does not name one. Claude Code always
+/// does, and its value is echoed rather than overridden - a client that asked for an older revision
+/// gets told what it asked for, which is what every reference server does.
+let mcpProtocolVersion = "2025-11-25"
+
+/// The tools `tools/list` publishes.
+///
+/// The input schema names the hook's own fields (PromptHookInputField, shared with the app that
+/// writes them) and still accepts anything else: the block is composed by a settings file that a
+/// future version may add to, and refusing an unknown key would turn that into a broken command.
+func mcpToolDescriptors() -> [[String: Any]] {
+    let properties = Dictionary(uniqueKeysWithValues: PromptHookInputField.allCases.map {
+        ($0.rawValue, ["type": "string", "description": $0.toolDescription] as Any)
+    })
+    let schema: [String: Any] = ["type": "object", "properties": properties,
+                                 "additionalProperties": true]
+    let pickDescription: String = "Answers the /usagebar prompt hook without a model turn: Claude Code calls "
+             + "it with the hook's own fields when the user types /usagebar. When command_args "
+             + "names an account it queues a move of this session to that account; when it "
+             + "names a model, with an optional effort, it queues that pair; when it is empty "
+             + "it opens a native panel where the user picks either. Changes take effect when "
+             + "the current turn ends. The result is a hook decision document whose reason is "
+             + "the line to show the user. From inside a conversation, run "
+             + "`\(BrandPaths.cliName) account \"<name>\"` or `\(BrandPaths.cliName) model <model> [effort]` instead: they find "
+             + "this session themselves and print their result directly."
+    return [
+        ["name": PromptHookTool.pick.rawValue,
+         "title": "Pick an account or a model",
+         "description": pickDescription,
+         "inputSchema": schema],
+        ["name": PromptHookTool.pickAccount.rawValue,
+         "title": "Pick an account",
+         "description": "Answers an account-picker hook registration written before /usagebar; "
+             + "the next integration sync replaces it with pick. When command_args names an "
+             + "account it queues a move of this session there, and when it is empty it asks "
+             + "the user which account this conversation continues on. The move takes effect "
+             + "when the current turn ends. From inside a conversation, run "
+             + "`\(BrandPaths.cliName) account \"<name>\"` instead.",
+         "inputSchema": schema],
+        ["name": PromptHookTool.pickModel.rawValue,
+         "title": "Pick a model",
+         "description": "Answers a model-picker hook registration written before /usagebar; the "
+             + "next integration sync replaces it with pick. When command_args names a model, "
+             + "with an optional effort, it queues that pair, and when it is empty it asks the "
+             + "user which model and effort this conversation runs. The change takes effect "
+             + "when the current turn ends. From inside a conversation, run "
+             + "`\(BrandPaths.cliName) model <model> [effort]` instead.",
+         "inputSchema": schema],
+    ]
+}
+
+/// The server itself: read a message, answer it, repeat until the client goes away.
+///
+/// A class because the elicitation counter and the connection are shared by the dispatch and by the
+/// nested wait inside it. Single-threaded throughout - one conversation, one reader.
+final class MCPServer {
+    private let connection: MCPConnection
+    private let world: MCPPickerWorld
+    private var elicitations = 0
+    /// The Claude Code that started this server, recorded while the answer is still true.
+    ///
+    /// Read at START-UP rather than per request, and that is the whole point: this process outlives
+    /// individual prompts, and a Claude Code that exits while it is still running leaves it
+    /// reparented to launchd, where `getppid()` answers 1 and would match no session at all. It is
+    /// the witness that says which conversation a prompt belongs to (PromptOrigin,
+    /// SwitchRequest.swift).
+    private let claudeCodePID: pid_t?
+
+    /// Everything the native picker does to the world, injected whole so the wait below can be
+    /// driven without an app to answer it (NativePick.swift).
+    private let pick: NativePickChannel
+
+    init(connection: MCPConnection, world: MCPPickerWorld = MCPPickerWorld(),
+         claudeCodePID: pid_t? = getppid(), pick: NativePickChannel = .live) {
+        self.connection = connection
+        self.world = world
+        self.claudeCodePID = claudeCodePID
+        self.pick = pick
+    }
+
+    /// Read until end of input. Returning IS the shutdown: the client closing the pipe is how an
+    /// MCP server is stopped, and there is nothing of ours to flush.
+    func serve() {
+        while let message = receive() { handle(message) }
+    }
+
+    /// One message, parsed. A line that is blank or is not an object is SKIPPED rather than
+    /// answered: there is no id to answer it with, and a server that gave up on the first stray
+    /// byte would take the pickers down with it.
+    private func receive() -> [String: Any]? {
+        while let line = connection.read() {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            guard let data = trimmed.data(using: .utf8),
+                  let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { continue }
+            return object
+        }
+        return nil
+    }
+
+    private func send(_ message: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: message, options: []),
+              let line = String(data: data, encoding: .utf8) else { return }
+        connection.write(line)
+    }
+
+    private func reply(to id: Any?, result: [String: Any]) {
+        guard let id else { return }   // a notification: nothing to answer
+        send(["jsonrpc": "2.0", "id": id, "result": result])
+    }
+
+    func handle(_ message: [String: Any]) {
+        let id = message["id"]
+        // A response we are not waiting on here: `ask` reads its own reply off the same stream.
+        guard let method = message["method"] as? String else { return }
+        switch method {
+        case "initialize":
+            let params = message["params"] as? [String: Any] ?? [:]
+            reply(to: id, result: [
+                "protocolVersion": params["protocolVersion"] as? String ?? mcpProtocolVersion,
+                "capabilities": ["tools": ["listChanged": false]],
+                "serverInfo": ["name": usageBarMCPServerName,
+                               "version": supervisorBuildVersion() ?? "dev"],
+            ])
+        case "tools/list":
+            reply(to: id, result: ["tools": mcpToolDescriptors()])
+        case "tools/call":
+            call(message)
+        case "ping":
+            reply(to: id, result: [:])
+        // Answered empty rather than left to the error branch: a client that lists these at start-up
+        // (Claude Code does) would otherwise log a protocol error on every session. Each key is
+        // written out, because the protocol's names for them are not derivable from the methods.
+        case "resources/list":
+            reply(to: id, result: ["resources": []])
+        case "resources/templates/list":
+            reply(to: id, result: ["resourceTemplates": []])
+        case "prompts/list":
+            reply(to: id, result: ["prompts": []])
+        default:
+            guard let id, !method.hasPrefix("notifications/") else { return }
+            send(["jsonrpc": "2.0", "id": id,
+                  "error": ["code": -32601, "message": "method not found: \(method)"]])
+        }
+    }
+
+    /// Run one tool and answer with its decision.
+    ///
+    /// A tool this server does not have is an ERROR RESULT rather than a JSON-RPC error, because
+    /// the two are read differently at the far end: an error result still carries text, so the
+    /// prompt is answered rather than falling through to a model turn.
+    private func call(_ message: [String: Any]) {
+        let params = message["params"] as? [String: Any] ?? [:]
+        let input = MCPHookInput(arguments: params["arguments"] as? [String: Any] ?? [:],
+                                 claudeCodePID: claudeCodePID)
+        let text: String
+        switch PromptHookTool(rawValue: params["name"] as? String ?? "") {
+        case .pick:
+            text = mcpPickUsageBar(input: input, world: world, ask: ask)
+        case .pickModel:
+            text = mcpPickModel(input: input, world: world, ask: ask)
+        case .pickAccount:
+            text = mcpPickAccount(input: input, world: world, ask: ask)
+        case nil:
+            reply(to: message["id"], result: [
+                "content": [["type": "text",
+                             "text": "\(BrandPaths.cliName) has no tool called "
+                                 + "\(params["name"] as? String ?? "(unnamed)")"]],
+                "isError": true,
+            ])
+            return
+        }
+        reply(to: message["id"], result: ["content": [["type": "text", "text": text]],
+                                          "isError": false])
+    }
+
+    /// Ask, by whichever channel can answer: UsageBar.app draws a one-step list when it is there, and
+    /// Claude Code draws the form when it is not.
+    ///
+    /// THE FALLBACK IS WHAT MAKES THIS SAFE TO SHIP. Every way the native path can fail - no app
+    /// running, an app that never claimed the request, an app that died holding it, a request that
+    /// could not be written at all - lands here, on the behaviour that shipped before it. The worst
+    /// outcome of the whole feature is today.
+    private func ask(_ offer: MCPPickOffer) -> MCPPickReply {
+        if let reply = askNatively(offer) { return reply }
+        return askByForm(offer.message, offer.schema)
+    }
+
+    /// Put the offer where the app will see it and wait for the person, serving the client all the
+    /// while. nil means nobody is going to answer this natively, which is the caller's cue to draw
+    /// the form instead - it is NOT a decline, and the difference matters: a decline would leave the
+    /// person with nothing after a command they typed.
+    ///
+    /// WHY THE LOOP LOOKS LIKE THIS is the whole of NativePick.swift's header: the answer arrives as
+    /// a file while the client keeps talking on stdin, so the wait watches both and blocks on
+    /// neither for longer than one poll interval.
+    private func askNatively(_ offer: MCPPickOffer) -> MCPPickReply? {
+        let id = newPickID()
+        // BOTH SHAPES ON THE WIRE: `rows` is the focus section, which is the whole of what an app
+        // from before the palette can read, and `sections` is the palette itself for one that can
+        // (`PickRequest.sections` states why both skews are live at once).
+        // …AND WHOSE SESSION IT IS. Several projects are usually open at once and the panel is one
+        // app answering all of them, so the request is the only thing that can say which
+        // conversation a submit would move (`pickProjectForCwd`). From the directory THIS PROMPT
+        // reported, which is the same witness the four answers behind this offer are built from
+        // (`MCPPickOffer.directory`): this server outlives any directory its session moves out of.
+        guard pick.publish(PickRequest(id: id, kind: offer.kind, message: offer.message,
+                                       rows: offer.rows, sections: offer.sections,
+                                       project: pickProjectForCwd(offer.directory)))
+        else { return nil }
+        // Whatever happens next, the files go: one left behind would raise a panel for a question
+        // nobody is waiting on any more.
+        defer { pick.discard(id) }
+        let started = pick.now()
+        /// Whether the previous lap found the request held by a claim with no seal beside it. The
+        /// one piece of memory this wait keeps, and the fallback below says what it is for.
+        var sawUnsealedClaim = false
+        while true {
+            // THE CLIENT FIRST, and only when it has actually said something. OUR OWN BUFFER IS
+            // ASKED BEFORE THE DESCRIPTOR, because a message already pulled into user space is
+            // invisible to `poll` and would otherwise wait out the whole pick (`MCPConnection
+            // .buffered` states the mechanism). `receive` reads a line, so calling it unasked is
+            // exactly the deafness this loop exists to avoid.
+            if connection.buffered() || pick.messageWaiting(nativePickPollSeconds) {
+                // End of input while waiting is a DECLINE, the same reading the form path gives it:
+                // the client went away, so nothing was chosen and nothing may be queued on a guess.
+                guard let next = receive() else { return .declined }
+                handle(next)
+            }
+            // WHO HAS IT, AND IS IT ONE OF OURS. The stand-down that keeps a build nobody installed
+            // from claiming (`pickMayBeClaimed`) can only bind builds that HAVE it, and the copies
+            // this protects against are older than it by definition: a UsageBar left running from
+            // before that change claims exactly as it always did, carrying the panel defect that
+            // cancelled every pick in 147ms. So this wait arbitrates, on the one thing an older
+            // build cannot produce - the seal beside the claim. It protects the sessions STARTED
+            // since the seal shipped, and only those: this server runs until its client closes
+            // stdin, so an older session is still asking the old questions with the old binary
+            // (`pickClaimSealFile` states the whole of that limit).
+            let holder = pick.claimant(id)
+            let strangerHolds = holder.map { !pick.sealed(id, $0) } ?? false
+            // Consecutive is what the extra lap below means, so a request that stops being held by a
+            // stranger starts the count over.
+            if !strangerHolds { sawUnsealedClaim = false }
+            // A CANCELLED ANSWER IS AN ANSWER: Esc and a click outside both write one, so the wait
+            // ends at the moment the person decides rather than at the deadline. UNLESS A STRANGER
+            // IS HOLDING THE REQUEST, because then the answer on disk is that stranger's, and the
+            // one it writes is the instant cancellation this whole round is about. Refusing the
+            // claim without refusing its answer would have changed nothing the person could see.
+            if !strangerHolds, let answer = pick.answer(id) {
+                return answer.isCancelled ? .declined : .accepted(offer.content(for: answer))
+            }
+            let waited = pick.now().timeIntervalSince(started)
+            // ASKED EVERY TURN RATHER THAN LATCHED. A claim that was true once is not a claim that
+            // is true now: an app that took the request and then died would hold this wait to its
+            // five-minute deadline and answer "nothing changed", when what it owes the person is the
+            // form (review of ee77152). Holding it open is only justified while somebody is really
+            // looking at it - and while it is somebody we can hold to this protocol, which is the
+            // same reason with one more term.
+            let watched = !strangerHolds && (holder.map(pick.isAlive) ?? false)
+            if !watched {
+                // Nobody has taken it, or whoever had it is gone. Fall back while the person is
+                // still looking at the terminal they typed into.
+                if waited > nativePickClaimSeconds {
+                    // ONE MORE LAP WHEN A CLAIM IS THERE BUT UNSEALED, because that state has two
+                    // causes and only one of them is a stale build. The other is a current app in
+                    // the microseconds between taking the claim and sealing it (`takePickClaim`
+                    // writes the two in that order), and a deadline landing in that gap would draw
+                    // the form with the panel already coming up: the two surfaces at once that the
+                    // claim exists to prevent. A stale build is unsealed on every lap, so it falls
+                    // back one poll interval later than it otherwise would, which is 100ms nobody
+                    // can see. AN ABSENT CLAIM IS NOT AMBIGUOUS and is not delayed with it.
+                    if !strangerHolds || sawUnsealedClaim { return nil }
+                    sawUnsealedClaim = true
+                }
+            } else if waited > nativePickDeadlineSeconds {
+                // A panel somebody raised and walked away from. Nothing was chosen, which is what
+                // every other unanswered pick already comes to.
+                return .declined
+            }
+        }
+    }
+
+    /// The form, unchanged: raise an elicitation and wait for the answer, answering everything else
+    /// that arrives meanwhile.
+    ///
+    /// End of input while waiting is a DECLINE, not a crash and not a retry: the client went away,
+    /// so nothing was chosen and nothing may be queued on a guess.
+    private func askByForm(_ message: String, _ schema: [String: Any]) -> MCPPickReply {
+        elicitations += 1
+        let id = "usagebar-elicit-\(elicitations)"
+        send(["jsonrpc": "2.0", "id": id, "method": "elicitation/create",
+              "params": ["message": message, "mode": "form", "requestedSchema": schema]])
+        while let next = receive() {
+            guard next["id"] as? String == id,
+                  next["result"] != nil || next["error"] != nil else {
+                handle(next)
+                continue
+            }
+            guard let result = next["result"] as? [String: Any],
+                  result["action"] as? String == "accept" else { return .declined }
+            // Values are read as strings and anything else is dropped: every field this server asks
+            // for is an enumerated string, and a client that answered with a number is not
+            // describing one of the rows it was given.
+            let content = result["content"] as? [String: Any] ?? [:]
+            return .accepted(content.compactMapValues { $0 as? String })
+        }
+        return .declined
+    }
+}
+
+/// `usagebar mcp-serve`: the server entry. Registered by the app in each config home's `.claude.json`,
+/// never typed by hand, so it is absent from the usage text (the same rule the hook entries follow).
+func runMCPServe() -> Int32 {
+    MCPServer(connection: .stdio).serve()
+    return 0
+}

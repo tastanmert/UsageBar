@@ -1,0 +1,491 @@
+import Foundation
+
+// The exec contract: the argv one supervisor writes so that the supervisor REPLACING it comes back
+// holding everything the session was promised. Split out of SelfUpdate.swift, which keeps the
+// decision (when to replace itself, and with what) while this keeps the spelling. The split is at
+// the size cap, and it is also the honest seam: this file is the only part of a self-update that a
+// DIFFERENT BUILD has to agree with, so what belongs in it is exactly what crosses the exec.
+//
+// LOAD-BEARING ACROSS VERSIONS. `__resupervise` and its flags are a contract between two different
+// builds, not an internal detail. The old build writes the argv; the NEW build's parser reads it.
+// Rename the subcommand, remove a flag, or change what one means, and every session that upgrades
+// into that release dies at the exec: its child has already been terminated, the new image does not
+// recognise the command, prints the usage text, exits 2, and the user is left staring at a shell
+// prompt where their conversation was. The upgrade-only gate cannot protect against this, because
+// the build they land on is by definition the newer one. Adding a new OPTIONAL flag is safe (an old
+// build simply never writes it, and the parser must keep defaulting sensibly when it is absent);
+// renaming or removing anything here is not. If it ever has to change, ship a release that accepts
+// both spellings first, and drop the old one only once no supervisor predating that release can
+// still be running. `parseResuperviseArgs` is round-trip tested against `selfUpdateArgv` for the
+// same reason: the two halves are one contract.
+//
+// WHAT RIDES ACROSS, and why each one has to. In-memory state resets at the exec, which is
+// acceptable for anything the new image re-derives within a tick or two, and NOT acceptable for a
+// promise about the user's SESSION - the recovery fuse's spent budget, the account a `usagebar switch`
+// pinned, the cap the session is still waiting out, the model and effort a `usagebar model` pinned.
+// Every one of those is a flag below, optional by construction, with its own note on what an absent
+// one has to mean.
+
+/// The internal subcommand a self-update re-enters through. Not a user-facing command (it is absent
+/// from the usage text on purpose): it carries the account and the conversation across the exec so
+/// the new supervisor resumes exactly what the old one was watching, with no re-picking.
+let resuperviseCommand = "__resupervise"
+
+/// The flag carrying the recovery fuse's recorded recoveries across the exec, so the limit holds
+/// for the SESSION rather than for the process. Optional by construction: a supervisor with an
+/// empty fuse writes no flag at all, which is also what every build predating it wrote.
+let resuperviseFuseFlag = "--fuse"
+
+/// The flag carrying the account a `usagebar switch` pinned this session to (SessionSwitch.swift), for
+/// the same reason the fuse rides along: the pin is a promise about the user's SESSION, and it lives
+/// in memory only. Without it, the first quiet tick after an upgrade would hand the session back to
+/// automatic selection - a nearly dry account rebalances it away, and the account the user named
+/// silently stops being the one they are on.
+///
+/// A NEW optional flag rather than a new meaning for `--pin-override` below, because the two halves
+/// of this argv are written by different BUILDS: an old supervisor writes the pin it moved the
+/// session OFF, and reading that as the pin it was moved ONTO would name the wrong account. Optional
+/// by construction, like the fuse - an unpinned session writes no flag, and so does every build
+/// predating this one, which is exactly the behaviour those builds had.
+let resuperviseSessionPinFlag = "--session-pin"
+
+/// The flag carrying the pin a `usagebar switch` took this session OFF (SessionSwitch.swift), for the
+/// same reason the fuse rides along: it is a promise about the user's session, not about this
+/// process. Without it the new image starts with no override, and the first quiet tick after an
+/// upgrade hands the session straight back to the pin it was deliberately moved away from - undoing
+/// an instruction the user gave by hand, minutes later, for no reason they can see.
+///
+/// Optional by construction, like the fuse: a session that never overrode a pin writes no flag, and
+/// so does every build predating this one. An absent flag means "no override", which is exactly the
+/// behaviour those builds had.
+///
+/// Nothing in this build WRITES it any more (a switch records a session pin instead, which outranks
+/// every pin rather than only the one it overrode), and it is still parsed and still forwarded: a
+/// session that upgrades out of a build that wrote one arrives holding it, and dropping it there
+/// would undo that session's switch on its first quiet tick.
+let resupervisePinOverrideFlag = "--pin-override"
+
+/// The flag carrying the cap recovery this session is still waiting on, for the same reason the fuse
+/// rides along: it is a promise about the SESSION - which account capped, when, when the window it
+/// capped on refills, when to retry the handoff, and what the status line is currently saying about
+/// the wait - and it lives in memory only. Without it the new image comes back with nothing left to
+/// notice a sibling freeing up, and the session waits on a dead account until its user hits the wall
+/// a second time: the same failure `capCarriedAcrossRelaunch` (CapRecovery.swift) exists to
+/// prevent one child later. That function decides WHETHER the state survives a given relaunch; this
+/// flag is only how it gets across an exec, and a self-update relaunch is one it carries.
+///
+/// JSON, where the fuse uses a delimited list, because these fields are not all numbers: the waiting
+/// note is a sentence containing commas and parentheses, and an account id can be a path. One argv
+/// token either way. Optional by construction, like every flag here - a session with no pending cap
+/// writes nothing, which is also what every build predating this one wrote, and an old parser
+/// reading an argv it does not recognise skips the flag and its value as two unknown words.
+let resupervisePendingCapFlag = "--pending-cap"
+
+/// The flag carrying the conversation this session has already published as the last one watched in
+/// its directory (LastConversation.swift), for the same reason the fuse rides along: it is what this
+/// supervisor knows about its OWN history, it lives in memory only, and the new image cannot
+/// re-derive it from anywhere. Without it the first tick after an upgrade re-announces an unchanged
+/// conversation, and in a directory where a SIBLING session has published since, that write silently
+/// takes the sibling's newer answer back off - which is the whole failure the record exists to
+/// prevent, arriving from inside.
+///
+/// A plain string, not JSON: the value is one transcript id, and it is re-validated on the way in
+/// because it crossed a process boundary and the build that wrote it is one we cannot see. Optional
+/// by construction, like every flag here - a session that has published nothing writes none, which
+/// is also what every build predating this one wrote, and an absent flag means "no memory", which is
+/// exactly the behaviour those builds had.
+let resuperviseLastConversationFlag = "--last-conversation"
+
+/// The session's task list (TaskListPin.swift): the id every child gets and the directory behind
+/// it. Absent (every build before it) means the new image starts a list of its own.
+let resuperviseTaskListFlag = "--task-list"
+let resuperviseTaskListDirFlag = "--task-list-dir"
+
+/// The flag carrying the model and effort a `usagebar model` pinned this session to (SessionModel.swift).
+///
+/// ONE flag for the pair, not one per axis, and that is a decision about this family rather than
+/// about this feature. `--fuse`, `--session-pin`, `--pin-override` and `--pending-cap` were each
+/// added the same way ("something else has to survive the exec"), and a fifth and sixth would make
+/// the shape of the argv the thing to reason about. The pair is also indivisible in meaning: a
+/// session pinned to opus/xhigh that arrived holding only the model would run the fleet's effort on
+/// a model the user chose, which is neither of the two states this feature has.
+///
+/// JSON like the pending cap, for the same reason it is one token per flag and for one it does not
+/// have: a model name is open text (`us.anthropic.claude-opus-4:1`), so a delimiter would need
+/// escaping the moment a provider used one. Optional by construction, like every flag here: an
+/// unpinned session writes nothing, which is what every build predating this one wrote, and an
+/// absent flag means the session follows its project profile and the fleet default - the behaviour
+/// those builds had.
+let resuperviseSessionModelFlag = "--session-model"
+
+/// The flag carrying cap resume's state (CapResume.swift): the standing offer, the newest wall it
+/// armed for, and when it last typed. A cap relaunch folds a pending self-update into the same tick,
+/// so without this the exec drops the arm every time an update is waiting. JSON like the pending
+/// cap. Optional by construction: a session with nothing to carry writes no flag, which is what
+/// every build predating this one wrote, and an absent flag means an empty state.
+let resuperviseCapResumeFlag = "--cap-resume"
+/// A session launched with `--spend-reserve` (B-1213): a bare flag, carried so an upgrade does not
+/// start holding a session its owner told to spend the reserve. Absent means it was not.
+let resuperviseSpendReserveFlag = "--spend-reserve"
+
+/// Written beside `--no-follow` by every build that opts a session out on the user's own word
+/// alone: a hand-typed --model or --effort, --no-follow, or USAGEBAR_AUTO_FOLLOW=0 (B-1091). Builds
+/// before it ALSO wrote `--no-follow` for a session whose project profile declared a model or an
+/// effort, and the argv cannot tell those two apart; the absence of this flag is what marks that
+/// older, ambiguous reading (`resupervisedFollow`). Optional by construction: a following session
+/// writes nothing new, so the `--follow` spelling every build has written is unchanged.
+let resuperviseHandOptOutFlag = "--hand-opt-out"
+/// The axis a partly-following session still follows (#14): bare flags, written ONLY beside a marked
+/// `--no-follow`, never beside `--follow` (a build without them would read that as follow-both and
+/// override the typed flag). An old image steps over them and reads the marked opt-out as today.
+let resuperviseFollowModelFlag = "--follow-model"
+let resuperviseFollowEffortFlag = "--follow-effort"
+
+/// The fuse's recoveries as a flag value: absolute epoch seconds, comma separated. Absolute, not
+/// "N seconds ago", because the exec takes real time (and can be delayed by a slow disk mid-install)
+/// and durations re-based on arrival would silently stretch the window they are measured in.
+func encodeRecoveryFuse(_ recoveries: [Date]) -> String {
+    recoveries.map { String($0.timeIntervalSince1970) }.joined(separator: ",")
+}
+
+/// The recoveries a previous build wrote, or none. Anything unreadable answers empty rather than a
+/// partial list: the value comes from a DIFFERENT build, so a shape we cannot fully parse is a
+/// disagreement about the format, and half-believing it would put an arbitrary number of recoveries
+/// into the new fuse. Empty degrades to exactly today's behaviour (a fresh fuse), never to a crash.
+func decodeRecoveryFuse(_ raw: String) -> [Date] {
+    guard !raw.isEmpty else { return [] }
+    var recoveries: [Date] = []
+    for field in raw.split(separator: ",", omittingEmptySubsequences: false) {
+        guard let epoch = Double(field), epoch.isFinite else { return [] }
+        recoveries.append(Date(timeIntervalSince1970: epoch))
+    }
+    return recoveries
+}
+
+/// A pending cap recovery as a flag value: one JSON object, with absolute epoch seconds for the
+/// times for the reason the fuse uses them - the exec takes real time, and a duration re-based on
+/// arrival would silently move the boundary it names. Keys are sorted so a given state always spells
+/// the same argv. nil when the value cannot be serialised at all, which writes no flag: a state we
+/// cannot spell in full is one the new image must not receive in part.
+func encodePendingCap(_ pending: PendingCapRecovery) -> String? {
+    var fields: [String: Any] = [
+        "account": pending.cappedAccountID,
+        "cappedAt": pending.cappedAt.timeIntervalSince1970,
+        "nextRetry": pending.nextRetry.timeIntervalSince1970,
+        "reason": pending.reason,
+    ]
+    if let model = pending.primaryModel { fields["model"] = model }
+    if let resets = pending.recoveryResetsAt { fields["resets"] = resets.timeIntervalSince1970 }
+    // Written only when there is one to write, the rule every optional here follows: an older build
+    // reading this ignores the key, and a newer build reading a record without it gets nil, which
+    // is the answer that refuses to spend a reset (`PendingCapRecovery.capScope`).
+    if let scope = pending.capScope { fields["scope"] = scope.rawValue }
+    return encodeResuperviseFields(fields)
+}
+
+/// The pending cap a previous build wrote, or none. Anything unreadable answers nil rather than a
+/// partial record, for the reason `decodeRecoveryFuse` gives: the value comes from a DIFFERENT
+/// build, so a shape we cannot fully parse is a disagreement about the format. Half-believing one is
+/// worse here than dropping it - a record that lost `resets` is a session whose badge can never
+/// clear itself, and one that lost `model` scores every handoff candidate against the wrong quota
+/// window - so a key that is present but unreadable discards the whole value. Keys a later build
+/// adds are ignored; keys genuinely absent are genuinely absent (no reset boundary the snapshot
+/// could name, no model this session pinned).
+func decodePendingCap(_ raw: String) -> PendingCapRecovery? {
+    func seconds(_ value: Any?) -> Date? {
+        guard let epoch = value as? Double, epoch.isFinite else { return nil }
+        return Date(timeIntervalSince1970: epoch)
+    }
+    guard let object = decodeResuperviseFields(raw),
+          let account = object["account"] as? String, !account.isEmpty,
+          let cappedAt = seconds(object["cappedAt"]), let nextRetry = seconds(object["nextRetry"]),
+          let reason = object["reason"] as? String
+    else { return nil }
+    var model: String?
+    if let value = object["model"] {
+        guard let text = value as? String, !text.isEmpty else { return nil }
+        model = text
+    }
+    var resets: Date?
+    if let value = object["resets"] {
+        guard let date = seconds(value) else { return nil }
+        resets = date
+    }
+    // A scope this build does not recognise discards the whole record, which is the same rule the
+    // two above keep and for the same reason: the value comes from another BUILD, so a word we
+    // cannot read is a disagreement about the format rather than a field to shrug at. A record that
+    // came back with the wrong wall would spend a weekly credit on a weekly wall.
+    var scope: CapScope?
+    if let value = object["scope"] {
+        guard let text = value as? String, let parsed = CapScope(rawValue: text) else { return nil }
+        scope = parsed
+    }
+    return PendingCapRecovery(cappedAccountID: account, cappedAt: cappedAt, primaryModel: model,
+                              recoveryResetsAt: resets, nextRetry: nextRetry, reason: reason,
+                              capScope: scope)
+}
+
+/// The pinned pair as a flag value: one JSON object naming only the axes that are pinned, so a pin
+/// on the model alone spells `{"model":"opus"}` rather than claiming an effort nobody chose. nil for
+/// a pin that says nothing, which writes no flag - the same thing an unpinned session writes.
+func encodeSessionModel(_ pin: SessionModelPin) -> String? {
+    guard !pin.isEmpty else { return nil }
+    var fields: [String: Any] = [:]
+    if let model = pin.model { fields["model"] = model }
+    if let effort = pin.effort { fields["effort"] = effort }
+    return encodeResuperviseFields(fields)
+}
+
+/// The pinned pair a previous build wrote, or none. Same standard of proof as the pending cap: a key
+/// that is PRESENT but not a usable axis value discards the whole pin rather than half of it, since
+/// half a pin is a session running one axis the user chose and one they did not. `isLaunchAxisValue`
+/// is asked here as well as at the command, because this value crossed a process boundary and the
+/// entrance check that refused it belongs to a build we cannot see (ProjectPolicy.swift). An empty
+/// object, or one naming only keys this build has never heard of, is no pin at all.
+func decodeSessionModel(_ raw: String) -> SessionModelPin? {
+    guard let object = decodeResuperviseFields(raw) else { return nil }
+    func axis(_ key: String) -> String?? {
+        guard let value = object[key] else { return .some(nil) }
+        guard let text = value as? String, isLaunchAxisValue(text) else { return nil }
+        return .some(text)
+    }
+    guard let model = axis("model"), let effort = axis("effort") else { return nil }
+    let pin = SessionModelPin(model: model, effort: effort)
+    return pin.isEmpty ? nil : pin
+}
+
+/// Cap resume's state as a flag value, epoch seconds like the pending cap. nil for an empty state,
+/// which writes no flag.
+func encodeCapResume(_ state: CapResumeState) -> String? {
+    var fields: [String: Any] = [:]
+    if let offer = state.offer {
+        fields["at"] = offer.at.timeIntervalSince1970
+        fields["conversation"] = offer.conversation
+        fields["line"] = offer.line
+    }
+    if let last = state.lastCapAt { fields["lastCapAt"] = last.timeIntervalSince1970 }
+    if let nudged = state.nudgedAt { fields["nudgedAt"] = nudged.timeIntervalSince1970 }
+    if let conversation = state.nudgedConversation { fields["nudgedConversation"] = conversation }
+    if !state.nudges.isEmpty { fields["nudges"] = state.nudges.map { $0.timeIntervalSince1970 } }
+    return fields.isEmpty ? nil : encodeResuperviseFields(fields)
+}
+
+/// The state a previous build wrote, or nil. Same standard as the pending cap: a key present but
+/// unreadable discards the whole value, and so does half an offer, since an offer typed into the
+/// wrong conversation or with no line is worse than no offer.
+func decodeCapResume(_ raw: String) -> CapResumeState? {
+    func seconds(_ value: Any?) -> Date?? {   // .some(nil) = absent, nil = malformed
+        guard let value else { return .some(nil) }
+        guard let epoch = value as? Double, epoch.isFinite else { return nil }
+        return .some(Date(timeIntervalSince1970: epoch))
+    }
+    guard let object = decodeResuperviseFields(raw),
+          let last = seconds(object["lastCapAt"]), let nudged = seconds(object["nudgedAt"]),
+          let at = seconds(object["at"]) else { return nil }
+    var offer: CapResumeState.Offer?
+    if let at {
+        guard let conversation = object["conversation"] as? String,
+              isTranscriptSessionID(conversation),
+              let line = object["line"] as? String, !line.isEmpty else { return nil }
+        offer = CapResumeState.Offer(at: at, conversation: conversation, line: line)
+    } else if object["conversation"] != nil || object["line"] != nil {
+        return nil
+    }
+    // The budget (B-1360). Absent keys are a build that predates it: a fresh budget, as a resume
+    // into a new conversation would be. Present and unreadable discards the whole value.
+    var nudgedConversation: String?
+    if let raw = object["nudgedConversation"] {
+        guard let id = raw as? String, isTranscriptSessionID(id) else { return nil }
+        nudgedConversation = id
+    }
+    var nudges: [Date] = []
+    if let raw = object["nudges"] {
+        guard let epochs = raw as? [Double], epochs.count <= capResumeBudget,
+              epochs.allSatisfy(\.isFinite) else { return nil }
+        nudges = epochs.map { Date(timeIntervalSince1970: $0) }
+    }
+    return CapResumeState(offer: offer, lastCapAt: last, nudgedAt: nudged,
+                          nudgedConversation: nudgedConversation, nudges: nudges)
+}
+
+/// One JSON object as a single argv token. Keys sorted so a given state always spells the same argv,
+/// which is what makes the round-trip tests assert a format rather than a dictionary ordering.
+/// Shared by the two flags that carry structured state, so neither can drift into a different
+/// spelling of the same idea.
+private func encodeResuperviseFields(_ fields: [String: Any]) -> String? {
+    guard let data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
+          let text = String(data: data, encoding: .utf8) else { return nil }
+    return text
+}
+
+/// The other half: an argv token back to an object, or nil for anything that is not one (a value
+/// truncated by a shell, a JSON array, a shape from a build we do not know).
+private func decodeResuperviseFields(_ raw: String) -> [String: Any]? {
+    guard let data = raw.data(using: .utf8) else { return nil }
+    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+}
+
+/// The argv an upgrade execs. Continuity is spelled out rather than re-derived: the account is named
+/// explicitly so the new supervisor cannot re-pick a different one, and `args` already carries the
+/// `--resume <session>` the relaunch path produced, so the conversation is pinned by id. Passing the
+/// original launch argv instead would let the new process pick another account and then follow a
+/// bare `--continue` into whatever conversation happens to be newest there. `recoveries` is the
+/// recovery fuse's live record (already pruned by `RecoveryFuse.carried`), `pendingCap` the cap
+/// state the relaunch this exec rides on decided to hand over (`capCarriedAcrossRelaunch`), and
+/// `sessionModel` the pair a `usagebar model` pinned, so the new image inherits exactly what the next
+/// CHILD would have inherited had there been no upgrade.
+func selfUpdateArgv(binary: String, id: String, label: String, home: String,
+                    follow: FollowAxes, recoveries: [Date] = [], sessionPin: String? = nil,
+                    pinOverride: String? = nil, pendingCap: PendingCapRecovery? = nil,
+                    sessionModel: SessionModelPin? = nil, lastConversation: String? = nil,
+                    capResume: CapResumeState? = nil, taskList: TaskListPin? = nil,
+                    restartNote: RestartNote? = nil, spendReserve: Bool = false,
+                    args: [String]) -> [String] {
+    var argv = [binary, resuperviseCommand, "--id", id, "--label", label, "--home", home,
+                follow == .both ? "--follow" : "--no-follow"]
+    if follow != .both {
+        argv.append(resuperviseHandOptOutFlag)
+        if follow.model { argv.append(resuperviseFollowModelFlag) }
+        if follow.effort { argv.append(resuperviseFollowEffortFlag) }
+    }
+    if spendReserve { argv.append(resuperviseSpendReserveFlag) }
+    if !recoveries.isEmpty { argv += [resuperviseFuseFlag, encodeRecoveryFuse(recoveries)] }
+    if let sessionPin, !sessionPin.isEmpty {
+        argv += [resuperviseSessionPinFlag, sessionPin]
+    }
+    if let pinOverride, !pinOverride.isEmpty {
+        argv += [resupervisePinOverrideFlag, pinOverride]
+    }
+    if let pendingCap, let encoded = encodePendingCap(pendingCap) {
+        argv += [resupervisePendingCapFlag, encoded]
+    }
+    if let sessionModel, let encoded = encodeSessionModel(sessionModel) {
+        argv += [resuperviseSessionModelFlag, encoded]
+    }
+    if let lastConversation, isTranscriptSessionID(lastConversation) {
+        argv += [resuperviseLastConversationFlag, lastConversation]
+    }
+    if let capResume, let encoded = encodeCapResume(capResume) {
+        argv += [resuperviseCapResumeFlag, encoded]
+    }
+    if let taskList, isTaskListID(taskList.id), taskList.dir.hasPrefix("/") {
+        argv += [resuperviseTaskListFlag, taskList.id, resuperviseTaskListDirFlag, taskList.dir]
+    }
+    if let restartNote, let encoded = encodeRestartNote(restartNote) {
+        argv += [resuperviseRestartNoteFlag, encoded]
+    }
+    return argv + ["--"] + args
+}
+
+/// Everything one side of the exec hands the other. A value type rather than a tuple because the
+/// list only ever grows (each entry is one more promise about the session that must survive), and a
+/// tuple of eight named fields is a signature nobody can read at the call site.
+struct ResuperviseArgs {
+    var id = ""
+    var label = ""
+    var home = ""
+    var follow = true
+    var recoveries: [Date] = []
+    var sessionPin: String?
+    var pinOverride: String?
+    var pendingCap: PendingCapRecovery?
+    var sessionModel: SessionModelPin?
+    var lastConversation: String?
+    var capResume: CapResumeState?
+    var taskListID: String?
+    var taskListDir: String?
+    var restartNote: RestartNote?
+    var spendReserve = false
+    var handOptOut = false
+    var followModel = false
+    var followEffort = false
+    var childArgs: [String] = []
+
+    var taskList: TaskListPin? {
+        guard let taskListID, let taskListDir else { return nil }
+        return TaskListPin(id: taskListID, dir: taskListDir)
+    }
+}
+
+/// Parse the exec contract's flags. Pure, and round-trip tested against `selfUpdateArgv`: the two
+/// halves are written by different BUILDS of this program, so a silent disagreement between them
+/// would strand exactly the sessions that were mid-upgrade. Values are taken positionally, so a
+/// label that looks like a flag (`--label --home`) is still a label; a missing or trailing `--`
+/// yields no child args rather than an error, because the supervisor can still resume without them.
+/// An absent `--fuse` (every build before it, and any supervisor whose fuse was empty) means no
+/// recoveries, which is the fresh-fuse behaviour this contract had all along; an absent
+/// `--session-pin` means the session was never pinned by hand, an absent `--pin-override` means it
+/// never overrode a pin, an absent `--pending-cap` means the session was not waiting on a cap, and
+/// an absent `--session-model` means it pinned no model or effort of its own, and an absent
+/// `--last-conversation` means this supervisor has published no record of its own yet, and an absent
+/// `--cap-resume` means no resume was armed - which is
+/// what every build before each flag effectively said too.
+func parseResuperviseArgs(_ args: [String]) -> ResuperviseArgs {
+    var parsed = ResuperviseArgs()
+    var index = 0
+    while index < args.count {
+        let argument = args[index]
+        func value() -> String {
+            index + 1 < args.count ? args[index + 1] : ""
+        }
+        switch argument {
+        case "--id": parsed.id = value(); index += 2
+        case "--label": parsed.label = value(); index += 2
+        case "--home": parsed.home = value(); index += 2
+        case resuperviseFuseFlag: parsed.recoveries = decodeRecoveryFuse(value()); index += 2
+        // An empty value is no pin rather than a pin on "": these flags are only written with a
+        // real account id, so an empty one is a disagreement about the format, and the safe reading
+        // of it is the behaviour of every build that never wrote the flag at all.
+        case resuperviseSessionPinFlag:
+            parsed.sessionPin = value().isEmpty ? nil : value()
+            index += 2
+        case resupervisePinOverrideFlag:
+            parsed.pinOverride = value().isEmpty ? nil : value()
+            index += 2
+        case resupervisePendingCapFlag: parsed.pendingCap = decodePendingCap(value()); index += 2
+        case resuperviseSessionModelFlag: parsed.sessionModel = decodeSessionModel(value()); index += 2
+        case resuperviseCapResumeFlag: parsed.capResume = decodeCapResume(value()); index += 2
+        case resuperviseRestartNoteFlag: parsed.restartNote = decodeRestartNote(value()); index += 2
+        // Re-validated rather than trusted: this value crossed a process boundary from a build we
+        // cannot see, and it is about to name a file. Anything that is not an id is no memory, which
+        // is the behaviour of every build that never wrote the flag.
+        case resuperviseLastConversationFlag:
+            parsed.lastConversation = isTranscriptSessionID(value()) ? value() : nil
+            index += 2
+        case resuperviseTaskListFlag:
+            parsed.taskListID = isTaskListID(value()) ? value() : nil
+            index += 2
+        case resuperviseTaskListDirFlag:
+            parsed.taskListDir = value().hasPrefix("/") ? value() : nil
+            index += 2
+        case "--follow": parsed.follow = true; index += 1
+        case "--no-follow": parsed.follow = false; index += 1
+        case resuperviseHandOptOutFlag: parsed.handOptOut = true; index += 1
+        case resuperviseFollowModelFlag: parsed.followModel = true; index += 1
+        case resuperviseFollowEffortFlag: parsed.followEffort = true; index += 1
+        case resuperviseSpendReserveFlag: parsed.spendReserve = true; index += 1
+        case "--":
+            parsed.childArgs = Array(args[(index + 1)...])
+            index = args.count
+        default: index += 1
+        }
+    }
+    return parsed
+}
+
+/// Which axes of the effective launch default the session a self-update hands over follows. A
+/// `--follow` and a marked `--no-follow` are taken as written, the latter with the axes its bare
+/// flags name (none, from a build before them: that is cell #14, a typed-model session born under
+/// it stays held). An UNMARKED `--no-follow` came from a build
+/// that also opted a session out because its project declared a model or effort (B-1091), and the
+/// only evidence left is the project itself: if it declares an axis, the opt-out is read as the
+/// project's and the session follows; if it declares none, the opt-out was the user's. The
+/// environment opt-out is honoured either way.
+func resupervisedFollow(_ parsed: ResuperviseArgs, project: ProjectPolicy,
+                        environmentAllows: Bool = autoFollowEnabled(args: [])) -> FollowAxes {
+    if parsed.follow { return .both }
+    if parsed.handOptOut {
+        return FollowAxes(model: parsed.followModel, effort: parsed.followEffort)
+    }
+    return environmentAllows && (project.model != nil || project.effort != nil) ? .both : .none
+}

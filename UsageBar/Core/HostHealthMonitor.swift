@@ -1,0 +1,235 @@
+import Foundation
+
+/// THE WATCH ITSELF: what runs a sample, what it writes, and who it tells. Glue between the pure
+/// rules (HostHealthLogic.swift) and the syscalls (HostHealthReaders.swift), on the division
+/// `DryPoolNotifier` keeps from `DryPoolLogic`.
+///
+/// IT KEEPS NO TIMER OF ITS OWN, which is the point of putting it here rather than in a daemon.
+/// The footprint sampler already ticks for the life of the process (every two seconds with the
+/// board up, every ten behind it), and this rides that tick and throttles itself to one sample a
+/// minute by the clock (`ProcessFootprintTiming.retime` is where it is called). A second timer
+/// would be a second thing to get wrong for a reading that is one minute coarse.
+///
+/// THE STATE IS MEMORY, WITH ONE EXCEPTION. A restart begins the run count again, which is the
+/// honest reading of "this process has not been watching": the alternative is an app that comes up
+/// after an update, reads a run of three from an hour ago and announces a machine that is fine.
+/// The exception is an ALARM the previous run published within `staleAfter`: an update restart
+/// lands in the middle of one, and announcing it a second time tells nobody anything
+/// (`HostHealthLogic.restore`, from the report this file already writes).
+///
+/// IT ENDS NOTHING. This version samples, publishes, logs and tells. Nothing here kills a process
+/// or stops a supervisor, and the incident that produced it wanted that separated so the reporting
+/// half could be trusted first.
+@MainActor
+final class HostHealthMonitor {
+    static let shared = HostHealthMonitor()
+
+    private var tracker = HostHealthTracker()
+    /// When the last sample was taken, which is the whole of the throttle. Nil before the first,
+    /// so the first tick after launch samples at once rather than a minute later.
+    private var lastSampledAt: Date?
+    /// The sample still in flight, which the next one waits on. One chain rather than a queue, so
+    /// two samples never interleave around the alarm scan and two reports can never land on disk
+    /// in the opposite order to the one they were taken in.
+    private var inFlight: Task<Void, Never>?
+    /// Whether the report a previous run left behind has been looked at, which happens once.
+    private var restoreTried = false
+
+    private init() {}
+
+    /// Whether the host watch is in alarm right now, and when it last raised one: read by the CPU
+    /// watch so the two never announce the same moment (CPUAlertLogic.hostQuiet).
+    var isAlarmed: Bool { tracker.state == .alarmed }
+    var lastAlarmAt: Date? { tracker.lastAlarm?.at }
+
+    /// Volatile launch flag (argument domain, so nothing persists): `-UsageBarHostHealthTest`
+    /// reports a CPU share of 97% to the rules instead of the machine's own, which walks the alarm
+    /// branch on a quiet machine. The memory reading is left alone, so what a run of this proves
+    /// is exactly the path a real alarm takes: three samples over the line, one notification, one
+    /// log line, one report with the top three in it.
+    ///
+    /// THE RUN IS NOT SHORTENED WITH IT, deliberately: a flag that also changed the threshold rule
+    /// would verify a path the machine never takes. Three samples at one minute each is what it
+    /// costs to watch this happen.
+    private lazy var testCPU: Double? =
+        UserDefaults.standard.bool(forKey: "UsageBarHostHealthTest") ? 97 : nil
+
+    /// The ten-second CPU windows the minute's share is the mean of (`HostCPUWindows`), and whether
+    /// the unreadable state has been written down: once per transition, not once per minute.
+    private var cpuWindows = HostCPUWindows()
+    private var cpuUnreadLogged = false
+
+    /// The latest minute's CPU witness, read by other code in the same process: the share, whether
+    /// it is over the line, and when it was judged. Nil fields mean CPU could not be read that
+    /// minute.
+    private(set) var latestCPU: (percent: Double?, over: Bool?, at: Date?) = (nil, nil, nil)
+
+    /// One tick of whatever is driving the sampler. Almost every one of these is a clock comparison
+    /// and nothing else.
+    func tick(now: Date = Date()) {
+        // One syscall every ten seconds, before the throttle: the windows need a finer clock than
+        // the minute the rest of the sample runs on.
+        if cpuWindows.due(at: now) {
+            let counters = HostHealthReaders.cpuCounters()
+            cpuWindows.observe(busy: counters?.busy, total: counters?.total, at: now)
+        }
+        if let last = lastSampledAt, now.timeIntervalSince(last) < HostHealthLogic.sampleInterval {
+            return
+        }
+        lastSampledAt = now
+        let previous = inFlight
+        inFlight = Task {
+            await previous?.value
+            await sample(at: now)
+        }
+    }
+
+    /// One sample: read, fold, publish, and say something only if the machine has just crossed.
+    ///
+    /// ONLY THE READING AND THE FOLD RUN ON THE MAIN THREAD. The process-table walk and the two
+    /// files go to a background task (a field report: the publish alone held the main thread past
+    /// two seconds at load 40), because the moment this watch has something to say is exactly the
+    /// moment the disk and the scheduler are slowest to answer.
+    private func sample(at now: Date) async {
+        // The test flag fakes a CPU share to walk the alarm branch, so it must not resume a real alarm.
+        if !restoreTried {
+            restoreTried = true
+            if testCPU == nil, let resumed = await Task.detached(priority: .utility, operation: {
+                HostHealthLogic.restoreFromDisk(at: now)
+            }).value { tracker = resumed }
+        }
+        // A machine that will not answer is not a machine that is fine: nothing is folded in,
+        // because a reading of zero free bytes would raise an alarm. The next sample asks again.
+        guard var reading = HostHealthReaders.reading() else { return }
+        let limits = HostHealthLimits.from(.standard)
+        let minute = cpuWindows.take()
+        reading.cpuPercent = testCPU ?? minute.percent
+        reading.cpuWindows = testCPU == nil ? minute.windows : HostCPUWindows.minimumWindows
+        // The unreadable state is written down when it BEGINS, and the end of it re-arms the line.
+        var unreadLine: String?
+        if testCPU == nil, reading.cpuPercent == nil, !cpuUnreadLogged {
+            unreadLine = hostHealthCPUUnreadLine(reason: minute.unreadReason ?? "windows", now: now)
+        }
+        cpuUnreadLogged = reading.cpuPercent == nil
+        // The minute line for the load history. A faked reading (-UsageBarHostHealthTest) never goes
+        // in: it would be counted as a real minute over the gate.
+        let loadSample = testCPU == nil
+            ? HostLoadSample(at: now, load1: reading.load1, freeBytes: reading.freeBytes,
+                             memPct: HostHealthReaders.memoryFreePercent(),
+                             cpuPct: hostLoadCPUPct(reading.cpuPercent), cores: reading.cores,
+                             swapBytes: HostHealthReaders.swapUsedBytes(),
+                             pressure: HostHealthReaders.pressureLevel())
+            : nil
+        let (next, event) = HostHealthLogic.advance(tracker, reading: reading, at: now, limits: limits)
+        tracker = next
+        latestCPU = (reading.cpuPercent, HostHealthLogic.cpuOver(reading, limits), now)
+        var renamedTop: [HostHealthCPUProcess]?
+        // THE EXPENSIVE READING HAPPENS HERE AND NOWHERE ELSE: only the sample that RAISES an alarm
+        // walks the process table, so the steady state pays for two syscalls a minute and nothing
+        // more (`HostHealthReaders.heaviest`).
+        if event == .alarm {
+            let (top, threads) = await Task.detached(priority: .utility) {
+                (HostHealthReaders.heaviest(), HostHealthReaders.threadCensus())
+            }.value
+            let sessions = boardSessions()
+            // A CPU alarm also names what is burning CPU: two seconds of sampling, once per alarm.
+            let cpuTop = HostHealthLogic.cpuExceeds(reading, limits)
+                ? await Task.detached(priority: .utility) {
+                    await HostHealthReaders.busiest(sessions: sessions)
+                }.value
+                : nil
+            tracker.lastAlarm = HostHealthAlarm(at: now, load1: reading.load1,
+                                                freeBytes: reading.freeBytes, top: top, cpuTop: cpuTop,
+                                                threads: threads, cpuPercent: reading.cpuPercent,
+                                                memoryAvailablePercent: reading.memoryAvailablePercent)
+            tracker.namedLeader = HostHealthLogic.leaderKey(cpuTop)
+        } else if HostHealthLogic.renameDue(tracker, reading: reading, at: now, limits: limits) {
+            // AN ALARM THAT IS STILL ON LOOKS AGAIN every ten minutes: the culprit that started it
+            // is often not the one still burning (2026-10-19, a virtual machine at 13:34, a render
+            // and an encode at 14:07, and the banner named only the first).
+            let sessions = boardSessions()
+            let cpuTop = await Task.detached(priority: .utility) {
+                await HostHealthReaders.busiest(sessions: sessions)
+            }.value
+            let (next, news) = HostHealthLogic.rename(tracker, cpuTop: cpuTop, at: now)
+            tracker = next
+            if news { renamedTop = cpuTop }
+        }
+        let report = HostHealthLogic.report(tracker, reading: reading, at: now, limits: limits)
+        let handover = renamedTop.map { HostHealthLogic.handoverReport(report, cpuTop: $0, at: now) }
+        let line = event.map { hostHealthLogLine($0, report: report, now: now) }
+            ?? handover.map { hostHealthLogLine(.handover, report: $0, now: now) }
+        await Task.detached(priority: .utility) {
+            Self.publish(report)
+            if let line { Self.append(line) }
+            if let unreadLine { Self.append(unreadLine) }
+            if let loadSample { HostLoadHistoryWriter.append(loadSample) }
+        }.value
+        // A RECOVERY IS WRITTEN DOWN AND NOT ANNOUNCED. Somebody reading the log afterwards needs
+        // to know when it ended; nobody needs a banner saying their machine is working again.
+        if event == .alarm { post(report, limits: limits) }
+        if let handover { post(handover, limits: limits) }
+    }
+
+    /// The board's live sessions, read on the main actor (memory only) and handed to the background
+    /// sample, which resolves each culprit to one of them (B-693).
+    private func boardSessions() -> [HostHealthSession] {
+        SessionRosterStore.shared.rows.compactMap { row in
+            pid_t(row.id).map { HostHealthSession(supervisor: $0, child: row.childPid,
+                                                  accountID: row.accountID) }
+        }
+    }
+
+    // MARK: Publishing
+
+    /// Rewrite `~/.usagebar/host-health.json`. Atomic, because the readers are other processes: a
+    /// `usagebar status` that read this file mid-write would print a parse failure as an absent
+    /// section, which is the one answer this file must never produce by accident.
+    nonisolated private static func publish(_ report: HostHealthReport) {
+        guard let data = encodeHostHealthReport(report) else { return }
+        let file = hostHealthReportFile
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        // `.atomic` is a write to a neighbouring temporary and a `rename(2)` over the destination,
+        // which is one act for every reader: nobody sees a half-written document, and nobody sees
+        // the file missing either. The same primitive `~/.usagebar/snapshot.json` is published with
+        // (`UsageSnapshot.write`), and for the same reason: another process reads it.
+        try? data.write(to: file, options: .atomic)
+    }
+
+    /// Append one line to `file`, `~/.usagebar/logs/host-health.log` unless told otherwise (the CPU
+    /// watch writes its own log through this too).
+    ///
+    /// 0644 LIKE ITS NEIGHBOURS AND UNLIKE `input.log`, which is the distinction that file's own
+    /// note draws: this holds events ABOUT the machine (a load average, a free figure, three
+    /// executable names), not content out of somebody's conversation.
+    nonisolated static func append(_ line: String, to file: URL = hostHealthLogFile) {
+        let payload = Data(line.utf8)
+        if let handle = try? FileHandle(forWritingTo: file) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: payload)
+        } else {
+            try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(),
+                                                     withIntermediateDirectories: true)
+            try? payload.write(to: file)
+        }
+    }
+
+    /// One banner, through the same authorization the other alerts ask for (`SystemAlert.post`
+    /// requests it and answers whether the alert will actually be seen).
+    ///
+    /// THE DELIVERY RESULT IS NOT CONSULTED, on the terms `DryPoolNotifier` states: this alert
+    /// re-arms on its own as soon as the machine recovers and crosses again, so a refused one comes
+    /// back around without any bookkeeping.
+    private func post(_ report: HostHealthReport, limits: HostHealthLimits) {
+        let body = hostHealthAlarmBody(report, limits: limits, localized: L)
+        let title = hostHealthAlarmTitle(report, localized: L)
+        Task {
+            // Check at delivery, not at the start of the potentially slow culprit scan. Sampling,
+            // reports, logs and the host-alarm mirror still run when banners are disabled.
+            guard HostHealthLogic.alertsEnabled(.standard) else { return }
+            _ = await SystemAlert.post(title: title, body: body)
+        }
+    }
+}

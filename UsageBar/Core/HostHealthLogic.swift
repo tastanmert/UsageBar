@@ -1,0 +1,484 @@
+import Foundation
+
+// WHETHER THE MACHINE ITSELF IS STILL STANDING UP, which is the one question every other watchdog
+// on this machine is unable to ask.
+//
+// WHY IT LIVES HERE AT ALL. On 2026-09-05 a harness starved this laptop: 127 of 128 GB held, an
+// exec storm at load 273, no idle CPU left. Every watchdog that was supposed to notice lived INSIDE
+// the processes being starved, so each of them was as slow as the thing it was watching and none of
+// them said anything. UsageBar is already resident, already sampling, and is not part of the workload
+// it would be reporting on, so it is the one process on this machine that can still say "the
+// machine is short" while the machine is short.
+//
+// EVERYTHING IN THIS FILE IS PURE, the split this repository makes everywhere it takes a reading
+// (`ProcessTreeReaders.swift` beside `ProcessTreeStats.swift`): the syscalls are in
+// HostHealthReaders.swift, the notification and the files are in HostHealthMonitor.swift, and what
+// is here can be stated in an assertion harness with no machine under it. Foundation only, so the
+// CLI target compiles it too: the app WRITES the report and `usagebar status` and the supervisor READ
+// it, which is two processes speaking through one file and therefore one record compiled twice
+// (project.yml states the rule this repository applies to every such pair).
+//
+// IT DECIDES NOTHING ABOUT WHAT TO DO. This first version samples, states, logs and tells; nothing
+// here kills a process or stops a supervisor, and nothing here is meant to be read as a step
+// towards doing so without somebody deciding that separately.
+
+/// What one sample read off the machine.
+struct HostHealthReading: Equatable, Sendable {
+    /// The one-minute load average (`getloadavg`). A DISPLAY value since B-4094: it counts runnable
+    /// and uninterruptible threads, so two virtual machines queueing threads read 140 on a machine
+    /// whose CPU is half idle, and nothing is decided on it any more.
+    var load1: Double
+    /// How many cores that load is spread over, which is what makes it comparable between machines.
+    var cores: Int
+    /// What could be handed out right now without paging: free plus inactive plus purgeable.
+    /// Deliberately NOT counting the compressor, which is memory already spent.
+    var freeBytes: UInt64
+    /// How busy the whole machine was over this minute, 0 to 100: the mean of the ten-second
+    /// windows (`HostCPUWindows`), nil when too few windows could be read to say.
+    var cpuPercent: Double? = nil
+    /// How many ten-second windows that mean is over.
+    var cpuWindows = 0
+    /// What the machine holds in total, which turns `freeBytes` into a share. Zero when unread.
+    var physicalBytes: UInt64 = 0
+
+    /// Free memory as a share of the machine's, nil when the total is unread.
+    var memoryAvailablePercent: Double? {
+        physicalBytes > 0 ? Double(freeBytes) / Double(physicalBytes) * 100 : nil
+    }
+}
+
+/// One process named in an alarm.
+///
+/// A NAME AND A NUMBER, NEVER AN ARGUMENT LIST. The rule is the card's own
+/// (`ProcessFootprint.memoryLeader`): the name is the EXECUTABLE's, because argv is a string that
+/// can carry a token and this record is written to a file and read into a conversation.
+struct HostHealthProcess: Codable, Equatable, Sendable {
+    var name: String
+    /// What it holds in physical memory, in bytes (`ri_phys_footprint`).
+    var rss: UInt64
+}
+
+/// What the machine looked like at the instant an alarm was raised, kept so that the report can
+/// still say what happened after the load has come back down.
+struct HostHealthAlarm: Codable, Equatable, Sendable {
+    var at: Date
+    var load1: Double
+    var freeBytes: UInt64
+    /// The three biggest memory holders, most first, read once at this instant and never again
+    /// (`HostHealthReaders.heaviest` states what that costs and why it is affordable only here).
+    var top: [HostHealthProcess]
+    /// The three busiest processes by CPU, most first, read only when the LOAD witness raised the
+    /// alarm (a memory-only alarm leaves it absent). Added 2026-10-02: a load-227 alarm listed the
+    /// memory holders while a stuck system scan burning 188% was the cause, and nobody could tell.
+    var cpuTop: [HostHealthCPUProcess]? = nil
+    /// The thread census at this instant (`HostHealthReaders.threadCensus`). Added 2026-10-03: nine
+    /// load spikes of 180 to 316 with CPU not full named no culprit, and load counts runnable and
+    /// uninterruptible threads, not CPU.
+    var threads: HostHealthThreads? = nil
+    /// The CPU share the alarm was raised at, and the free-memory share, for the sentence and the
+    /// banner (B-4094). Optional and last: a report written before them decodes.
+    var cpuPercent: Double? = nil
+    var memoryAvailablePercent: Double? = nil
+}
+
+/// Threads at an alarm. Thread figures cover only the processes this user may inspect (libproc
+/// answers nothing about root's without privilege); `processes` counts every pid on the machine.
+struct HostHealthThreads: Codable, Equatable, Sendable {
+    var running: Int
+    var uninterruptible: Int
+    var total: Int
+    var processes: Int
+    /// Programs holding the most threads, summed by executable name, most first.
+    var top: [HostHealthThreadHolder]
+}
+
+struct HostHealthThreadHolder: Codable, Equatable, Sendable {
+    var name: String
+    var threads: Int
+}
+
+/// One process named in a load alarm, by what it is burning.
+struct HostHealthCPUProcess: Codable, Equatable, Sendable {
+    /// The executable's display name, never an argument (the `HostHealthProcess` rule).
+    var name: String
+    /// Share of ONE core, Activity Monitor's unit: a process on two full cores reads 200.
+    var percent: Double
+    /// The checkout its working directory is in, nil when it is in none or cannot be read.
+    var project: String?
+    /// Whether its executable is the operating system's own (`hostHealthIsSystemPath`).
+    var system: Bool
+    /// The supervised session it runs under, by the name Claude Code gave it (`geo-12`), nil when
+    /// it is in none or the session has no name to read (B-693). Optional and last: a report
+    /// written before it decodes, and one written by this build carries it only when known.
+    var session: String? = nil
+    /// The app macOS holds responsible for an OS executable, by name (a virtual machine started
+    /// for Docker reads `Docker`). Set only for `system` processes whose responsible process is
+    /// inside an app bundle, and nil whenever the kernel does not say (B-2238). Optional and last:
+    /// a report written before it decodes.
+    var app: String? = nil
+
+    /// Who it belongs to: the session, else the checkout, else the responsible app, else `system`
+    /// for an OS executable, else nobody (the name already says it). The banner, its title and the
+    /// log line all name owners by this one rule.
+    func owner(system label: String) -> String? {
+        (session ?? project ?? app).map(keystrokeStripped) ?? (system ? label : nil)
+    }
+}
+
+/// Which side of the line the machine is on.
+enum HostHealthPhase: String, Codable, Equatable, Sendable {
+    case normal
+    case alarmed
+}
+
+/// The document the app publishes at `~/.usagebar/host-health.json`, rewritten on every sample.
+///
+/// ADDITIVE FOR EVER, the compatibility rule every file this repository writes for another of its
+/// own processes is under: an older `usagebar` and a newer app coexist on a machine for as long as a
+/// session runs, so a field may be appended and may never change meaning.
+struct HostHealthReport: Codable, Equatable, Sendable {
+    var sampledAt: Date
+    var load1: Double
+    var cores: Int
+    var freeBytes: UInt64
+    var state: HostHealthPhase
+    /// Since when the machine has been in that state.
+    var since: Date
+    /// The last alarm this app raised, kept across the recovery so a person arriving afterwards can
+    /// still read what it was. Absent until one has been raised.
+    var lastAlarm: HostHealthAlarm?
+    /// Who the alarm last named and when (`HostHealthTracker.namedLeader`/`namedAt`), so a restarted
+    /// app resumes the naming it announced rather than the one the alarm opened with. Optional and
+    /// last: a report written before them decodes.
+    var namedLeader: String? = nil
+    var namedAt: Date? = nil
+    /// What the alarm is decided on since B-4094, and the one place other processes read it: this
+    /// minute's CPU share, whether that witness is over the line (absent when CPU could not be read,
+    /// which a reader takes as "not busy"), the line it was judged against, and free memory as a
+    /// share. Additive: a report written before them decodes, and `load1` keeps its meaning.
+    var cpuPercent: Double? = nil
+    var cpuOver: Bool? = nil
+    var cpuLimit: Double? = nil
+    var memoryAvailablePercent: Double? = nil
+    /// B-4171: how many threads queue per core (`HostHealthLogic.queuePerCore`) and how bad that is.
+    /// Display only, nothing is decided on it. Absent when the core count is unreadable. Additive.
+    var queuePerCore: Double? = nil
+    var queueLevel: HostHealthQueueLevel? = nil
+}
+
+/// What one folded sample asks the caller to do about it.
+enum HostHealthEvent: String, Equatable, Sendable {
+    /// The machine has just crossed into trouble: notify, and write a line.
+    case alarm
+    /// And back out of it: write a line, tell nobody.
+    case clear
+    /// Still in alarm, but the leader of the CPU list is somebody else than the one last named
+    /// (`HostHealthLogic.rename`): write a line, notify once more.
+    case handover
+}
+
+/// The watch's memory between samples. Held in the app's own memory. A restart starts the count
+/// again, except for an alarm the previous run published a moment ago (`HostHealthLogic.restore`).
+struct HostHealthTracker: Equatable, Sendable {
+    var state: HostHealthPhase = .normal
+    /// When the current state began, and nil before the first sample.
+    var since: Date?
+    /// How many samples in a row have been over the line, and under it. Both are kept because the
+    /// two directions are counted separately: what raises an alarm is a run of readings over, and
+    /// what clears it is a run under, and neither may be answered by the other's count.
+    var over = 0
+    var under = 0
+    var lastAlarm: HostHealthAlarm?
+    /// When the alarm last had its CPU leader named (the alarm itself, or a later `rename`), and
+    /// who that leader was (`HostHealthLogic.leaderKey`).
+    var namedAt: Date?
+    var namedLeader: String?
+}
+
+/// The rules over those readings, and the numbers they are decided against.
+enum HostHealthLogic {
+    static let alertEnabledKey = "hostHealthAlertEnabled"
+
+    /// A separate preference from sustained CPU alerts. Before this switch existed, CPU alert was
+    /// the only machine-alert control: preserve an explicit opt-out when seeding the new setting.
+    /// SettingsStore persists the resolved value at initialization so subsequent CPU changes do
+    /// not silently change this independent choice.
+    static func alertsEnabled(_ defaults: UserDefaults) -> Bool {
+        defaults.object(forKey: alertEnabledKey) as? Bool
+            ?? defaults.object(forKey: "cpuAlertEnabled") as? Bool
+            ?? true
+    }
+
+    /// The old load line, three times the core count: 48 on 16 cores. Nothing is DECIDED on it
+    /// since B-4094 (the alarm reads CPU, `HostHealthLimits`); it stays for `usagebar status --history`,
+    /// which counts how often the `~/.claude` gates that still use load would have held.
+    static let loadPerCore = 3.0
+
+    /// The old absolute floor, kept for a machine whose total memory cannot be read: 2 GB. Below
+    /// this the machine is compressing and swapping to hand out anything at all. Otherwise the line
+    /// is a share (`HostHealthLimits.memoryPercent`).
+    static let minimumFreeBytes: UInt64 = 2 * 1024 * 1024 * 1024
+
+    /// How long between samples. ONE MINUTE, which the incident's own shape is what sets: a machine
+    /// takes minutes to starve and the run above means three of these before anything is said, so
+    /// the news is four minutes old at worst and a sample costs two syscalls.
+    static let sampleInterval: TimeInterval = 60
+
+    /// How old a report may be and still be read as NEWS rather than as history: five samples.
+    ///
+    /// A REPORT OUTLIVES THE APP THAT WROTE IT. It is rewritten every minute while UsageBar runs, so an
+    /// alarmed document nobody has touched since then is an app that was closed mid-alarm, and that
+    /// file on disk reads exactly like a machine in trouble right now - to every supervisor that
+    /// starts afterwards, hours or days later. A reader has to be given the age or the silence, and
+    /// the knock cannot be given the age: it says one sentence into somebody's work.
+    ///
+    /// FIVE RATHER THAN TWO, because a missed tick must not turn into silence: a laptop that slept,
+    /// or a sampler that did not get a turn under exactly the load this watch exists to report on,
+    /// is a late sample rather than a stopped app. `hostHealthStatusLine` needs no rule of this kind
+    /// at all - it prints the age beside the reading, which is open to a reader who is looking.
+    static let staleAfter: TimeInterval = 5 * sampleInterval
+
+    /// The load at which this machine is over the line, which is what a report can be read against
+    /// without knowing the rule (`hostHealthStatusLine` prints it as the denominator).
+    static func loadLimit(cores: Int) -> Double { loadPerCore * Double(cores) }
+
+    /// Fold one sample into the watch, returning the next state and what it asks the caller to do.
+    ///
+    /// THE TRANSITION IS THE EVENT, which is the whole of the notification discipline: an event is
+    /// produced by a CROSSING and never by a reading, so a machine that stays over the line for an
+    /// hour is announced once. Nothing here re-announces, and nothing here expires.
+    ///
+    /// The counters are reset at a crossing so the run that clears an alarm is counted from the
+    /// alarm, not from whatever happened before it.
+    ///
+    /// A CPU READING THAT COULD NOT BE TAKEN IS NEITHER OVER NOR UNDER: with memory in no trouble
+    /// the counters stay where they were, so an unreadable minute neither raises an alarm nor clears
+    /// the one that is on (B-4094).
+    static func advance(_ tracker: HostHealthTracker, reading: HostHealthReading,
+                        at now: Date, limits: HostHealthLimits = .standard)
+        -> (HostHealthTracker, HostHealthEvent?) {
+        var next = tracker
+        if next.since == nil { next.since = now }
+        let over = exceeds(reading, limits)
+        if over || reading.cpuPercent != nil {
+            next.over = over ? next.over + 1 : 0
+            next.under = over ? 0 : next.under + 1
+        }
+        // Which crossing this run has just completed, if any: each state watches its own counter,
+        // and neither may be answered by the other's.
+        let crossing: (phase: HostHealthPhase, event: HostHealthEvent)? = switch tracker.state {
+        case .normal: next.over >= limits.samples ? (.alarmed, .alarm) : nil
+        case .alarmed: next.under >= limits.samples ? (.normal, .clear) : nil
+        }
+        guard let crossing else { return (next, nil) }
+        next.state = crossing.phase
+        next.since = now
+        next.over = 0
+        next.under = 0
+        next.namedAt = crossing.phase == .alarmed ? now : nil
+        next.namedLeader = nil
+        return (next, crossing.event)
+    }
+
+    /// The document one sample publishes, out of the watch it has just been folded into.
+    static func report(_ tracker: HostHealthTracker, reading: HostHealthReading,
+                       at now: Date, limits: HostHealthLimits = .standard) -> HostHealthReport {
+        let queue = queuePerCore(load1: reading.load1, cores: reading.cores)
+        return HostHealthReport(sampledAt: now, load1: reading.load1, cores: reading.cores,
+                                freeBytes: reading.freeBytes, state: tracker.state,
+                                since: tracker.since ?? now, lastAlarm: tracker.lastAlarm,
+                                namedLeader: tracker.namedLeader, namedAt: tracker.namedAt,
+                                cpuPercent: reading.cpuPercent,
+                                cpuOver: cpuOver(reading, limits),
+                                cpuLimit: limits.cpuPercent,
+                                memoryAvailablePercent: reading.memoryAvailablePercent,
+                                queuePerCore: queue, queueLevel: queue.map(queueLevel))
+    }
+}
+
+// MARK: - What the readings are spelled as
+
+/// One figure, at the precision a person reads it at: a decimal below ten and none above it.
+///
+/// SPELLED HERE RATHER THAN WITH A FORMATTER, because every reader of these strings is a machine or
+/// a log: a locale that writes a comma for the decimal point would put a field separator inside a
+/// field. `String(format:)` on a plain double is locale-independent by construction.
+func hostHealthFigure(_ value: Double) -> String {
+    value >= 10 ? String(format: "%.0f", value) : String(format: "%.1f", value)
+}
+
+/// Bytes as whole gigabytes, on the same terms.
+func hostHealthGigabytes(_ bytes: UInt64) -> String {
+    hostHealthFigure(Double(bytes) / 1_073_741_824)
+}
+
+/// The three heaviest processes as one phrase, with the unit each caller wants after each figure.
+/// Empty when the scan found nothing, which reads the same way everywhere: the phrase is left out.
+///
+/// THE NAMES ARE REPAIRED HERE, once, for both of the readers built out of this (`usagebar status`'s
+/// host line and the notification's body): a name is the last component of an executable path and
+/// nothing between the process table and here writes it, so it may hold a newline that would break
+/// a one-line status section in two, or an ESC that a terminal reads as a command rather than as
+/// text. `hostHealthKnockSentence` does not come through this function and repairs its own names
+/// through the same rule (KeystrokeText.swift), so nothing is stripped twice.
+func hostHealthTopText(_ top: [HostHealthProcess], unit: String) -> String {
+    top.map { "\(keystrokeStripped($0.name)) \(hostHealthGigabytes($0.rss))\(unit)" }
+        .joined(separator: ", ")
+}
+
+/// Programs a person can quit without losing anything, which an alarm marks as such. Only names with
+/// a measured incident behind them: `ApplicationsStorageExtension` is System Settings' Storage pane
+/// scanning app sizes, stuck for 1h31m at 188% CPU on 2026-10-02 and gone the moment the pane closed.
+let hostHealthStoppable: Set<String> = ["ApplicationsStorageExtension"]
+
+/// Whether an executable belongs to the operating system rather than to the person, which is the
+/// only case an alarm may call a process "system". `/usr/local` is Homebrew's and the person's.
+func hostHealthIsSystemPath(_ path: String) -> Bool {
+    if path.hasPrefix("/usr/local/") { return false }
+    return ["/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/"].contains { path.hasPrefix($0) }
+}
+
+/// The busiest processes as one phrase: `name 188% (system) · can stop, node 104% (geo-12)`.
+/// `stoppable` carries its own separator, so each language spaces it its own way. The owner
+/// is the session, else the checkout, else `system` for an OS executable, else nothing (the name
+/// already says it).
+/// `tag` wraps the owner the way the language wants its parentheses.
+func hostHealthCPUText(_ top: [HostHealthCPUProcess], system: String, stoppable: String,
+                       tag: (String) -> String = { " (\($0))" }) -> String {
+    top.map { entry in
+        let name = keystrokeStripped(entry.name)
+        let owner = entry.owner(system: system)
+        return "\(name) \(String(format: "%.0f", entry.percent))%"
+            + (owner.map(tag) ?? "")
+            + (hostHealthStoppable.contains(entry.name) ? stoppable : "")
+    }
+    .joined(separator: ", ")
+}
+
+/// The banner's body. `localized` is the app's `L`, handed in so this stays pure. A CPU alarm names
+/// what is burning CPU; a memory alarm names what holds memory; both at once gets a second line.
+func hostHealthAlarmBody(_ report: HostHealthReport, limits: HostHealthLimits = .standard,
+                         localized: (String) -> String) -> String {
+    let alarm = report.lastAlarm
+    let memory = hostHealthTopText(report.lastAlarm?.top ?? [], unit: "GB")
+    let cpu = hostHealthCPUText(alarm?.cpuTop ?? [], system: localized("system"),
+                                stoppable: localized(" · can stop"),
+                                tag: { String(format: localized(" (%@)"), $0) })
+    let named = [cpu, memory].first { !$0.isEmpty } ?? localized("unknown")
+    let share = (alarm?.cpuPercent ?? report.cpuPercent).map(hostHealthFigure) ?? "?"
+    var body = String(format: localized("CPU %1$@%% (%2$@ cores) · free memory %3$@ GB · top: %4$@"),
+                      share, String(report.cores), hostHealthGigabytes(report.freeBytes), named)
+    let memoryShort = alarm.map {
+        HostHealthLogic.memoryShort(availablePercent: $0.memoryAvailablePercent,
+                                    freeBytes: $0.freeBytes, limits)
+    } ?? false
+    if !cpu.isEmpty, !memory.isEmpty, memoryShort {
+        body += "\n" + String(format: localized("memory: %@"), memory)
+    }
+    return body
+}
+
+/// The banner's title, carrying the first culprit: macOS stacks UsageBar's banners and summarises the
+/// stack from titles and opening words, so a name left to the body is a name nobody reads
+/// (2026-10-02, a summary of sixteen banners read "load too high; free space low").
+func hostHealthAlarmTitle(_ report: HostHealthReport, localized: (String) -> String) -> String {
+    let culprit = report.lastAlarm?.cpuTop?.first
+    let first = culprit?.name ?? report.lastAlarm?.top.first?.name
+    let name = first.map(keystrokeStripped) ?? ""
+    guard !name.isEmpty else { return localized("Host under pressure") }
+    let owner = culprit?.owner(system: localized("system"))
+        .map { String(format: localized(" (%@)"), $0) } ?? ""
+    return String(format: localized("Host under pressure: %@"), name + owner)
+}
+
+/// One line for `~/.usagebar/logs/host-health.log`.
+///
+/// THE SAME SHAPE AS `~/.usagebar/logs/input.log`: an ISO instant, then fixed-offset `key=value`
+/// fields for an eye and a `grep`, and the one field that can contain a space last. The names in it
+/// are executable names, never arguments (`HostHealthProcess`).
+///
+/// AND ONE LINE PER EVENT IS THE FORMAT ITSELF, which is why the names are repaired here too: a
+/// newline inside one of them would split a record in half, and a `grep` for `host-health=alarm`
+/// would return a line with no reading on it and leave a second line that belongs to no event. The
+/// entry is kept even when its name strips to nothing, unlike the sentence's: this is a record, and
+/// what it holds is a figure that was measured.
+func hostHealthLogLine(_ event: HostHealthEvent, report: HostHealthReport,
+                       now: Date = Date()) -> String {
+    let top = report.state == .alarmed ? (report.lastAlarm?.top ?? []) : []
+    let names = top.map { "\(keystrokeStripped($0.name)):\(hostHealthGigabytes($0.rss))G" }
+        .joined(separator: ",")
+    // CPU before memory: `top=` stays last, where readers of this format already look for it.
+    let busy = report.state == .alarmed ? (report.lastAlarm?.cpuTop ?? []) : []
+    let cpu = busy.map { entry in
+        keystrokeStripped(entry.name) + (entry.owner(system: "system").map { "[\($0)]" } ?? "")
+            + ":\(String(format: "%.0f", entry.percent))%"
+    }
+    .joined(separator: ",")
+    let threads = report.state == .alarmed ? report.lastAlarm?.threads : nil
+    return "\(ISO8601DateFormatter().string(from: now)) host-health=\(event.rawValue) "
+        + "load=\(hostHealthFigure(report.load1)) cores=\(report.cores) "
+        + (report.cpuPercent.map { "cpu_pct=\(hostHealthFigure($0)) " } ?? "")
+        + "free=\(hostHealthGigabytes(report.freeBytes))G"
+        + (threads.map { t in
+            " thr=r\(t.running),u\(t.uninterruptible),t\(t.total) procs=\(t.processes) nthr="
+                + t.top.map { "\(keystrokeStripped($0.name)):\($0.threads)" }.joined(separator: ",")
+        } ?? "")
+        + (cpu.isEmpty ? "" : " cpu=\(cpu)")
+        + (names.isEmpty ? "\n" : " top=\(names)\n")
+}
+
+/// The one sentence a supervised session is told, when the machine goes into alarm underneath it.
+///
+/// ONE LINE, AND A REFERENCE RATHER THAN A PAYLOAD. It says what is wrong and what is holding the
+/// memory, and nothing else: whoever reads it has `~/.usagebar/logs/host-health.log` and
+/// `~/.usagebar/host-health.json` for the rest, and a session in the middle of a work package should
+/// not have a report pasted into it.
+///
+/// THE NAMES ARE REPAIRED RATHER THAN TRUSTED, through the one rule this repository has for what
+/// may go on a terminal's input queue (KeystrokeText.swift): a process name is the last component
+/// of an executable path, nothing between the process table and here writes it, and a filename may
+/// hold a newline or an ESC. Here the STRIP is the answer rather than the refusal `quotaKnockName`
+/// makes, because the two are read for different things: an account name is acted on, so a repaired
+/// one that no longer resolves is worse than none, while this names something to go and look at,
+/// and a name that merely reads right still does that. One that strips to nothing is left out
+/// rather than printed as an empty field.
+///
+/// AND THE WHOLE LINE IS CUT BY BYTES, with `limit` handed in the way `quotaKnockMessage` takes its
+/// own: the budget belongs to the channel the caller owns, which this file knows nothing about
+/// (200 bytes at 30ms each, `sessionInputMaxBytes`). Bytes rather than `String.prefix`, which
+/// counts CHARACTERS: 200 CJK ones are 600 bytes and eighteen seconds of a poll loop that is
+/// blocked for every one of them.
+func hostHealthKnockSentence(_ alarm: HostHealthAlarm, bytes limit: Int) -> String {
+    let names = alarm.top.map { keystrokeStripped($0.name) }.filter { !$0.isEmpty }
+        .joined(separator: ",")
+    let line = "[host-health] "
+        + (alarm.cpuPercent.map { "cpu=\(hostHealthFigure($0))% " } ?? "")
+        + "free=\(hostHealthGigabytes(alarm.freeBytes))GB"
+        + (names.isEmpty ? "" : " top=\(names)")
+    return keystrokeClipped(line, bytes: limit)
+}
+
+/// Where the app publishes the report, and where both readers look for it.
+let hostHealthReportFile = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("\(BrandPaths.stateDirName)/host-health.json")
+
+/// And the log beside it.
+let hostHealthLogFile = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("\(BrandPaths.stateDirName)/logs/host-health.log")
+
+/// The one decoder both targets use, so a document this build cannot read means the same thing to
+/// each of them.
+func decodeHostHealthReport(_ data: Data?) -> HostHealthReport? {
+    guard let data else { return nil }
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return try? decoder.decode(HostHealthReport.self, from: data)
+}
+
+/// And the one encoder, for the same reason.
+func encodeHostHealthReport(_ report: HostHealthReport) -> Data? {
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    return try? encoder.encode(report)
+}

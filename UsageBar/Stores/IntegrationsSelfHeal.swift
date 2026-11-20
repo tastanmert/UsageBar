@@ -1,0 +1,361 @@
+import Foundation
+
+// Putting the prompt hooks back when something takes them out.
+//
+// The hooks live in the user's settings.json, which is not ours: it is their whole harness
+// configuration, it is edited by hand, and on shared setups one physical file stands behind several
+// config homes. Anything that rewrites it wholesale - another tool's config sync, a restore from a
+// dotfiles repo, an editor saving a stale buffer - takes our entry with it, silently. The user then
+// types `/usagebar` or `/usagebar` and gets a model turn instead of a free answer, with
+// nothing anywhere saying why. Until now the only repair was relaunching the app, because the sync
+// runs once at launch (`autoUpdateSkill`, AppDelegate).
+//
+// So the app watches those files and re-runs the sync it already has. Nothing here installs
+// anything new: the whole of the repair is calling `syncPromptCommands`, which is idempotent and
+// already knows how to leave a user's own entries alone (IntegrationsPromptCommand.swift).
+//
+// TWO THINGS IT MUST NOT DO, and both are guards rather than good intentions:
+//
+//   - IT MUST NOT LOOP. The repair WRITES settings.json, that write is a filesystem event, and the
+//     event arrives back here. The gate is "everything is already in place, so do nothing", asked
+//     before anything is written, which makes the second pass a no-op and ends the cycle.
+//   - IT MUST NOT UNDO AN UNINSTALL. A user who turns the integration off in Settings has said
+//     something, and an app that put it back within seconds would be overriding them with a
+//     watchdog. Absence of the SKILL.md is what says so: it is what the uninstall removes, and it is
+//     read off the disk rather than off the manifest, which records what was installed once and not
+//     what is wanted now.
+
+/// Whether a changed path is one of the directories holding a settings file we registered in.
+///
+/// EXACTLY those directories, never anything below them, and that is the whole filter. FSEvents is
+/// asked at directory granularity, so an event names the folder; but the folder here is a provider
+/// config home, one of the busiest on the machine - every running session writes through
+/// `projects/`, and `.claude.json` is rewritten constantly. Accepting a subdirectory would turn
+/// ordinary typing into a stream of wake-ups for a file nobody touched.
+///
+/// Pure and exported so the rule is testable without a filesystem.
+func settingsEventIsInteresting(path: String, watching directories: [String]) -> Bool {
+    settingsEventIsInteresting(path: path,
+                               trimmedDirectories: Set(directories.map(withoutTrailingSlash)))
+}
+
+/// The same rule against directories already passed through `withoutTrailingSlash`, so each event
+/// costs one trim and one hash lookup rather than a trim per watched directory (a field report).
+func settingsEventIsInteresting(path: String, trimmedDirectories: Set<String>) -> Bool {
+    trimmedDirectories.contains(withoutTrailingSlash(path))
+}
+
+/// What the heal's inputs looked like: `config` (settings files, SKILL.md, helper) triggers a pass
+/// on any change, `state` (`.claude.json`, rewritten by every claude process) only on a throttle.
+struct HealFingerprint: Equatable, Sendable {
+    var config: [String: String]
+    var state: [String: String]
+}
+
+extension IntegrationsStore {
+    /// Whether the hooks need putting back, given what is installed and where.
+    ///
+    /// Static and fully injected so both answers it has to get right are testable without touching a
+    /// real config home: "nothing is missing, so do nothing" (the loop guard) and "nothing is
+    /// installed here, so do nothing" (the uninstall).
+    ///
+    /// The order matters only for cost - the uninstall check is a file read per home, the currency
+    /// check is that plus a settings parse - but the SECOND is the one that ends the write-event-
+    /// write cycle, so it can never be skipped for a machine where the first passes.
+    /// - Parameter binary: the helper the entries are expected to name (this app's, from the heal).
+    ///   Injected so a test can state a path without owning an app bundle.
+    /// - Parameter nativePicker: whether the registration is the tool-plus-backstop pair or the
+    ///   plain command hook, which is the installed Claude Code's answer (IntegrationsMCPServer)
+    ///   and is injected here for the same reason the binary is: a test states it rather than
+    ///   depending on which Claude Code the machine running the suite happens to have. Both are
+    ///   resolved by the caller on the main actor, so this can run on the watcher's background hop.
+    nonisolated static func hooksNeedHealing(skillFiles: [URL], population: [URL],
+                                             binary helper: URL,
+                                             nativePicker: Bool) -> Bool {
+        let ours = oursAmong(skillFiles)
+        guard !ours.isEmpty else { return false }
+        guard promptCommandsAreCurrent(forSkillFiles: ours, population: population) else { return true }
+        // AND THE ENTRY HAS TO RUN THIS APP. Presence was the only question this asked, and an
+        // entry that is present can still name a binary that is not there: a locally built Release
+        // registered every hook at a path inside its build tree, which holds no bundled CLI, and
+        // from then on every `/usagebar` answered "No such file or directory" and fell through
+        // to a model turn. The watcher was watching, found nothing missing, and healed nothing.
+        //
+        // A path that is merely OLD is the same repair, and it always was: the launch sync rewrites
+        // it silently whenever the app moves (`syncPromptCommands`). This only makes the watcher
+        // able to see the same thing between launches.
+        //
+        // ASKED PER HOME WHILE THE REPAIR WRITES PER GROUP, and the two are the same question, by
+        // construction rather than by luck: `settingsGroups` keys a group on the home's settings.json
+        // RESOLVED path, `syncPromptCommand` writes `homes.first`'s, and `editSettings` resolves
+        // before writing - so the write lands exactly at the group key, which is the physical file
+        // every home in that group reads through. Homes whose settings resolve elsewhere form another
+        // group with a write of its own, so no home is left unwritten. Break any of those three and
+        // the second home of a shared pair asks about a file nothing writes and answers "needs
+        // healing" forever, which is a write-event-write cycle with the write left out.
+        //
+        // EXACTLY ONE REGISTRATION, NAMING THIS APP. Both halves are the health condition, and the
+        // count is the half that reads as pedantry until you see what it catches: something else
+        // rewriting settings.json (a dotfiles merge, two config homes folded into one) can leave two
+        // UsageBar hooks that BOTH name the current binary. Judged on "is any of them wrong" that file
+        // is in perfect health, so the watcher never reaches the repair - while every prompt runs the
+        // command twice, two answers and two writes, forever (codex review of 264f657).
+        //
+        // A set comparison rather than a scan, because the repair's contract is now exactly this
+        // list (`settingsRegisteringPromptHook` collapses to one), so the check face and the write
+        // face state the same sentence: absent, stale, or duplicated are one answer, and it is "fix".
+        //
+        // THE WHOLE ENTRY, not the command lines it happens to contain. Half of a registration is a
+        // tool hook with no command in it at all, so a comparison of command lines would read a
+        // file whose tool hook names the wrong server (or is missing entirely, leaving the backstop
+        // to answer every prompt as text) as being in perfect order. It also covers the shape
+        // change itself: an install made by the previous version holds the single plain command,
+        // which is exactly "not the expected list" and is repaired on the first launch after the
+        // update.
+        //
+        // AND THE SERVER THOSE HOOKS CALL. It lives in another file, per home rather than per
+        // settings group, and its absence is invisible from settings.json: every hook is present
+        // and correct, the tool call finds no server, and the backstop answers as text on that one
+        // account while the others show a picker.
+        return homesCarrying(ours, population: population).contains { home in
+            let settings = home.appendingPathComponent("settings.json")
+            let registered = mcpServerIsRegistered(claudeStateFile(forConfigDir: home),
+                                                   binary: helper)
+            guard registered == nativePicker else { return true }
+            return promptCommands.contains { command in
+                !promptHooksMatch(registeredPromptHooks(settings, hook: command),
+                                  promptHookEntries(helper, command: command,
+                                                    nativePicker: nativePicker))
+            }
+        }
+    }
+
+    /// The physical settings files a registration was recorded in. The manifest is the right source
+    /// here, unlike for the uninstall question above: it is asking WHERE to watch, and a file we
+    /// once registered in is a file worth watching whether or not the entry is in it right now -
+    /// which is precisely the case this feature exists for.
+    static func watchedSettingsDirectories(manifest url: URL = manifestURL) -> [URL] {
+        var seen = Set<String>()
+        // THE SERVER'S OWN FILE JOINS THE HOOKS'. A registration lives in two places now, and only
+        // one of them was watched: the hooks are in `<home>/settings.json` while the MCP server is
+        // in that home's `.claude.json` - which for the DEFAULT account is one level up, in the
+        // user's home directory, so nothing was watching it at all. That account fell back to a
+        // text listing (or a model turn) until the next launch, silently, while every numbered
+        // account healed within seconds (codex review of 512303b).
+        //
+        // MEASURED BEFORE ADDING IT, because the directory it brings in is the busiest one on the
+        // machine (2026-08-07, this repo's scratchpad): at directory granularity `$HOME` woke 2 of
+        // 12 debounce windows over 24 seconds, and the only thing moving in it was `.claude.json`
+        // itself. One heal check reads and parses every home's state document - 657 KB across six
+        // of them here - and takes 3 ms, so the continuous cost is 0.02% of a core. It is also not
+        // a new CLASS of noise: `~/.claude/.claude.json` is inside a directory this watcher has
+        // always watched, and its writes have always woken it.
+        return (promptCommands.flatMap { manifestPaths($0.hookManifest, manifest: url) }
+            + manifestPaths(mcpServerManifest, manifest: url))
+            // BOTH PARENTS, because the file can be written in two different places and only one
+            // of them is where it lives. The manifest records the path a registration was made
+            // THROUGH, which on a shared setup is a symlink (`~/.claude2/settings.json` pointing at
+            // `~/.claude/settings.json`), and FSEvents reports a write where the bytes land:
+            //
+            //   - Something rewriting the CONTENT writes through the link, so the event names the
+            //     RESOLVED parent (`.claude`). Watching only the logical one was deaf to it, which
+            //     is what the first fix corrected (review of 212e25d).
+            //   - Something replacing the FILE writes a temporary and renames it over the path it
+            //     was given - which replaces the SYMLINK, not its target - so the event names the
+            //     LOGICAL parent (`.claude2`) and the resolved one never hears it. That is the
+            //     ordinary atomic-save an editor or a dotfiles tool performs (review of 3af8d67).
+            //
+            // Neither is a special case of the other, so both are watched. Each is resolved in
+            // itself, because the DIRECTORY may be a link even when the file is not, and they
+            // collapse to one entry on the ordinary machine where nothing is linked at all.
+            .flatMap { path -> [URL] in
+                let file = URL(fileURLWithPath: path)
+                return [file.deletingLastPathComponent().resolvingSymlinksInPath(),
+                        file.resolvingSymlinksInPath().deletingLastPathComponent()]
+            }
+            .filter { seen.insert($0.path).inserted }
+    }
+
+    /// Put back whatever is missing, or do nothing. Returns whether anything on disk changed.
+    ///
+    /// The reading runs off the main thread: it is a SKILL.md read and a settings plus state-file
+    /// parse per home, on every settle of the busiest directories on the machine. The repair it may
+    /// lead to is rare and stays here, on the main actor, exactly as the launch sync makes it.
+    ///
+    /// Shared state belongs to the INSTALLED release app, the same rule `autoUpdateSkill` follows: a
+    /// build nobody installed - the dev variant, or any bundle running out of a build products tree
+    /// - must never write into the config homes.
+    func healPromptHooksInBackground() async -> Bool {
+        // BRIM-GATE: Phase 1 keeps this external action disabled.
+        guard BrimFeatures.integrationsSelfHeal else { return false }
+        // BRIM-GATE: automatic maintenance must not edit provider or shell files.
+        guard BrimFeatures.integrationsSelfHeal, !BuildVariant.isUnshipped else { return false }
+        // Resolved here: the picker answer is cached in a main-actor static, and the helper path is
+        // this bundle's. Both go over as plain values.
+        let binary = Self.bundledCLIURL
+        let nativePicker = Self.nativePickerIsSupported
+        // THE GATE IN FRONT OF THE READ (2026-09-27, sampled at 20-55% of the app's CPU). Every
+        // claude process, the app's own usage probes included, rewrites its `.claude.json`, so
+        // nearly every probe woke this and re-parsed every home's state file. The settings files
+        // and SKILL.md are now the only trigger for a full pass; a state file alone is re-checked
+        // at most once per `stateCheckInterval`, which bounds how long a removed server stays out.
+        let previous = healFingerprint
+        let sinceStateCheck = lastStateCheck.map { Date().timeIntervalSince($0) }
+        let extra = "\(binary.path)|\(nativePicker)"
+        let now = await Task.detached(priority: .utility) {
+            Self.healFingerprint(homes: Self.claudeHomes(), skillFiles: Self.installedSkillFiles(),
+                                 extra: extra)
+        }.value
+        switch Self.healGate(previous: previous, current: now, sinceStateCheck: sinceStateCheck) {
+        case .skip:
+            return false
+        case .deferState(let delay):
+            scheduleStateRecheck(after: delay)
+            return false
+        case .run:
+            healFingerprint = now
+            lastStateCheck = Date()
+        }
+        let ours = await Task.detached(priority: .utility) {
+            Self.oursNeedingHeal(binary: binary, nativePicker: nativePicker)
+        }.value
+        guard let ours else { return false }
+        // Re-read those SKILL.md files here: Settings may have removed the skill while the
+        // background read was away, and repairing from the stale list would write it all back.
+        let current = Self.oursAmong(ours)
+        guard !current.isEmpty else { return false }
+        return syncPromptCommands(forSkillFiles: current)
+    }
+
+    /// The longest a state-file-only change waits for its re-check: the bound on how long an MCP
+    /// server another program removed stays out.
+    nonisolated static let stateCheckInterval: TimeInterval = 300
+
+    enum HealGate: Equatable {
+        case run
+        case skip
+        /// Only state files moved and they were read less than an interval ago: look again then.
+        case deferState(TimeInterval)
+    }
+
+    /// Whether a watcher settle runs the heal. Pure so all three answers are testable.
+    nonisolated static func healGate(previous: HealFingerprint?, current: HealFingerprint,
+                                     sinceStateCheck: TimeInterval?,
+                                     interval: TimeInterval = stateCheckInterval) -> HealGate {
+        guard let previous, previous.config == current.config else { return .run }
+        guard previous.state != current.state else { return .skip }
+        guard let since = sinceStateCheck, since < interval else { return .run }
+        return .deferState(interval - since)
+    }
+
+    /// Modification time and size of every file the heal reads, split by how often a change to it
+    /// is worth a pass: the settings.json, state file and slash-command files of every home the
+    /// repair can touch (`homes` plus the homes carrying `skillFiles`, which include a logged-out
+    /// account the manifest still remembers), and the SKILL.md files. `extra` carries the non-file
+    /// inputs (helper path, picker answer).
+    nonisolated static func healFingerprint(homes population: [URL], skillFiles: [URL],
+                                            extra: String) -> HealFingerprint {
+        func stamp(_ url: URL) -> String {
+            let values = try? url.resolvingSymlinksInPath()
+                .resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+            guard let values, let date = values.contentModificationDate else { return "absent" }
+            return "\(date.timeIntervalSinceReferenceDate):\(values.fileSize ?? -1)"
+        }
+        let homes = population + homesCarrying(skillFiles, population: population)
+        var config = ["extra": extra]
+        for url in homes.map({ $0.appendingPathComponent("settings.json") }) + skillFiles {
+            config[url.path] = stamp(url)
+        }
+        for home in homes {
+            for command in promptCommands {
+                let url = promptCommandFile(inHome: home, command: command)
+                config[url.path] = stamp(url)
+            }
+        }
+        var state: [String: String] = [:]
+        for home in homes {
+            let url = claudeStateFile(forConfigDir: home)
+            state[url.path] = stamp(url)
+        }
+        return HealFingerprint(config: config, state: state)
+    }
+
+    /// One held re-check per throttle window, so a burst of state writes schedules it once.
+    private func scheduleStateRecheck(after delay: TimeInterval) {
+        guard stateRecheckTask == nil else { return }
+        stateRecheckTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self else { return }
+            self.stateRecheckTask = nil
+            if await self.healPromptHooksInBackground() { self.refresh() }
+        }
+    }
+
+    /// The skill files to repair from, or nil when nothing needs healing: the whole of the heal's
+    /// reading, callable from any thread.
+    nonisolated static func oursNeedingHeal(binary: URL, nativePicker: Bool) -> [URL]? {
+        let files = installedSkillFiles()
+        guard hooksNeedHealing(skillFiles: files, population: claudeHomes(),
+                               binary: binary, nativePicker: nativePicker) else { return nil }
+        return oursAmong(files)
+    }
+
+    /// Whether the watcher has to be rebuilt, given what it is watching and what it should be.
+    ///
+    /// Pure, because the failure it prevents is invisible: on a machine with nothing installed yet
+    /// the manifest names no directories, so the watcher is never created - and an Install pressed
+    /// in Settings then left the user with no self-heal at all until the next launch. First-time
+    /// users are the ones most likely to need it and the least likely to know it is missing (review
+    /// of 212e25d). A new account's config dir arriving mid-session is the same event.
+    ///
+    /// Compared as SETS: the manifest's order is not a promise, and rebuilding a live FSEvents
+    /// stream because two paths swapped places would be churn for nothing. Nothing to watch is a
+    /// real answer - it means stop, not "leave the old one running".
+    static func settingsWatcherNeedsRestart(current: [URL], desired: [URL]) -> Bool {
+        Set(current.map(\.path)) != Set(desired.map(\.path))
+    }
+
+    /// Watch the settings files the hooks live in, and repair one that loses them.
+    ///
+    /// The watcher's own gate is the heal's decision (`hooksNeedHealing`), so an event that changed
+    /// nothing we care about costs a file read and stops there; `onChange` fires only once a repair
+    /// has actually been made, and refreshes so the Settings row stops claiming an install that is
+    /// no longer true.
+    ///
+    /// Fail-open at every step, like the account watcher it shares its machinery with: no manifest
+    /// entries means nothing to watch and the launch-time sync behaves exactly as it did before.
+    /// Called at launch AND whenever the prompt-hook manifest changes, so an install performed in a
+    /// running app is watched from that moment rather than from the next launch. A no-op when the
+    /// set is unchanged, which is what keeps the repair's own manifest write from rebuilding the
+    /// stream that noticed the damage.
+    func refreshSettingsWatcher() {
+        // The same gate as the repair it exists to run (`healPromptHooksInBackground`), and it has
+        // to be the same one: a watcher whose only action can never fire is an FSEvents stream over
+        // the busiest directories on the machine, woken by every session write, to decide nothing.
+        // Two gates spelt differently here also read as a claim that a build tree may watch but not
+        // write, which is not a distinction anything wants.
+        // BRIM-GATE: automatic maintenance must not edit provider or shell files.
+        guard BrimFeatures.integrationsSelfHeal, !BuildVariant.isUnshipped else { return }
+        let directories = Self.watchedSettingsDirectories()
+        guard Self.settingsWatcherNeedsRestart(current: settingsWatcherRoots,
+                                               desired: directories) else { return }
+        // Stop before starting: two streams over the same directories would answer every event
+        // twice, and the old one's roots are by definition the wrong ones now.
+        settingsWatcher?.stop()
+        settingsWatcher = nil
+        settingsWatcherRoots = directories
+        guard !directories.isEmpty else { return }
+        let watched = Set(directories.map { withoutTrailingSlash($0.path) })
+        let watcher = AccountDirWatcher(
+            roots: directories,
+            // Shorter than the account watcher's three seconds: a wholesale rewrite of settings.json
+            // is one write, not the burst a login produces, and the wait here is time the user's
+            // slash commands spend costing a turn.
+            debounce: .seconds(2),
+            isInteresting: { settingsEventIsInteresting(path: $0, trimmedDirectories: watched) },
+            discoverChanged: { [weak self] in await self?.healPromptHooksInBackground() ?? false },
+            onChange: { [weak self] in self?.refresh() })
+        watcher.start()
+        settingsWatcher = watcher
+    }
+}

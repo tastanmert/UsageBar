@@ -1,0 +1,89 @@
+import Foundation
+
+// The `usagebar hook-agents <event>` subcommand: Claude Code's `SubagentStart`, `SubagentStop` and
+// `Stop` hooks, registered by the app's Integrations pane. Reads the event JSON on stdin and leaves
+// this session's subagent roster for its supervisor to publish (AgentRoster.swift holds the record
+// and every rule; this file is the plumbing around them).
+//
+// THE SAME HARD CONSTRAINTS AS THE OTHER HOOKS, and for the same reason: this runs inside somebody's
+// session, several times a turn, on events they did not ask for. It never throws, never prints,
+// never blocks, and answers 0 whatever happens - a hook that failed loudly would put its complaint
+// on the terminal the child is drawing into for a number nobody in that terminal is looking at.
+
+/// `usagebar hook-agents <event>` - one of Claude Code's three subagent-facing hooks.
+///
+/// A SESSION THIS TOOL DID NOT LAUNCH IS NOT OURS TO REPORT ON: without the supervisor marker in the
+/// environment there is nobody to leave the roster for, so it returns before reading anything.
+func runHookAgents(args: [String]) -> Int32 {
+    guard let supervisor = ProcessInfo.processInfo.environment["\(BrandPaths.envPrefix)SUPERVISOR_PID"],
+          let pid = pid_t(supervisor), supervisorAlive(pid) else { return 0 }
+    let input = FileHandle.standardInput.readDataToEndOfFile()
+    let payload = (try? JSONSerialization.jsonObject(with: input)) as? [String: Any]
+    guard let event = agentRosterEvent(payload, registered: args.first) else { return 0 }
+    // WHOSE EVENT IS THIS. The marker above is inherited by every descendant of a supervised
+    // session, a `claude` launched from inside one included, so a nested session's fan-out would
+    // otherwise be counted against the conversation its parent is having - the defect family
+    // `SupervisedSession.transcriptSessionID` was added to close. Both ends have to be able to say
+    // who they are for this to decide anything, so an event with no id, or a supervisor too old to
+    // publish which conversation it watches, reads as "cannot say" and is recorded: the same
+    // fail-open every other witness on this track takes.
+    let session = (payload?["session_id"] as? String).flatMap {
+        isTranscriptSessionID($0) ? $0 : nil
+    }
+    // ONE INSTANT FOR THE WHOLE RUN, stamped into both documents this hook writes.
+    //
+    // They are compared against each other by a reader that has to know whether a roster describes
+    // THIS boundary (`turnBoundaryAgents`, TurnBoundaryMove.swift), and two `Date()` calls a
+    // microsecond apart fall either side of a second boundary often enough to matter: the roster is
+    // encoded with whole-second resolution, so a run that straddled one would publish a roster
+    // stamped a second BEFORE the turn end it belongs to, and that reader would correctly refuse to
+    // believe it. One instant makes the pairing exact rather than probable.
+    let now = Date()
+    let watching = session == nil ? nil : readSessionContext(pid: supervisor)?.transcriptSessionID
+    if let dropped = hookAgentsDropLine(event, session: session, watching: watching,
+                                        pid: supervisor, now: now) {
+        appendHandoffLine(dropped, to: handoffLog)
+        return 0
+    }
+    let claudeCode = ProcessInfo.processInfo.environment[claudeCodeExecPathVariable]
+    // THE ROSTER LANDS FIRST, AND THE BOUNDARY IS WHAT PUBLISHES THE PAIR. This ordering is a fix
+    // (codex review of d21f2e0, P1): the boundary used to be written first, on the reasoning that
+    // its recorded instant should be as close to the turn end as possible - but the instant is
+    // taken above rather than at the write, so nothing is lost by writing it second, and what is
+    // gained is that no reader can ever see a turn end whose roll call has not landed yet. The
+    // supervisor polls every 2 seconds and the fold below may queue on the roster lock for up to a
+    // quarter of a second; a tick landing in that gap read the PREVIOUS turn's roster against this
+    // turn's boundary, and an empty one there is a session restarted out from under a live fan-out.
+    //
+    // THE READ AND THE WRITE ARE ONE ACT (`recordAgentEvent`), never two here. A fan-out starts its
+    // subagents at once and Claude Code runs this hook per subagent, so these processes race each
+    // other over one document: done as two halves, a fan-out ends with a roster naming whichever
+    // agent happened to write last.
+    recordAgentEvent(event, declared: claudeCodeReportsAgents(executablePath: claudeCode),
+                     pid: supervisor, now: now)
+    // THE TURN BOUNDARY IS A FACT WORTH LEAVING ON ITS OWN, beside the roster this event is folded
+    // into: `Stop` is the moment `usagebar session send` has always been waiting for and had to infer
+    // from 30 seconds of silence (SessionTurnEnd.swift carries the whole reasoning, the fail-open
+    // included). Only a `Stop` produces one - `turnEndEvent` answers nil for the two subagent
+    // edges, so their path through this function is byte for byte what it was.
+    if let ended = turnEndEvent(event, sessionID: session, now: now) {
+        writeSessionTurnEnd(ended, pid: supervisor)
+    }
+    return 0
+}
+
+/// The `handoff.log` record of an event dropped as another conversation's (grep
+/// `hook-agents-dropped`), or nil when the event is this conversation's or either side cannot say.
+/// A nested session's hooks land here too, so the line is expected now and then; it carries the two
+/// ids' first 8 characters and the event's background count, and nothing else off the payload.
+func hookAgentsDropLine(_ event: AgentRosterEvent, session: String?, watching: String?,
+                        pid: String, now: Date) -> String? {
+    guard let session, let watching, watching != session else { return nil }
+    return "\(ISO8601DateFormatter().string(from: now)) pid=\(pid) hook-agents-dropped "
+        + "event=\(event.kind.rawValue) session=\(session.prefix(8)) watching=\(watching.prefix(8)) "
+        + "background=\(event.otherTasks.map(String.init) ?? "none")\n"
+}
+
+/// Where Claude Code says which build is running, exported to everything it spawns
+/// (`claudeCodeVersion` states what is read out of it and why this rather than a version variable).
+let claudeCodeExecPathVariable = "CLAUDE_CODE_EXECPATH"

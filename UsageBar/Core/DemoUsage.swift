@@ -1,0 +1,486 @@
+import Foundation
+
+/// Fixture accounts for marketing and README screenshots:
+/// `open UsageBar.app --args -UsageBarDemoData YES`.
+///
+/// The flag lives in the volatile argument domain, so a normal launch always shows real data. Demo
+/// mode never runs a provider CLI and never writes the launch snapshot, so a demo instance on
+/// screen can't steer the `usagebar` CLI's account picking.
+///
+/// The same launch's SESSION BOARD fixtures are one file over (DemoSessions.swift), which says why
+/// they are not in here.
+enum DemoUsage {
+    static var isActive: Bool { UserDefaults.standard.bool(forKey: "UsageBarDemoData") }
+
+    /// `-UsageBarDemoHardError YES` (with `-UsageBarDemoData`): Claude 2 and Codex 3 read as accounts
+    /// whose first poll failed, so a capture can show the reset "?" on a card and a row that never
+    /// loaded. A modifier, off by default: the README grid keeps every card's numbers.
+    static var showsHardErrors: Bool { UserDefaults.standard.bool(forKey: "UsageBarDemoHardError") }
+
+    /// `-UsageBarDemoPastReset YES` (with `-UsageBarDemoData`): Claude 4 reads as an account whose polls
+    /// have failed since before its 5-hour window reset, so a capture shows the "?" and the
+    /// "Reset passed" line instead of a spent window. A modifier, off by default like the one above.
+    static var showsPastReset: Bool { UserDefaults.standard.bool(forKey: "UsageBarDemoPastReset") }
+
+    /// `-UsageBarDemoColorLevels YES` (with `-UsageBarDemoData`): only four Claude fixtures, their weekly
+    /// windows at 15, 40, 70 and 100% left, so one capture shows every colour a menu bar ring and a
+    /// panel bar can wear side by side. A modifier, off by default like the ones above.
+    static var showsColorLevels: Bool { UserDefaults.standard.bool(forKey: "UsageBarDemoColorLevels") }
+
+    /// `-UsageBarTooltipPreview smart` (with `-UsageBarDemoData`): Claude 2, 3 and 4 are reshaped so their
+    /// scores sit inside the smart pick's tie margin and Claude 3, not the first in the list, resets
+    /// soonest. The callout then shows its tie-break line ("Others about as urgent: 2. This one
+    /// resets soonest."). Only under that flag, so the README grid keeps every card's numbers.
+    static var showsSmartTie: Bool {
+        isActive && UserDefaults.standard.string(forKey: "UsageBarTooltipPreview")?.lowercased() == "smart"
+    }
+
+    private static let smartTieFixtures: [String: (weekly: Double, model: Double, resetDays: Double?)] = [
+        "claude:demo-Claude 2": (72, 52, nil),
+        "claude:demo-Claude 3": (82, 70, nil),
+        "claude:demo-Claude 4": (55, 27, 2.0),
+    ]
+
+    /// `-UsageBarDemoRenewingLogin <account id>` (with `-UsageBarDemoData`): that fixture reads as having
+    /// a login renewal running, so a capture can show the "Browser sign-in…" state on a card or row.
+    static var renewingLoginPreview: Set<String> {
+        guard isActive, let id = UserDefaults.standard.string(forKey: "UsageBarDemoRenewingLogin") else { return [] }
+        return [id]
+    }
+
+    /// Debug-only login scenarios, layered onto the synthetic account fixtures.
+    static var loginHealthPreview: Bool {
+        BuildVariant.isDev && isActive && UserDefaults.standard.bool(forKey: "UsageBarLoginHealthPreview")
+    }
+
+    /// The fixture whose identity callout `-UsageBarTooltipPreview identity` holds open: the Team
+    /// account that shares its address with the Pro one, which is the whole point that callout's
+    /// second line exists to make.
+    static let tooltipPreviewAccountID = "codex:demo-Codex 4"
+
+    /// The fixture standing in for the account the user is also signed into on claude.ai: it wears
+    /// the "Personal" mark in the Accounts pane, its bars carry the water line, and it is where the
+    /// reserve stepper appears (PersonalAccount.swift).
+    ///
+    /// "Claude 2" rather than any of the others because of what its numbers do to the picture: at
+    /// 25-52% used, the reserve below is a stretch of EMPTY track rather than a band hidden under a
+    /// full bar, so a capture shows the line, the hatching and the headroom above it all at once.
+    static let personalAccountID = "claude:demo-Claude 2"
+
+    /// And the water line itself, at the figure the row's own sentence quotes.
+    static let personalReserve = 30
+
+    /// The fixtures as DISCOVERY would report them, for the surfaces that draw from existence rather
+    /// than from usage - the Settings account list, which is the pane the marking above lives in.
+    ///
+    /// Without these that pane is empty on a demo launch (the fixture branch replaces the discovery
+    /// pass wholesale), so the one surface that owns this feature could not be photographed at all.
+    ///
+    /// NO LAUNCH HOME, deliberately, which is the rule the whole file is under: a fixture stands for
+    /// an account that does not exist on this machine, so every affordance that would touch a real
+    /// folder - renaming into it, opening it, removing it - stays greyed exactly as it does on a
+    /// demo card. The one home a fixture DOES name is the identity one above, which names without
+    /// touching.
+    static func discoveredAccounts(now: Date = Date()) -> [ProviderAccount] {
+        accounts(now: now).map {
+            ProviderAccount(id: $0.id, providerID: $0.providerID, label: $0.accountLabel,
+                            locator: [:], launchHome: nil)
+        }
+    }
+
+    /// The one fixture whose home is NOT under the user's own directory: a `CODEX_HOME` pointed
+    /// somewhere else, which the env var allows today. It is the fixture the callout preview holds
+    /// open, so the capture that checks this feature checks the shortened form the rule produces
+    /// for such a path (`…/codex-team`, AccountIdentity.homeName) rather than only `~/.codexN`.
+    private static let customHomes = [tooltipPreviewAccountID: "/Volumes/work/codex-team"]
+
+    /// The config home a fixture stands for (`~/.codex4`), for that second line.
+    ///
+    /// Derived from the label the same way `usagebar add` numbers real homes, rather than stored: the
+    /// fixtures ARE their labels, and a parallel table would be one more thing to keep in step -
+    /// bar the one above, which is deliberately not derivable. Asked only by the identity line - a
+    /// fixture still has no `launchHome` anywhere discovery can see, so every action that would
+    /// touch a folder stays greyed out on a demo card.
+    static func launchHome(accountID: String) -> String? {
+        guard isActive else { return nil }
+        if let custom = customHomes[accountID] { return custom }
+        guard let separator = accountID.range(of: ":demo-") else { return nil }
+        let base = accountID.hasPrefix("claude:") ? ".claude" : ".codex"
+        let number = accountID[separator.upperBound...].filter(\.isNumber)
+        return NSHomeDirectory() + "/\(base)\(number)"
+    }
+
+    /// The weekly session-limit reset, as a demo fleet shows it: one Claude card with a reset to
+    /// spend and one that has already spent this week's.
+    ///
+    /// TWO FIXTURES RATHER THAN ONE, because the two states are drawn differently and a capture has
+    /// to show both: "Reset available" is a control the user can press, "Reset used" is a date they
+    /// can only wait for. The rest of the fleet answers nil, which is what an account nothing has
+    /// been observed about looks like - and that is a third state worth having on screen, since it
+    /// is what most cards read on the day this ships.
+    ///
+    /// NO FILE IS EVER WRITTEN FOR THESE, the rule the whole fixture file is under: the store
+    /// short-circuits to this table while the demo flag is set, so a marketing launch neither reads
+    /// nor writes `~/.usagebar/limit-reset/` (LimitResetStore.refresh).
+    static func limitReset(accountID: String, now: Date = Date()) -> LimitResetRecord? {
+        switch accountID {
+        case "claude:demo-Claude":
+            return LimitResetRecord(state: .available, observedAt: now)
+        case "claude:demo-Claude 3":
+            return LimitResetRecord(state: .used,
+                                    nextAvailableAt: now.addingTimeInterval(3.4 * 86_400),
+                                    enabledSeenAt: now, observedAt: now)
+        case "claude:demo-Claude 4":
+            // Not supported on this login (redeemable on claude.ai only); Claude 2 and 5 stay
+            // unknown, so all four states are on screen.
+            return LimitResetRecord(state: .notEnabled, observedAt: now)
+        default:
+            return nil
+        }
+    }
+
+    /// The one fixture whose CLI takes a typed `/limit-reset` (`claudeLimitResetPressPathOpen`).
+    /// "Claude" also sits at a full 5-hour window, so a capture shows "Reset session limit" beside
+    /// "Reset used" (Claude 3) and "Reset status unknown" (Claude 2, 4, 5). Greyed there, as every
+    /// demo affordance that would touch a real session is.
+    static func limitResetPressPathOpen(accountID: String) -> Bool {
+        accountID == "claude:demo-Claude"
+    }
+
+    static func accounts(now: Date = Date()) -> [AccountUsage] {
+        scoped(unscopedAccounts(now: now))
+    }
+
+    private static func unscopedAccounts(now: Date) -> [AccountUsage] {
+        let fixtures = [
+            // Every remaining percentage stays double-digit (10-99): a mixed column of "8%" and
+            // "100%" reads ragged in the right-aligned figures, and this grid IS the README shot.
+            // Claude's session sits at the wall: the fixture limitResetPressPathOpen offers.
+            claude("Claude", plan: "Ultra", model: 3, session: 100, weekly: 8,
+                   modelResetDays: 6.4, sessionResetHours: 4.6, weeklyResetDays: 6.4, now: now),
+            claude("Claude 2", plan: "Ultra", model: 52, session: nil, weekly: 39,
+                   modelResetDays: 1.2, sessionResetHours: 3.1, weeklyResetDays: 1.2, now: now),
+            claude("Claude 3", plan: "Ultra", model: 88, session: nil, weekly: 82,
+                   modelResetDays: 0.8, sessionResetHours: 1.4, weeklyResetDays: 0.8, now: now),
+            claude("Claude 4", plan: "Ultra", model: 27, session: nil, weekly: 20,
+                   modelResetDays: 4.2, sessionResetHours: 2.3, weeklyResetDays: 4.2, now: now),
+            // The one card whose login has run out (LoginStatusStore.demoExpiredAccountID puts the
+            // red "Login expired" chip on it). It keeps its numbers: the last-good figures are
+            // exactly what a real expired account still shows, and a blank card would make the
+            // screenshot about an error rather than about the chip.
+            claude("Claude 5", plan: "Ultra", model: 45, session: 89, weekly: 59,
+                   modelResetDays: 2.6, sessionResetHours: 0.6, weeklyResetDays: 2.6, now: now),
+            codex("Codex", plan: "Pro", email: "sam@example.com", session: 42, weekly: 69,
+                  sessionResetHours: 2.4, weeklyResetDays: 5.9, resets: 3,
+                  expiresInHours: [290, 480, 600], now: now),
+            codex("Codex 2", plan: "Pro", email: "sam2@example.com", session: 71, weekly: 14,
+                  sessionResetHours: 0.9, weeklyResetDays: 3.3, resets: 1,
+                  expiresInHours: [30], now: now),
+            codex("Codex 3", plan: "Pro", email: "sam3@example.com", session: 18, weekly: 83,
+                  sessionResetHours: 3.8, weeklyResetDays: 1.7, resets: 0, now: now),
+            // Nine accounts total (a 3-column demo screenshot lands as a full 3x3 grid); the
+            // one non-premium plan sits last, not mid-pack.
+            //
+            // Deliberately the SAME address as "Codex" above, on a different plan: one ChatGPT
+            // login in a personal workspace and in a team's is two accounts that answer with one
+            // email, and the identity callout's second line is what tells them apart. A fixture
+            // set where every address is unique could never show that.
+            codex("Codex 4", plan: "Team", email: "sam@example.com", session: 47, weekly: 62,
+                  sessionResetHours: 1.6, weeklyResetDays: 4.8, resets: 2,
+                  expiresInHours: [220, nil], now: now),
+        ]
+        var result = fixtures + manyAccountsExtras(now: now)
+        if showsSmartTie {
+            result = result.map { usage in
+                guard let tie = smartTieFixtures[usage.id] else { return usage }
+                var tied = usage
+                tied.metrics = usage.metrics.map { metric in
+                    guard metric.kind == .weeklyAll || metric.kind == .weeklyModel else { return metric }
+                    var weekly = metric
+                    weekly.usedPercent = metric.kind == .weeklyAll ? tie.weekly : tie.model
+                    weekly.severity = .fromUsedPercent(weekly.usedPercent)
+                    if let days = tie.resetDays { weekly.resetsAt = now.addingTimeInterval(days * 86_400) }
+                    return weekly
+                }
+                return tied
+            }
+        }
+        if showsColorLevels {
+            // The weekly windows are every kind the strip or the panel might read for the account.
+            let remaining = ["Claude": 15.0, "Claude 2": 40, "Claude 3": 70, "Claude 4": 100]
+            result = result.compactMap { usage in
+                guard let left = remaining[usage.accountLabel], usage.providerID == "claude" else { return nil }
+                var leveled = usage
+                leveled.metrics = usage.metrics.map { metric in
+                    guard metric.kind != .session else { return metric }
+                    var weekly = metric
+                    weekly.usedPercent = 100 - left
+                    weekly.severity = .fromUsedPercent(100 - left)
+                    return weekly
+                }
+                return leveled
+            }
+        }
+        if showsPastReset {
+            result = result.map { usage in
+                guard usage.id == "claude:demo-Claude 4" else { return usage }
+                var held = usage
+                // Last good read 84 minutes ago with the 5h window spent; it refilled 70 minutes
+                // ago and nothing has been read since: the 2026-09-28 report, as a fixture.
+                held.refreshedAt = now.addingTimeInterval(-84 * 60)
+                held.metrics = held.metrics.map { metric in
+                    guard metric.kind == .session else { return metric }
+                    var spent = metric
+                    spent.usedPercent = 100
+                    spent.severity = .fromUsedPercent(100)
+                    spent.resetsAt = now.addingTimeInterval(-70 * 60)
+                    return spent
+                }
+                held.isStale = true
+                held.lastRefreshFailed = true
+                held.pollsKeepFailing = true
+                held.error = L("Claude is limiting usage reads: showing the last reading")
+                held.errorDetail = L("Claude Code answered /usage without this account's limits, usually because Anthropic limits how often usage is read. UsageBar waits a few minutes before asking again. If it lasts for hours, run /login in a Claude Code session on this account.")
+                return held
+            }
+        }
+        guard showsHardErrors else { return result }
+        // The failure a first poll produces: no metrics, no reset count, the provider's own short
+        // line. Identity survives, as it does on a real failed read (`AccountUsage.failure`).
+        let failures = ["claude:demo-Claude 2": L("No usage data"),
+                        "codex:demo-Codex 3": L("Codex CLI read failed")]
+        return result.map { usage in
+            guard let message = failures[usage.id] else { return usage }
+            return AccountUsage(id: usage.id, providerID: usage.providerID,
+                                accountLabel: usage.accountLabel, planName: usage.planName,
+                                accountEmail: usage.accountEmail, metrics: [], refreshedAt: now,
+                                error: message)
+        }
+    }
+
+    /// Which fixture each supervised session gets during a capture, by pid in ASCENDING STRING
+    /// ORDER.
+    ///
+    /// WHAT THE ORDER BUYS IS STABILITY, NOT AN ARRANGEMENT. It is not the board's own order (that
+    /// is the roster's seating, `SessionBoardOrder`) and it is not numeric (these are pid strings,
+    /// so "1234" sorts before "987"): which card on screen carries the warned fixture therefore
+    /// cannot be predicted before a capture, only that it stays the same card while the capture
+    /// runs. That is the property a screenshot needs - a fixture that moved between ticks would
+    /// change the picture between two presses of the shutter.
+    ///
+    /// THE KEYS ARE THE CARDS THAT WILL BE DRAWN, which is the caller's part of the same bargain
+    /// (`ProcessFootprintStore.sample`): handed the roster instead, a session the store turns out
+    /// to have no reading for takes an index with it, and the fixtures after the hole all shift up
+    /// - so the WARNED card, the one state a capture cannot sit and wait for, can be missing from
+    /// a shot that otherwise looks entirely normal.
+    ///
+    /// COUNTED OVER THE DISTINCT KEYS, so that promise does not depend on the caller's list being
+    /// free of repeats. A key listed twice would otherwise take two indices and hand back only the
+    /// second, leaving exactly the same hole by a different route: `["100", "100", "200"]` numbered
+    /// straight through gives nobody index 0. The board's keys are supervisor pids and are expected
+    /// to be distinct, which is why this is a boundary rather than a bug - and why it is closed here
+    /// instead of trusted.
+    static func fixtureOrder(of keys: [String]) -> [String: Int] {
+        var order: [String: Int] = [:]
+        for (index, key) in Set(keys).sorted().enumerated() { order[key] = index }
+        return order
+    }
+
+    /// One session's readings replaced by a fixture, so a capture can show the states a real board
+    /// reaches rarely and never on demand: readings warned in EITHER tier (the amber takes ten
+    /// seconds of a heavy idle session to earn, the red three minutes of a tree holding most of the
+    /// machine), a port with a name against it (which takes a dev server somebody happens to have
+    /// left running), and a culprit named at the length real program names run to.
+    ///
+    /// FOUR OF THEM, AND EVERY CARD ON A BOARD OF FOUR IS A DIFFERENT ONE. The count is what the
+    /// index is taken modulo, so a capture of three sessions shows three of the four and the fourth
+    /// is simply not on that shot: a state added here is worth adding a session to see.
+    ///
+    /// THE CARDS ARE STILL THE MACHINE'S OWN, because the board's rows are: this app has no fixture
+    /// sessions, and inventing some would mean a second roster. What is replaced is the READINGS,
+    /// and all of them - every branch below states every field it could show, including the ports.
+    /// A branch that left a field alone would put this machine's own dev server ports into a
+    /// screenshot meant for a README (see the file's own note above about what these are for).
+    static func footprint(_ real: ProcessFootprint, at index: Int) -> ProcessFootprint {
+        var one = real
+        one.agents = 0
+        one.backgroundProcesses = 0
+        one.cpuLeader = nil
+        one.diskWriteBytesPerSecond = nil
+        one.diskLeader = nil
+        one.listeningPorts = []
+        one.portNames = [:]
+        switch index % 4 {
+        case 0:
+            one.processes = 3
+            // TWO OF THOSE THREE ARE JOBS THE SESSION LEFT BEHIND, which is the state the whole
+            // group ledger exists for and the one a capture cannot wait for: it needs a job to
+            // detach from its own shell while the app is watching (`SessionProcessGroups`). Put on
+            // the WARNED card on purpose - a session burning 92% of a core with nothing of its own
+            // still running is exactly what that field explains.
+            one.backgroundProcesses = 2
+            one.cpuPercent = 92
+            // BOTH READINGS NAME A PROCESS ON THIS ONE, which is what a warned card looks like on a
+            // real machine: 92% of a core is being burned by something, and a card that warns about
+            // the CPU without saying whose it is answers half of its own alarm. It is also the only
+            // fixture that puts the trend row under its own narrowest rung - two names is the state
+            // a 236pt card cannot hold both of (`SessionCardView.sessionFootprintTrends`), so a
+            // capture shows what that row does about it rather than leaving it to a live board.
+            one.cpuLeader = "node"
+            one.memoryBytes = 4_100_000_000
+            one.memoryLeader = "bun"
+            one.alerts = FootprintAlerts(cpu: .residue, memory: .residue)
+            // Two long-named ports: the identity must stay whole and the names give way.
+            one.listeningPorts = [3196, 3197]
+            one.portNames = [3196: "Python", 3197: "Python"]
+        case 1:
+            one.processes = 2
+            one.cpuPercent = 4
+            one.memoryBytes = 1_260_000_000
+            one.memoryLeader = "node"
+            one.listeningPorts = [3000, 5173, 9229]
+            one.portNames = [3000: "next-server", 5173: "vite", 9229: "node"]
+            one.alerts = FootprintAlerts()
+        case 2:
+            // THE MACHINE-LEVEL CARD, which is the state the amber tier is structurally blind to
+            // and the reason the red one exists: a session working hard enough to be why the rest
+            // of the desktop has gone slow (`FootprintAlerts`). The tier flags are SET rather than
+            // earned - the rule wants three minutes of held cores, a share of this machine's own
+            // memory, and the machine itself reporting memory pressure to go with it
+            // (`FootprintAlarm.outlastsABuild`, `MachineCapacity`, `MachineMemoryPressure`), none of
+            // which a capture can wait for and none of which these numbers can promise on hardware
+            // this file has never seen. What the fixture is claiming is the CARD, not the verdict.
+            //
+            // AND IT IS THE LONG-NAME CARD TOO, which is the second thing a live board will not
+            // pose for. A culprit is drawn at whatever width its name happens to be
+            // (`SessionCardView.sessionFootprintTrends` says why it gets no column of its own), so
+            // the row's lower rungs - where the CPU's name is given up and the memory's holder is
+            // the last word left - are only ever reached by a card whose blamed process is named
+            // like a real one. `Google Chrome Helper` is that name on this machine, and a headless
+            // browser fan-out under a test run is where it comes from.
+            //
+            // WHICH RUNG THAT PUTS IT ON, measured at 10pt on the same ledger the row itself is
+            // written against (2026-08-17): this card is 324.4pt with both names and 211.5pt with
+            // the memory's alone, so a 264pt card (236pt of content) draws the rung that keeps one
+            // name and a single-column panel (328pt) draws the one that keeps both. The two rungs
+            // this fixture set demonstrates are therefore adjacent - fixture 0 sits on
+            // `culpritsOnly` at 226.2pt - which is what a capture of the ladder needs.
+            one.processes = 6
+            one.cpuPercent = 540
+            one.cpuLeader = "Google Chrome Helper"
+            one.memoryBytes = 18_000_000_000
+            one.memoryLeader = "node"
+            one.alerts = FootprintAlerts(cpu: .saturation, memory: .saturation)
+            // Eight ports: the narrowest spelling is the first port and a count.
+            one.listeningPorts = [3200, 20243, 3201, 5432, 6379, 8080, 8081, 9229]
+            one.portNames = [3200: "node", 20243: "node"]
+        default:
+            one.processes = 0
+            one.cpuPercent = 1
+            one.memoryBytes = 214_000_000
+            one.memoryLeader = nil
+            one.alerts = FootprintAlerts()
+        }
+        return one
+    }
+
+    /// Fixture token history for the Tokens tab, so the screenshot shows a plausible year of work
+    /// instead of this machine's real project names. Spread over 366 days so every range button
+    /// (today / 7D / 30D / all) has something to show AND a row's expanded activity graph is a full
+    /// year rather than a bright corner, and shaped like the real corpus: cache reads dwarf
+    /// everything, cache writes are a few times output, fresh input tracks output.
+    static func tokenSamples(today: Int = LocalDayStamper.today()) -> [TokenSample] {
+        let projects: [(path: String, provider: String, output: Int64)] = [
+            ("/Users/you/workspace/atlas", "claude", 96_000),
+            ("/Users/you/workspace/atlas-web", "claude", 61_000),
+            ("/Users/you/workspace/ledger", "codex", 44_000),
+            ("/Users/you/workspace/relay", "claude", 28_000),
+            ("/Users/you/.claude", "claude", 12_000),
+            (TokenProject.otherKey, "codex", 7_000),
+        ]
+        return (0 ..< 366).flatMap { offset -> [TokenSample] in
+            // A fixed, uneven weekly rhythm (quiet weekends, one heavy day) - a flat series would
+            // make every range button show the same shape. Under it, a slow swell over about seven
+            // weeks, so the year-long graph reads as busy and quiet stretches instead of one even
+            // texture. Both are arithmetic on the day offset and carry no randomness: a fixture
+            // that redrew differently on every launch could not be screenshotted twice.
+            let season = 0.55 + 0.45 * sin(Double(offset) / 23)
+            let weight = [1.0, 1.3, 0.9, 1.6, 1.1, 0.3, 0.2][offset % 7] * season
+            return projects.enumerated().map { index, project in
+                let output = Int64(Double(project.output) * weight * (index == 0 && offset == 0 ? 0.6 : 1))
+                return TokenSample(
+                    day: today - offset, project: project.path, providerID: project.provider,
+                    totals: TokenTotals(input: output, cacheWrite: output * 8,
+                                        cacheRead: output * 330, output: output),
+                    model: project.provider == "claude" ? "claude-opus-5-5" : "")  // priced on Spend
+            }
+        }
+    }
+
+    /// A Claude account shaped exactly like ClaudeUsageCLI's mapping: a model-scoped weekly window
+    /// (the headline), the 5h session, and the all-model weekly. A nil session reset mirrors the
+    /// untouched-account case ("5h starts on first use"). A nil `session` is an account with no 5h
+    /// window at all, which the list rows leave as an empty column.
+    static func claude(_ label: String, plan: String, model: Double, session: Double?,
+                               weekly: Double, modelResetDays: Double?, sessionResetHours: Double?,
+                               weeklyResetDays: Double?, now: Date) -> AccountUsage {
+        // Fixture identity for the header's hover tooltip ("Claude 2" → alex2@example.com), derived
+        // from the label so no screenshot can ever carry this machine's real address.
+        AccountUsage(
+            id: "claude:demo-\(label)", providerID: "claude", accountLabel: label, planName: plan,
+            accountEmail: "alex\(label.filter(\.isNumber))@example.com",
+            metrics: modelWindows.enumerated().map { index, name in
+                // Windows past the first get their own figure off the first's, still 10-94.
+                let used = index == 0 ? model : Double((Int(model) * 7 + 23 * index) % 85 + 10)
+                return UsageMetric(id: "weekly_model:\(name)", kind: .weeklyModel, label: name,
+                                   modelName: name, usedPercent: used,
+                                   severity: .fromUsedPercent(used),
+                                   resetsAt: modelResetDays.map { now.addingTimeInterval($0 * 86_400) },
+                                   isActive: false)
+            } + ((noSessionWindow ? nil : session).map { session in
+                [UsageMetric(id: "session", kind: .session, label: "Session", modelName: nil,
+                             usedPercent: session, severity: .fromUsedPercent(session),
+                             resetsAt: sessionResetHours.map { now.addingTimeInterval($0 * 3_600) },
+                             isActive: false)]
+            } ?? []) + [
+                UsageMetric(id: "weekly_all", kind: .weeklyAll, label: "Weekly", modelName: nil,
+                            usedPercent: weekly, severity: .fromUsedPercent(weekly),
+                            resetsAt: weeklyResetDays.map { now.addingTimeInterval($0 * 86_400) },
+                            isActive: false),
+            ],
+            refreshedAt: now)
+    }
+
+    /// A Codex account shaped like CodexAppServerClient's mapping: the 5h primary window plus
+    /// the weekly secondary, both with resets (some real plans report only the weekly; the demo
+    /// shows the full shape).
+    static func codex(_ label: String, plan: String, email: String, session: Double,
+                              weekly: Double, sessionResetHours: Double, weeklyResetDays: Double,
+                              resets: Int, expiresInHours: [Double?] = [],
+                              now: Date) -> AccountUsage {
+        AccountUsage(
+            id: "codex:demo-\(label)", providerID: "codex", accountLabel: label, planName: plan,
+            // Spelled out per fixture rather than derived from the label (which is what the Claude
+            // ones do): two of these deliberately share one address, and a derivation cannot say so.
+            accountEmail: email,
+            metrics: [
+                UsageMetric(id: "session", kind: .session, label: "Session", modelName: nil,
+                            usedPercent: session, severity: .fromUsedPercent(session),
+                            resetsAt: now.addingTimeInterval(sessionResetHours * 3_600),
+                            isActive: false),
+                UsageMetric(id: "weekly_all", kind: .weeklyAll, label: "Weekly", modelName: nil,
+                            usedPercent: weekly, severity: .fromUsedPercent(weekly),
+                            resetsAt: now.addingTimeInterval(weeklyResetDays * 86_400),
+                            isActive: false),
+            ],
+            refreshedAt: now,
+            // Every reset state on screen: a count dated far off, one inside 48 hours, one with an
+            // undated credit, and a zero ("No banked resets").
+            resetCreditsAvailable: resets,
+            resetCredits: expiresInHours.enumerated().map { index, hours in
+                BankedResetCredit(id: "demo-\(label)-\(index)", resetType: "codexRateLimits",
+                                  status: "available",
+                                  expiresAt: hours.map { now.addingTimeInterval($0 * 3_600) })
+            })
+    }
+}

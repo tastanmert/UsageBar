@@ -1,0 +1,465 @@
+import SwiftUI
+import AppKit
+
+/// The menu-bar popover: header, one card per account, footer with the used/left toggle + settings.
+///
+/// Every host sizes itself to what this content reports, in a single pass. There is deliberately no
+/// measure-then-resize round trip here: measuring the laid-out height and feeding it back as a
+/// `.frame(height:)` made the popover open at one size then resize to fit, so AppKit's frame
+/// animation fought SwiftUI's layout - the classic "two clocks" stutter.
+///
+/// The screen is the one bound that needs no measuring: how tall the surface may be is known before
+/// it opens, so `ScreenFitStack` applies it in the same pass that lays the content out, and the
+/// cards scroll inside whatever is left. A surface that fits the screen is laid out exactly as it
+/// was before there was a cap; only one that would have run off the display below the footer
+/// changes. Capping it in the hosts instead cannot work - see `ScreenFitStack` and
+/// `StatusItemController.applyPopoverSize`.
+
+struct PopoverRootView: View {
+    @Bindable var store: UsageStore
+    @Bindable var settings: SettingsStore
+    /// Reports the content's ACTUAL rendered size so the host (popover / panel) can size itself to it.
+    /// Measuring the real size beats asking `sizeThatFits`, which returned a greedy screen-tall height.
+    ///
+    /// Also what says whether this surface is placed by its own frame at all: a host that passes one
+    /// sizes itself from the report and holds a corner while it does, and one that does not must not
+    /// have the content waiting against an edge nothing keeps still (see `anchoredInHost`).
+    var onContentSize: ((CGSize) -> Void)? = nil
+    /// Which screen this surface is on, asked of the host rather than assumed: the popover opens on
+    /// the status item's screen, the pinned panel sits wherever the user dragged it, and the window
+    /// on whichever display it was summoned to. Nil before the host has a window, which falls back
+    /// to the main screen.
+    var hostScreen: () -> NSScreen? = { NSScreen.main }
+    /// Where this surface's content starts on screen, for the hosts that grow downward from a
+    /// position the user placed (`ScreenFitStack.maxHeight(on:topEdge:)`). Nil for the popover,
+    /// which is not one of them: it hangs off the status item and NSPopover repositions it.
+    var hostTopEdge: () -> CGFloat? = { nil }
+    var tokens: TokenStatsStore = .shared
+    /// This surface's own tab selection, held by its host controller (see `SurfaceTabState`).
+    @Bindable var tabState: SurfaceTabState
+    /// Which window this copy is in (see `SurfaceHost`). Only the view-options card reads it: whose
+    /// card is open, and whether it is a window of its own here. Deliberately without a default: a
+    /// fourth host that forgot to answer would silently claim to be the popover, and keep its card
+    /// attached to a footer that moves under it.
+    var host: SurfaceHost
+
+    var tab: SurfaceTab { tabState.tab }
+
+    static let reorderSpace = "usageBarCardReorder"
+    @State var cardFrames: [String: CGRect] = [:]
+    @State var cardLift: CardLift?
+    /// True while the reorder drag is tracking. @GestureState resets automatically on BOTH end and
+    /// cancellation - the only hook SwiftUI guarantees for a cancelled gesture (onEnded is skipped) -
+    /// so cardLift cleanup keys off its reset instead of trusting onEnded alone.
+    @GestureState var isReorderDragActive = false
+    /// The session card being carried, if any (SessionBoardReorder.swift). Its own state rather
+    /// than the account cards', because the two carry different things - an account and a board of
+    /// sessions frozen mid-scan - and because a lift left over from one board must never be read as
+    /// the other's while the tabs crossfade.
+    @State var sessionLift: SessionLift?
+    /// The session drag's tracking flag, for the reason the account one above gives: cancellation
+    /// is the only thing @GestureState is guaranteed to report, and the lift is cleaned up off it.
+    @GestureState var isSessionDragActive = false
+    /// WHAT AUTO RESOLVED TO WHEN THIS SURFACE'S BOARD WAS OPENED: as many columns as there were
+    /// cards to seat, bounded afterwards by what the width can hold (`sessionColumnCount`). Nil
+    /// until the page has appeared, where the live count answers instead so the first frame is
+    /// already the right shape.
+    ///
+    /// HELD, BECAUSE THE ROSTER MOVES AND THE READER DOES NOT. The scan runs twice a second; a count
+    /// read from it live would re-flow the board a session at a time while somebody is reading it,
+    /// which is the same thing the seats are frozen against (`SessionRosterStore.seatingOnOpen`).
+    /// One per surface, as the tab selection is: two windows can be on different pages.
+    @State var sessionsAutoColumns: Int?
+    /// A need, not a preference - the same rule the glass follows for Reduce Transparency. Every
+    /// animated change on this surface reads it and goes instant, the extensions' included (the
+    /// session board's filter switch), which is why it is not private.
+    @Environment(\.accessibilityReduceMotion) var reduceMotion
+
+    /// The System Settings pane vocabulary: a short crossfade with just enough vertical drift to say
+    /// the panel was replaced rather than repainted. Deliberately not a push - a slide would imply
+    /// the two views sit side by side in some order, and they do not.
+    ///
+    /// The drift is on the arriving view only. The surface takes the incoming tab's height on the
+    /// first frame of the switch, so the leaving view is already being cut off at the bottom, and
+    /// drifting it downward only pushed it further into the part that is going away. It fades where
+    /// it stands, leaving the top edge as the one thing nothing in the switch moves against.
+    /// Static so the Cost tab's own two pages switch with the same vocabulary (CostTabPage).
+    static var tabTransition: AnyTransition {
+        .asymmetric(insertion: .opacity.combined(with: .offset(y: 8)), removal: .opacity)
+    }
+
+    var body: some View {
+        // Rebuild the whole tree on language change. A bare read of languageOverride only re-runs THIS
+        // body - SwiftUI still diffs child View structs (AccountCardView, MetricRowView, EmptyStateView)
+        // as unchanged and skips re-localizing them, leaving cards stuck in the old language. Keying
+        // `.id` on the language forces a full teardown + rebuild so every L() re-resolves.
+        ZStack(alignment: .topLeading) {
+            ScreenFitStack(maxHeight: screenCap
+                            ?? ScreenFitStack.maxHeight(on: hostScreen(), topEdge: hostTopEdge())) {
+                // Header and footer frame both tabs: the countdown and the refresh stay reachable
+                // while reading token history, and the footer button that switched here is the one
+                // that switches back (a surface that swallowed its own way out would be a trap).
+                // They are also what must never scroll away: the footer is the way out of a fleet
+                // too tall for the display, which is the case the cap exists for.
+                if settings.panelDensity == .list && host == .panel { PanelGrip() }
+                header
+                // The Detailed panel's header sits straight on the body, no rule between them.
+                if settings.panelDensity != .list { Divider() }
+                // A ZStack of independent conditions, not one if/else chain: mid-crossfade two views
+                // exist, and stacked they occupy the taller of the two rather than the sum of them.
+                // In a VStack the host would chase a height neither tab has - the surface would
+                // balloon and collapse on every switch.
+                //
+                // TOP LEADING, never the bare top: `.top` alone centres its children horizontally,
+                // so a page offered any width but the other's would fade out sliding sideways - the
+                // one movement the held top edge exists to prevent.
+                ZStack(alignment: .topLeading) {
+                    if tab == .usage {
+                        VStack(spacing: 0) {
+                            // The notices stay at their own height, always: they are small, and the
+                            // gate in front of the first morning message must not scroll away. Once a
+                            // fleet outgrows the display this stack is handed a definite height
+                            // (`screenFitFlexible` below) and a VStack shares it among ALL its
+                            // children, so only the scroll view below may give or take height.
+                            VStack(spacing: 0) {
+                                // Above everything, and only once: the gate in front of the very
+                                // first morning message (EarlyStartNoticeStrip.swift).
+                                earlyStartNotice
+                            }
+                            .fixedSize(horizontal: false, vertical: true)
+                            // The machine strip, this region's title and the cards share one scroll
+                            // view (B-3570). The strip and the title used to stand above it at a fixed
+                            // height, and a strip that outgrew the room (cards two to a row) was drawn
+                            // under the footer where no scrolling could bring it back. At any height
+                            // that fits, a scroll view is laid out at its content's ideal size and shows
+                            // no scroller, so this is invisible until the page outgrows the display.
+                            // Pinned to the surface's width, leading edge first: what a scroll view
+                            // reports is its content plus whatever scroller is in the layout, so left
+                            // to itself the region sits centred and the cards step sideways the moment
+                            // a fleet outgrows the display. A no-op under overlay scrollers (see
+                            // `scrollContentWidth`).
+                            ScrollView(.vertical) {
+                                VStack(alignment: .leading, spacing: 0) {
+                                    // This region's own title, the cards, then the private build's machine
+                                    // strip under them.
+                                    // Each provider's summary is the heading of its own section below
+                                    // (ProviderSectionHeader.swift), not a strip of its own up here.
+                                    accountPoolTitle
+                                    // Nothing at all to show skips the card container entirely: its 12pt
+                                    // padding read as a hollow band (see `showsAccountRegion`).
+                                    if store.contentState != .hasAccounts || showsAccountRegion { content }
+                                    overlayStrip
+                                }
+                            }
+                            .frame(width: popoverWidth, alignment: .leading)
+                            // The scroll area's visible frame, for the first-run bubble the panel
+                            // draws over everything (see the overlay below the footer). On the scroll
+                            // view itself, not its content: a capped panel scrolls the content, and
+                            // the bubble's rules are about what is in view.
+                            .transformAnchorPreference(key: PanelHintTargetKey.self, value: .bounds) {
+                                $0[PanelHintTargetKey.area] = $1
+                            }
+                            // The invite stays outside the scroll view: a panel capped to a short
+                            // display scrolled it out of sight when it was the last thing inside.
+                            if showsPanelHints {
+                                PanelHintsSection(store: store).fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        .transition(Self.tabTransition)
+                    }
+                    if tab == .cost {
+                        // WHAT THE TOKENS COST AND WHERE THEY WENT: one tab, Spend and Tokens
+                        // inside it (CostTabPage, CostPage.swift).
+                        ScrollView(.vertical) {
+                            CostTabPage(store: tokens, page: $tabState.costPage,
+                                        width: scrollContentWidth)
+                        }
+                        .frame(width: popoverWidth, alignment: .leading)   // as above
+                        .transition(Self.tabTransition)
+                    }
+                    if tab == .sessions {
+                        // WHAT IS RUNNING (SessionBoardView.swift). A page rather than the strip it
+                        // used to be inside the Usage tab: a list of sessions, each with an account,
+                        // a model and possibly a sentence about what it is waiting for, needs the
+                        // width of the surface rather than a band between two other summaries.
+                        ScrollView(.vertical) { sessionsPage }
+                            .frame(width: popoverWidth, alignment: .leading)   // as above
+                            .transition(Self.tabTransition)
+                    }
+                }
+                .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: tab)
+                // Whichever tab is up, the region between the two dividers is the one that gives up
+                // height when the surface would outgrow the screen.
+                .screenFitFlexible()
+                // The Detailed panel's footer is a rounded bar of its own and needs no rule above it.
+                if settings.panelDensity != .list { Divider() }
+                footer
+            }
+            .frame(width: popoverWidth)
+            // The first-run bubble (PanelHints), over the header, the cards and the footer alike, so
+            // it never makes the panel taller (B-3823). It hit-tests only where the bubble is drawn;
+            // the rest of this layer is empty and passes every press through (see the note below).
+            .overlayPreferenceValue(PanelHintTargetKey.self, alignment: .topLeading) {
+                PanelHintBubbleOverlay(store: store, targets: $0)
+            }
+            // NO WHOLE-SURFACE GRAB AREA, and the reason is worth keeping: a drag layer mounted
+            // behind this content was measured on 2026-08-07 to receive no press at all (four such
+            // regions tested, zero movement - the hosting view answers the hit test for its own
+            // SwiftUI content and never consults what is below it). Laying one OVER the surface
+            // instead is not the fix, it is the opposite bug: it would sit above every card, every
+            // gauge and every menu on the panel. So the grab areas are named one by one, on the
+            // regions that have nothing to click (see `windowDragSurface`), and the gaps between
+            // cards are honestly not among them.
+            .background(sizeReporter)
+            // The floating copy of the dragged card, above everything, tracking the pointer.
+            if let cardLift {
+                CardLiftPreview(lift: cardLift, settings: settings,
+                                density: settings.panelDensity)
+            }
+            // And the session board's, which is the same idea one tab over. Both are here rather
+            // than inside their pages because a preview clipped by the scroll view it came from
+            // would disappear at the edge of the very board it is being dragged across.
+            sessionLiftPreview
+        }
+        .coordinateSpace(name: Self.reorderSpace)
+        // The colour haloes behind the Detailed cards (PanelSkin.swift): over the host's glass, under
+        // every control, and blind to the pointer.
+        .background { skinHalos }
+        // Hover callouts for the whole surface, above every card and outside the cards' scroll clip
+        // (see UsageBarTooltip). Held back while a card is being dragged: the anchors are moving.
+        .usageBarTooltipLayer(suppressed: cardLift != nil || sessionLift != nil)
+        // The two ways a surface ends up on a different screen than it was laid out for: its window
+        // moved (the panel is dragged by hand), or the displays themselves changed (one unplugged,
+        // resolution switched). See `screenCap`.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didMoveNotification)) { _ in
+            refreshScreenCap()
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didChangeScreenParametersNotification)) { _ in refreshScreenCap() }
+        // And the end of a carry, which is the move notification the guard above skipped: the panel
+        // has arrived somewhere, and this is where it finds out what that somewhere allows.
+        .onReceive(NotificationCenter.default.publisher(for: PanelDrag.ended)) { _ in
+            refreshScreenCap()
+        }
+        .trackingScrollerGutter($scrollerGutter)
+        // And the moment neither notification covers: the surface is laid out, and appears, while
+        // its host is still assembling itself - a window has no `screen` until it is ordered onto
+        // one - so it opens capped for the main display wherever it actually is. Deferred a
+        // run-loop turn, not just to appear: measured, the host has its window on a screen by the
+        // next turn and not one moment sooner (`onAppear` itself still reads nil).
+        .onAppear { DispatchQueue.main.async { refreshScreenCap() } }
+        // The roster scans only while a surface is up, and this is that surface saying so. On the
+        // ROOT rather than on the board's own page, and it stays there now that the board is a tab:
+        // the switch in the header carries the blocked dot, so a surface that is on Usage is still
+        // reading the roster - and the scan serves the things that are only true while somebody is
+        // looking (the durations ticking, a session that started after the panel opened). The knock
+        // keeps the dot honest with no surface open at all (SessionRosterStore), so nothing here is
+        // what makes the alert live. Counted on the store's side, so the three hosts closing one at
+        // a time do not stop each other's ticking - and counted apart from the surfaces actually
+        // SHOWING the board, which is the page's own count and the one the seats answer to
+        // (`sessionsPage`): a surface can sit on another tab for an hour.
+        .onAppear { SessionRosterStore.shared.beginViewing() }
+        .onDisappear { SessionRosterStore.shared.endViewing() }
+        .onAppear { OverlayApp.panelAppeared() }
+        .onDisappear { OverlayApp.panelDisappeared() }
+        .onPreferenceChange(CardFramePreferenceKey.self) { cardFrames = $0 }
+        // A host can go away with its card still up (the popover closes on a click outside, the
+        // panel is unpinned), and `onChange` never fires for a view that was torn down - so a
+        // detached card would be left standing over nothing, with no surface left to dismiss it.
+        // Named per host, so a popover closing behind its own footer cannot take away the pinned
+        // panel's card.
+        .onDisappear { ViewOptionsCard.shared.dismiss(host: host) }
+        .environment(\.usageBarCardStyle, cardStyle)
+        .id(settings.languageOverride ?? "system")
+        // Outermost, because it is about this view's relationship with the window it is in and
+        // nothing inside it: the surface stays against the corner the host is about to hold while
+        // the host catches up with the height the surface just reported (see `HostAnchored`).
+        .anchoredInHost(enabled: onContentSize != nil)
+    }
+
+    /// The card fill for this surface: glass when the user asked for it (all three hosts put glass
+    /// behind the cards then: the popover's vibrancy, the panel's and the window's behind-window blur). Reduce Transparency is a need, not a preference, so it clamps the cards to
+    /// solid regardless of the setting - the same rule the pinned panel's backdrop follows.
+    private var cardStyle: UsageBarCardStyle {
+        guard settings.isPanelTranslucent,
+              !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency else { return .solid }
+        return .glassVariant
+    }
+
+    /// Measures the laid-out content size and reports it upward (fires on appear + on change).
+    private var sizeReporter: some View {
+        GeometryReader { proxy in
+            Color.clear.onChange(of: proxy.size, initial: true) { _, size in
+                onContentSize?(size)
+            }
+        }
+    }
+
+    /// How many card columns. An explicit 1/2/3/4 is a width the user chose and is second-guessed
+    /// on one count only: what the display can seat (see `PanelGeometry.seated`). Folding cards
+    /// shrinks the panel's height only (want it narrow? that's what the view menu is for). Auto is
+    /// the mode that delegates layout to the system, so there it follows what's actually visible:
+    /// two columns once any provider shows more than one card, a single narrow column otherwise -
+    /// including the fully folded gauges-only view.
+    var columnCount: Int {
+        let chosen = (1 ... 4).contains(settings.panelColumns)
+            ? settings.panelColumns
+            : (Dictionary(grouping: visibleAccounts, by: \.providerID).values.contains { $0.count > 1 }
+                ? 2 : 1)
+        return PanelGeometry.seated(chosen, columnWidth: PanelGeometry.cardColumnWidth,
+                                    in: usableScreenWidth)
+    }
+
+    /// The Detailed panel is one column wide: a card per provider already carries every account's
+    /// windows side by side.
+    var listColumnCount: Int { 1 }
+
+    /// Constant card width (263pt) across the 2/3/4-column layouts; only the window grows.
+    /// Internal: the strip and footer extensions lay themselves out against it. The arithmetic
+    /// itself is in `PanelGeometry`, which the column counts above are bounded by.
+    ///
+    /// SWITCHING TABS NEVER RESIZES THE SURFACE, which is why the page in front is not one of the
+    /// questions asked here. A width that followed the page moved everything measured against it:
+    /// the header switch is centred in this width, so the very tab being clicked walked sideways out
+    /// from under the pointer and back again on every switch (Albert, 2026-08-17, the third time
+    /// this face was questioned), while the strips, the footer's credit and the leaving page's own
+    /// cards were all re-decided mid-crossfade. The invariant is older than that regression and was
+    /// paid for three times over - the Tokens column, the Settings window's height, the resize
+    /// anchors - so a page with a layout of its own spends its count on its CARDS instead, held to
+    /// the card ladder's width against the leading edge (`sessionsBoardWidth`).
+    var popoverWidth: CGFloat {
+        // Never narrower than the header needs: a badge beside the wordmark is width the layout
+        // below was not sized for (see `headerMinWidth`).
+        let layout = settings.panelDensity == .list
+            ? PanelGeometry.detailedPanelWidth
+            : PanelGeometry.cardPanelWidth(columns: columnCount)
+        return max(layout, headerMinWidth)
+    }
+
+    /// What the scrolling regions lay their content out at: the surface, less what a permanently
+    /// visible scroller takes out of it (zero by default). Held, not read per pass, because the
+    /// style can change under a surface that is already open (see `trackingScrollerGutter`).
+    var scrollContentWidth: CGFloat { popoverWidth - scrollerGutter }
+    @State private var scrollerGutter = ScreenFitStack.scrollerGutter
+
+    /// The invite shows with accounts on screen, never over the forced empty-state capture.
+    private var showsPanelHints: Bool {
+        !UserDefaults.standard.bool(forKey: "UsageBarEmptyStatePreview") && store.contentState == .hasAccounts
+    }
+
+    /// The cap actually in force. A surface can change screens without anything the layout reads
+    /// changing - dragged to another display, or one unplugged out from under it - and then it
+    /// holds a height that screen never had, which is this whole file's bug with extra steps. So
+    /// the two events that can move a window between displays re-read it. Stored rather than read
+    /// every pass because it is only ever re-read on those events, and only a cap that actually
+    /// CHANGED touches the state.
+    ///
+    /// The move notification carries a second duty now: for a host that grows downward from where
+    /// the user put it, the cap depends on the surface's own top edge (`hostTopEdge`), so dragging
+    /// a panel DOWN its own display shortens it. That is the one event that changes the answer
+    /// without any display changing, and it is the same notification, so nothing else was needed.
+    @State private var screenCap: CGFloat?
+    /// The same reading on the other axis, for the compact list's auto column count. Held for the
+    /// same reason and refreshed by the same two events: `popoverWidth` is read on every layout
+    /// pass, and asking AppKit for the display each time would both cost and go stale silently.
+    @State private var screenWidth: CGFloat?
+
+    private var usableScreenWidth: CGFloat {
+        screenWidth ?? ScreenFitStack.maxWidth(on: hostScreen())
+    }
+
+    private func refreshScreenCap() {
+        // NOT WHILE THE PANEL IS BEING CARRIED. The cap depends on the surface's own top edge, so
+        // every frame of a drag produces a new answer and the surface was resized dozens of times
+        // on the way to where it was being put (measured: 532 -> 320 over one downward drag, while
+        // the window server was moving the window). The answer is re-read the moment the hand lets
+        // go (`PanelDrag`), so a panel set down low still gets the height that position allows -
+        // once, when it is standing still.
+        guard !PanelDrag.isActive else { return }
+        let height = ScreenFitStack.maxHeight(on: hostScreen(), topEdge: hostTopEdge())
+        if screenCap != height { screenCap = height }
+        let width = ScreenFitStack.maxWidth(on: hostScreen())
+        if screenWidth != width { screenWidth = width }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        // Volatile launch flag: force the empty state so its copy and layout can be looked at on a
+        // machine that has accounts. Reads the argument domain, so a normal launch never
+        // sees it (same pattern as -UsageBarDemoData).
+        if UserDefaults.standard.bool(forKey: "UsageBarEmptyStatePreview") {
+            EmptyStateView(state: .noAccounts)
+        } else if store.contentState != .hasAccounts {
+            EmptyStateView(state: store.contentState)
+        } else {
+            accountLayout
+                // One glass pass for the whole grid under the Liquid Glass variant; nothing at all
+                // under the others (see `usageBarCardGroup`).
+                .usageBarCardGroup(cardStyle)
+                .padding(contentInsets)
+                // Cards glide (not teleport) whenever the order changes - from a drag here or the
+                // settings window - and equally when the grouping switch or the column count re-seats
+                // every card without the order itself moving. Same spring as the drag, so a card
+                // moving under its own steam and a card moved by hand travel the same way.
+                .animation(reduceMotion ? nil : CardMotion.spring, value: cardSeatingSignature)
+                // The reorder gesture lives HERE on the stable cards container, never on a card: a
+                // live reorder changes AccountRow identities, and SwiftUI CANCELS (not ends) a
+                // gesture whose view that diff tears down - onEnded never fires, and lift state
+                // parked there leaked forever (stuck floating preview, 2026-07-17). The container
+                // survives every reorder, so one drag keeps tracking across commits.
+                .highPriorityGesture(reorderGesture)
+                // Cancellation safety net: mirror @GestureState's guaranteed reset into cardLift.
+                // Plain assignment, no spring - a cancelled preview should vanish, not fly home.
+                .onChange(of: isReorderDragActive) { _, active in
+                    if !active { cardLift = nil }
+                }
+                .onDisappear { cardLift = nil }
+        }
+    }
+
+    /// Cards on screen: a provider collapsed behind its fleet gauge hides its cards, but ONLY
+    /// while that gauge is actually rendered - no pool (single account) or gauge off, and the
+    /// cards come straight back. Cards can never be hidden with nothing summarizing them. The rule
+    /// itself lives in `PanelSections`, which the grouped sections read too - one fact, so a folded
+    /// section and a hidden card can never disagree about what is folded.
+    /// The "Gauges only" mode: every pooled provider folded behind its gauge. Named once because
+    /// two places now answer to it - the footer switch that turns it on, and the account headings
+    /// that go quiet under it - and a second spelling of "is this mode on" would let the panel be in
+    /// it according to one of them and not the other.
+    var isGaugesOnly: Bool {
+        let pooled = pooledProviderIDs
+        return !pooled.isEmpty && pooled.isSubset(of: settings.collapsedProviders)
+    }
+
+    var visibleAccounts: [AccountUsage] {
+        let pooled = pooledProviderIDs
+        let collapsed = settings.collapsedProviders
+        guard !pooled.isEmpty, !collapsed.isEmpty else { return store.orderedAccounts }
+        return store.orderedAccounts.filter {
+            !PanelSections.isFolded($0.providerID, pooled: pooled, collapsed: collapsed)
+        }
+    }
+
+    // Header and footer state lives here (stored properties can't live in extensions); those two
+    // views are in PopoverHeaderView.swift and PopoverFooterView.swift, and the card grid with its
+    // drag-to-reorder is in PopoverCardGrid.swift.
+    @State var showLaunchHelp = false
+    @State var showViewOptions = false
+    /// Where the button that opens the view-options card is, for the surfaces that place the card
+    /// themselves (`ViewOptionsCard`). A box rather than a rect: the answer is read at moments
+    /// SwiftUI is not driving, and it has to be the LIVE one - the footer moves while the card is up.
+    @State var viewOptionsAnchor = ViewOptionsAnchor()
+    @State var footerWidths = FooterWidths()
+    @State var headerWidths = HeaderWidths()
+
+    /// Reports its own width, which is its host's: `Color.clear` fills whatever it is offered, and a
+    /// background is offered exactly the size of the view it backs. Both strips measure with it -
+    /// each fits a row of rigid clusters into a fixed width and drops the softest part when it runs
+    /// out, and neither can be told the widths any other way.
+    func widthProbe(_ report: @escaping (CGFloat) -> Void) -> some View {
+        GeometryReader { proxy in
+            Color.clear.onChange(of: proxy.size.width, initial: true) { _, width in report(width) }
+        }
+    }
+}
+

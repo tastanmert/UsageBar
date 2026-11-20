@@ -1,0 +1,347 @@
+import Foundation
+
+// WHAT THE CALLER DOES WHILE ITS LINE IS ON ITS WAY, and what it is told when it is not.
+//
+// Split from SessionInputCommand.swift, which keeps the grammar, the addressing and the order of
+// business; this is the half that runs after the request is on disk. Every wording here is a pure
+// function for the same reason the ones next door are: nothing can call `runSessionSend` in a suite
+// without writing into the developer's own live conversation, so what CAN be asserted is every
+// sentence it prints and every code it exits on.
+//
+// THE ONE RULE THIS FILE EXISTS TO KEEP (Albert, 2026-08-17): a caller either gets its line
+// delivered, or is told why not, promptly. It may wait for a turn to end - that is what the whole
+// feature is for - but it may not sit in silence for minutes and then be told nothing useful. The
+// two shapes that broke that rule are answered here: a wait whose end is already decided (the
+// supervisor is gone), and a wait that CANNOT end because the caller is the reason it cannot.
+//
+// QUEUEING IS THE ANSWER, WAITING IS THE EXCEPTION (2026-08-18). Both halves of this command used to
+// be built around collecting a delivery report, and a request now waits for its session up to
+// `sessionInputQueuedLife` - so a caller that stayed for the report would be a caller sitting on a
+// line that is doing exactly what it should. Every caller therefore leaves after a short grace with
+// `queued` and exit 0, and what became of the line is recorded rather than returned
+// (`~/.usagebar/logs/input.log`).
+
+/// How long an answer nobody said anything about is somebody's to collect.
+///
+/// A COMPATIBILITY FALLBACK RATHER THAN A WAIT ANYBODY MAKES, since the rework above: a request
+/// written by a CLI that predates `SessionInputRequest.waitSeconds` says nothing about how long its
+/// caller will be there, and 150s is what every answer was charged before that field existed. It is
+/// deliberately the longest number here, because the failure it avoids is one-sided - an answer
+/// judged too short is deleted out from under a caller still polling for it, while one judged too
+/// long only holds the address until it expires.
+let sessionInputWaitSeconds: TimeInterval = 150
+
+/// How long a caller stays for an answer before it says the line is queued and leaves.
+///
+/// SIX SECONDS, and the reason it is not 150 is a deadlock rather than a preference. A command run
+/// inside a conversation runs as a tool call, and a tool call that has not returned is an OPEN TURN:
+/// the supervisor reads that turn in the transcript and (rightly) refuses to type into a session
+/// that is mid-turn, so a caller blocking until the turn ends is blocking on itself. Measured on
+/// this machine 2026-08-17: three self-sends held their own tool call for 120.2s each and were
+/// killed by Claude Code's own timeout, and two thirds of every send in the preceding day expired
+/// unserved (`~/.usagebar/logs/input.log`).
+///
+/// THE SAME NUMBER FOR A SEND INTO ANOTHER SESSION, which it was not before. That caller is not
+/// holding anything open, so waiting was free for it - but what it would now be waiting for is a
+/// line that may legitimately sit queued for a quarter of an hour, and a wait that ends in "nobody
+/// answered" about a request that is alive and pending is the same lie this rework removed from the
+/// supervisor's side.
+///
+/// What the six seconds still buy, since the honest answer would otherwise be zero: a session that
+/// is ALREADY blocked or idle when the request lands is served on the next 2s tick, which is the
+/// case a send from a background task or from another session hits. That answer arrives inside this
+/// window and is reported exactly as any other.
+let sessionInputGraceSeconds: TimeInterval = 6
+
+/// How much longer than its line's life a `--no-queue` caller stays, so the supervisor's last word on
+/// that line is read rather than guessed at. The latest that word can come is one 2s tick after the
+/// life ends (the tick that refuses it), or, for a line injected on the last tick inside the life, the
+/// injection's own worst case of about 1.1s (SessionInput.swift) before its receipt is written; plus
+/// one `sessionInputPollInterval` to read it. 2 + 1.1 + 0.25 rounds up to 4.
+let sessionInputNoQueueGrace: TimeInterval = 4
+
+/// What a withdrawn `--no-queue` line exits on: its own code, because it is neither a refusal read
+/// from the supervisor (3) nor a session that has gone (4).
+let sessionInputWithdrawnExitCode: Int32 = 5
+
+/// What a `--composer-only` line refused because a dialog may be open exits on: its own code,
+/// because the advice differs from a plain refusal (3). This one usually lifts by itself once the
+/// dialog is answered, so a caller may retry; 3 asks the caller to read the reason first.
+let sessionInputComposerOnlyExitCode: Int32 = 6
+
+/// The first release whose supervisor reads `SessionInputRequest.composerOnly`. Set to the version
+/// this change ships in.
+let sessionInputComposerOnlySince = "0.84.0"
+
+/// Why a `--composer-only` line cannot be queued for a supervisor of this version, or nil when it
+/// can: the supervisor must be at least `sessionInputComposerOnlySince`, compared as numbers.
+/// FAIL-CLOSED: a version that cannot be read is refused, because the one supervisor that would
+/// mis-serve this line is an old one, and "unknown" includes it.
+func sessionInputComposerOnlyUnsupported(supervisorVersion: String?) -> String? {
+    if let supervisorVersion,
+       supervisorVersion.compare(sessionInputComposerOnlySince, options: .numeric)
+           != .orderedAscending { return nil }
+    let running = supervisorVersion.map { "runs \($0)" } ?? "does not report its version"
+    return "this session's supervisor \(running) and cannot honour --composer-only (it arrived "
+        + "in \(sessionInputComposerOnlySince)), so it would type the line into an open dialog; "
+        + "nothing was queued. Restart that session once (exit, then launch it again with "
+        + "`\(BrandPaths.cliName) claude`) and it can be sent to from then on"
+}
+
+/// The first release whose supervisor answers a `usagebar session clear` by reopening the window as
+/// the project's default provider (B-1706, ProviderReopen.swift).
+let sessionClearReopenSince = "0.85.36"
+
+/// Why a `usagebar session clear` that should reopen the window as `reopenTarget` cannot be queued for
+/// a supervisor of this version, or nil when it can. An older supervisor ignores the reopen and
+/// types a bare /clear, which leaves the window on the provider the project moved away from. nil
+/// target (no reopen due) is never refused. `reopenTarget` is only evaluated for an old supervisor,
+/// because reading it loads the snapshot. A version that cannot be read is refused, as
+/// `sessionInputComposerOnlyUnsupported` does.
+func sessionClearReopenUnsupported(supervisorVersion: String?,
+                                   reopenTarget: @autoclosure () -> String?) -> String? {
+    if let supervisorVersion,
+       supervisorVersion.compare(sessionClearReopenSince, options: .numeric)
+           != .orderedAscending { return nil }
+    guard let target = reopenTarget() else { return nil }
+    let running = supervisorVersion.map { "runs \($0)" } ?? "does not report its version"
+    return "this session's supervisor \(running) and will not reopen this window as \(target), "
+        + "this project's default provider (that arrived in \(sessionClearReopenSince)); it would "
+        + "only type /clear, so nothing was queued. Run `\(BrandPaths.cliName) reload --self` first (the supervisor "
+        + "swaps in the installed build once this turn ends), then run `\(BrandPaths.cliName) session clear` again"
+}
+
+/// `sessionClearReopenUnsupported` for the session at `sessionKey`, read off its state file. The
+/// session's own directory decides the project default, not this process's: `--session` may name
+/// another session. No state file or no directory reads as no refusal, which is the old behaviour.
+func sessionClearReopenRefusal(sessionKey: String) -> String? {
+    guard let state = readSessionState(pid: sessionKey), let directory = state.directory else { return nil }
+    return sessionClearReopenUnsupported(
+        supervisorVersion: state.supervisorVersion,
+        reopenTarget: clearReopenTarget(
+            current: sessionProviderName(sessionKey: sessionKey, dir: supervisorStateDir), cwd: directory))
+}
+
+/// Why the supervisor refuses a pending line instead of typing it, under `--composer-only`, or
+/// nil when it may be typed. Asked at the instant the line would land, after every shared gate.
+///
+/// `dialogPossible` is `SessionTick.dialogPossible`: a dialog known open OR a registry that cannot
+/// be read. It errs toward refusing, which is this flag's whole promise; `dialogOpen` only picks
+/// the sentence.
+func sessionInputComposerOnlyRefusal(_ request: SessionInputRequest, dialogPossible: Bool,
+                                     dialogOpen: Bool) -> String? {
+    guard request.composerOnly == true, dialogPossible else { return nil }
+    return dialogOpen
+        ? "a dialog is open in front of the composer; nothing was typed (--composer-only)"
+        : "Claude Code's session registry cannot be read, so an open dialog cannot be ruled out; "
+            + "nothing was typed (--composer-only)"
+}
+
+/// Take back an unanswered request, but only the one this caller wrote: true when the file on disk
+/// still carried `epoch` and has been removed. A different epoch, or no file, is left alone and
+/// answers false - the supervisor has already taken the line, and removing somebody else's would
+/// lose it.
+func sessionInputWithdraw(sessionKey: String, epoch: Int, dir: URL = sessionInputDir) -> Bool {
+    guard readSessionInputRequest(sessionKey: sessionKey, dir: dir)?.epoch == epoch else {
+        return false
+    }
+    clearSessionInputRequest(sessionKey: sessionKey, dir: dir)
+    return true
+}
+
+/// What a caller is told when its `--no-queue` line was withdrawn.
+func sessionInputWithdrawnMessage(sessionKey: String, waited: TimeInterval) -> String {
+    "not delivered to session \(sessionKey) within \(Int(waited))s; withdrawn (--no-queue), so "
+        + "nothing will be typed later"
+}
+
+/// How often to look for it. A quarter second is well inside the 2s tick that writes it, so the
+/// answer is read within one interval of being published.
+let sessionInputPollInterval: TimeInterval = 0.25
+
+/// How a wait ended, in the three ways that want different things said and different codes returned.
+enum SessionInputAnswer: Equatable {
+    /// The supervisor answered. Whether that answer is a delivery or a refusal is the result's own
+    /// business.
+    case answered(SessionInputResult)
+    /// It will never be answered, and this is why. Distinct from a timeout because the two are
+    /// opposite advice: a timeout may mean "it is still coming", this means "stop waiting".
+    case abandoned(String)
+    /// Nobody answered inside the grace this caller gives it, which is the ordinary ending rather
+    /// than a failure: the request is queued and the caller says so and leaves.
+    case timedOut
+}
+
+/// Wait for the answer to this request.
+///
+/// Matched on the EPOCH, which is the whole reason a result carries one: a husk from an earlier
+/// request can still be sitting at that path (a caller killed mid-wait, a wait that timed out), and
+/// reading somebody else's outcome as this one's is a fire-and-forget channel's one silent failure.
+///
+/// `abandon` IS ASKED ON EVERY PASS, and it is what turns one class of silent timeout into a prompt
+/// failure: the only thing that ever writes an answer is that session's supervisor, so a supervisor
+/// that has exited is a wait with a known ending. Answering the question early costs one `kill(pid,
+/// 0)` per quarter second and saves the caller up to 150 seconds of waiting for a process that is
+/// not there. It defaults to "carry on", so a caller that has nothing to check for stays as it was.
+///
+/// The clock and the reads are injectable so the suite can exercise every ending without spending
+/// one.
+func awaitSessionInputResult(sessionKey: String, epoch: Int, timeout: TimeInterval,
+                             interval: TimeInterval = sessionInputPollInterval,
+                             now: () -> Date = Date.init,
+                             sleep: (TimeInterval) -> Void = { usleep(useconds_t($0 * 1_000_000)) },
+                             abandon: () -> String? = { nil },
+                             read: (String) -> SessionInputResult? = {
+                                 readSessionInputResult(sessionKey: $0)
+                             }) -> SessionInputAnswer {
+    let deadline = now().addingTimeInterval(timeout)
+    while true {
+        if let result = read(sessionKey), result.epoch == epoch { return .answered(result) }
+        // AFTER the read, never before it: a supervisor that wrote the answer and then exited has
+        // answered, and asking about the process first would throw that answer away in favour of a
+        // sentence about a pid.
+        if let why = abandon() { return .abandoned(why) }
+        guard now() < deadline else { return .timedOut }
+        sleep(interval)
+    }
+}
+
+/// Why a wait for THIS session cannot be waited out, or nil when it can be.
+///
+/// Its own function so the sentence and the condition cannot drift, and so the suite can assert both
+/// without a supervisor: `alive` is injected, the default is the same registry reader every other
+/// per-session channel uses.
+///
+/// IT DOES NOT SAY THE LINE WAS NOT TYPED, and that restraint is the whole wording. A supervisor
+/// types the bytes and writes the receipt afterwards (`applySessionInput`), so one that died
+/// between the two leaves a terminal that HAS the line and an address with no answer on it - which
+/// is indistinguishable from here from one that died before reading the request at all. Telling the
+/// caller nothing was typed invites the retry that puts the line in twice, which is the one failure
+/// this channel has always been built to avoid (codex review of 0c9798b). What the caller is given
+/// instead is the file that does know.
+func sessionInputAbandonment(sessionKey: String,
+                             alive: (pid_t) -> Bool = { supervisorAlive($0) }) -> String? {
+    guard let pid = pid_t(sessionKey), !alive(pid) else { return nil }
+    return "session \(sessionKey) has exited, so nothing will ever answer the line queued for it. "
+        + "Whether it was typed first is unknown from here: the supervisor types before it writes "
+        + "the receipt. Read ~/\(BrandPaths.stateDirName)/logs/input.log rather than sending it again"
+}
+
+// MARK: - What the caller is told, and what it exits on
+
+// MOVED HERE FROM SessionInputCommand.swift (2026-08-18), which is over the size a file in
+// this repo may be: these two are the sentence and the code one ANSWER comes to, which is this
+// file's subject, while that one keeps the grammar and the order of business.
+
+/// What to tell the caller about an answer. Pure, so every wording is assertable.
+///
+/// An outcome this build does not recognise is REPORTED VERBATIM rather than flattened into a
+/// generic failure: a CLI one version behind a supervisor is exactly the case where the word itself
+/// is the only information there is.
+func sessionInputMessage(_ result: SessionInputResult, sessionKey: String) -> String {
+    // Appended to EVERY wording, the successes included. A delivery does not normally carry one, but
+    // a supervisor from a later build may say something alongside an outcome this one already
+    // understands, and dropping it because the news was good is how a channel loses exactly the
+    // sentence somebody added for a reason.
+    let detail = result.detail.map { " (\($0))" } ?? ""
+    switch result.resolved {
+    case .submitted: return "sent to session \(sessionKey)\(detail)"
+    case .unconfirmedInput: return "unconfirmed: inspect session \(sessionKey) before retrying\(detail)"
+    case .refusedUnsafeInput: return "refused: cannot verify the Codex composer is empty\(detail)"
+    case .refusedTooLong: return "refused: too long\(detail)"
+    case .refusedNotReporting:
+        return "refused: session \(sessionKey) never reported what it was doing, so nothing was "
+            + "typed into it\(detail)"
+    case .refusedExpired:
+        return "refused: session \(sessionKey) never reached a moment this could be typed at"
+            + "\(detail)"
+    case .failedTTY: return "failed: the session's terminal refused the write\(detail)"
+    case .refusedDialog:
+        return "refused: a dialog may be standing in front of session \(sessionKey)'s composer, "
+            + "so nothing was typed\(detail)"
+    case .movedAccount:
+        // A DELIVERY WORDED AS WHAT HAPPENED rather than as "sent": nothing was typed into session
+        // \(sessionKey), and a caller told it was would go looking for the line in a conversation
+        // that no longer exists. What it asked for - an empty window - is what it got.
+        return "window closed by moving session \(sessionKey)\(detail)"
+    case .reopenedProvider: return "window closed by reopening session \(sessionKey)\(detail)"
+    case .refusedReopenHeld: return "refused: session \(sessionKey) was left as it was\(detail)"
+    case nil: return "the supervisor answered \"\(result.outcome)\"\(detail)"
+    }
+}
+
+/// The exit code one run ends on, for the one ending that has an answer to read: 0 it landed, 3 it
+/// was refused with a reason. 6 is the one refusal with a code of its own: a --composer-only line
+/// kept out of a dialog (sessionInputComposerOnlyExitCode). The other two are decided by the run
+/// itself - 4 the session is gone, 1 something here broke - and usage errors are 2, as everywhere
+/// else in this binary.
+///
+/// A QUEUED LINE EXITS 0 WITHOUT A RESULT, which is the one thing this code says that no
+/// `SessionInputResult` can: since 2026-08-18 every caller leaves after a short grace, so "did it
+/// land" is normally unanswerable from where the caller stands (`sessionInputGraceSeconds`). Exit 0
+/// therefore means "typed, or queued with nothing refusing it", and the line printed says which. A
+/// code of its own was weighed and refused: every caller of this is a hand-over that reads non-zero
+/// as "fall back to doing it by hand", and a queued line is not a failure to fall back from.
+func sessionInputExitCode(_ result: SessionInputResult) -> Int32 {
+    if result.resolved == .refusedDialog { return sessionInputComposerOnlyExitCode }
+    return result.delivered ? 0 : 3
+}
+
+/// What a caller is told when the supervisor about to read its request is not this build, or nil
+/// when it is (and when it is too old to read one at all, which is a refusal rather than a note).
+///
+/// THE TWO COMMANDS BESIDE THIS ONE ALREADY SAY THE FIRST HALF (`SwitchCommand`, `ModelCommand`):
+/// the supervisor replaces itself at the next idle moment and the instruction is served after that.
+/// What is specific here is the SECOND half, and it is the reason this note exists at all: this
+/// channel's contract changed on 2026-08-18, so a request written by this CLI can be read by a
+/// supervisor that still holds a queued line for 120 seconds and refuses it when they run out. The
+/// caller is told `queued` by this build and can still be refused by that one.
+///
+/// A NOTE RATHER THAN A REFUSAL OR A DOWNGRADE, which was weighed: the request is byte for byte the
+/// same either way, the old build serves it exactly as it always did, and refusing to write one
+/// would take the feature away from every session that has not restarted since an update. What can
+/// honestly be added is which contract is about to read it.
+///
+/// The other direction is left unnamed on purpose: a supervisor NEWER than this CLI is the same
+/// enum case, and what its terms are is not knowable from here - so the sentence names the version
+/// whose behaviour is known and says "that build's terms" for the rest.
+func sessionInputSkewNote(_ honourability: RequestHonourability) -> String? {
+    guard honourability == .afterSelfUpdate else { return nil }
+    return "this session runs a supervisor from another build: it replaces itself with the "
+        + "installed one at the next idle moment, and until then this line is served on that "
+        + "build's terms rather than these. A supervisor from before 0.58.0 holds a queued line "
+        + "for 120s instead of \(Int(sessionInputQueuedLife))s and refuses it when they run out, "
+        + "whatever this command printed"
+}
+
+/// What a caller is told when the grace ends with no answer: the line is queued.
+///
+/// IT IS NOT A FAILURE AND IT DOES NOT PRETEND TO BE A DELIVERY, which is the whole of the wording.
+/// The line is on disk, addressed, and the supervisor types it at the first quiet moment the session
+/// is out of its turn - which is what the caller wanted and, for a caller inside that session,
+/// cannot be told about: being told would mean still being here, and still being here is what keeps
+/// the turn open (`sessionInputGraceSeconds` carries the measurement). So the sentence says exactly
+/// that, names the one condition that can still lose it, and names the file that records what became
+/// of it.
+///
+/// ONE SENTENCE FOR BOTH CALLERS, where there were two (a progress note before a long wait, and a
+/// queued line after a short one). They now do the same thing, and `doing` is what the second of
+/// those carried that this needed: what that session's own supervisor last published about it
+/// (`SessionStateRecord.state`), which is the single most useful thing to say here - "working" tells
+/// the caller its line is behind a turn, "idle" that the next tick should take it.
+func sessionInputQueuedMessage(sessionKey: String, doing: String? = nil,
+                               mayMove: Bool = false) -> String {
+    let state = doing.map { " (it is \($0) right now)" } ?? ""
+    // The second ending, named only for the caller that can get it: a `usagebar session send` cannot,
+    // whatever its text says, and telling every caller about a decision their command never makes
+    // is how a dumb pipe comes to look clever (SessionClear.swift).
+    let moving = mayMove
+        ? " - or, if this session's account is nearly dry, reopened on a healthier one instead,"
+            + " which is the same empty window arrived at from the other side"
+        : ""
+    return "queued for session \(sessionKey)\(state): it is typed at the first quiet moment that "
+        + "session is out of its own turn\(moving), so nothing here waits for it - waiting from "
+        + "inside that session would hold the turn open and the line would never be typed. It is "
+        + "dropped if no such moment arrives within \(Int(sessionInputQueuedLife))s; either way "
+        + "~/\(BrandPaths.stateDirName)/logs/input.log records what became of it"
+}

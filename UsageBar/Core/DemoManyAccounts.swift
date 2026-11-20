@@ -1,0 +1,223 @@
+import Foundation
+
+/// `-UsageBarDemoData YES -UsageBarDemoAccounts 22` (Debug builds only): the fixture fleet padded out to
+/// N accounts, roughly sixteen Claude to six Codex, for capturing the Settings account list at the
+/// size real users run it. Names, addresses, plans, usage and sharing all vary, and every sharing
+/// state appears (shared, partly shared, own setup).
+///
+/// The nine fixtures the README shots rely on are left exactly as they are; this only appends.
+/// Without the flag nothing here does anything.
+extension DemoUsage {
+    static var manyAccountsCount: Int {
+        #if DEBUG
+        return isActive ? UserDefaults.standard.integer(forKey: "UsageBarDemoAccounts") : 0
+        #else
+        return 0
+        #endif
+    }
+
+    private static let extraClaudeNames = ["Claude 6", "Studio", "Research", "Client Acme",
+                                           "Night shift", "Claude 11", "Pairing", "Ops",
+                                           "Claude 14", "Sandbox", "Review", "Claude 17",
+                                           "Writing", "Claude 19"]
+    private static let extraCodexNames = ["Codex 5", "Team Beta", "Codex 7", "Infra", "Codex 9"]
+
+    /// The accounts past the fixtures, numbered on from them (`Claude 6`, `Codex 5`, ...) so each
+    /// stands for its own `~/.claudeN` / `~/.codexN`.
+    static func manyAccountsExtras(now: Date) -> [AccountUsage] {
+        let total = manyAccountsCount
+        guard total > 9 else { return [] }
+        let codexTotal = max(4, Int((Double(total) * 6 / 22).rounded()))
+        let claudeExtra = min(extraClaudeNames.count, max(0, total - codexTotal - 5))
+        let codexExtra = min(extraCodexNames.count, max(0, codexTotal - 4))
+        let claudePlans = ["Ultra", "Max", "Pro", "Ultra", "Team"]
+        let codexPlans = ["Plus", "Pro", "Team"]
+
+        func figure(_ seed: Int, _ step: Int, _ floor: Int, _ span: Int) -> Double {
+            Double(seed * step % span + floor)
+        }
+        func renamed(_ usage: AccountUsage, _ name: String, number: Int) -> AccountUsage {
+            var copy = usage
+            copy.accountLabel = name
+            if !name.hasSuffix(" \(number)") {
+                copy.accountEmail = name.lowercased().filter { $0.isLetter } + "@example.com"
+            }
+            // Two shapes the row has to hold: a 32-character address that must not be cut, and a
+            // nicknamed login that never reported one (its row names the config home instead).
+            if name == "Research" { copy.accountEmail = "albert.liu.long.test@example.com" }
+            if name == "Night shift" { copy.accountEmail = nil }
+            return copy
+        }
+
+        let claudes = (0 ..< claudeExtra).map { index -> AccountUsage in
+            let number = index + 6
+            let usage = claude("Claude \(number)", plan: claudePlans[index % claudePlans.count],
+                               model: figure(number, 29, 4, 90), session: figure(number, 37, 3, 92),
+                               weekly: figure(number, 53, 8, 88), modelResetDays: 1 + Double(index % 6),
+                               sessionResetHours: 0.5 + Double(index % 5),
+                               weeklyResetDays: 1 + Double(index % 6), now: now)
+            return renamed(usage, extraClaudeNames[index], number: number)
+        }
+        let codexes = (0 ..< codexExtra).map { index -> AccountUsage in
+            let number = index + 5
+            let usage = codex("Codex \(number)", plan: codexPlans[index % codexPlans.count],
+                              email: "sam\(number)@example.com", session: figure(number, 31, 6, 88),
+                              weekly: figure(number, 47, 9, 84), sessionResetHours: 1 + Double(index),
+                              weeklyResetDays: 2 + Double(index), resets: index % 3, now: now)
+            return renamed(usage, extraCodexNames[index], number: number)
+        }
+        return claudes + codexes
+    }
+
+    /// `-UsageBarDemoModelWindows Fable,Sonnet` (Debug builds only): the model-scoped weekly windows
+    /// every Claude fixture reports, in order, so a capture can show a model pool other than Fable.
+    /// Fable alone without it, which is what the README shots are.
+    static var modelWindows: [String] {
+        #if DEBUG
+        if isActive, let list = UserDefaults.standard.string(forKey: "UsageBarDemoModelWindows") {
+            let names = list.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            if !names.isEmpty { return names }
+        }
+        #endif
+        return ["Fable"]
+    }
+
+    /// `-UsageBarDemoNoSessionWindow YES` (Debug builds only): every Claude fixture reports no 5-hour
+    /// window, so a capture can show a whole block that has none (the list rows then keep two
+    /// columns, the flagship and the weekly window). False without it, and always false outside demo.
+    static var noSessionWindow: Bool {
+        #if DEBUG
+        return isActive && UserDefaults.standard.bool(forKey: "UsageBarDemoNoSessionWindow")
+        #else
+        return false
+        #endif
+    }
+
+    /// `-UsageBarDemoPinnedAccount <n>` (Debug builds only): the n-th fixture account (0-based, store
+    /// order) is the one manually pinned for its provider, so a capture can show a pinned row. Nil
+    /// without it, and always nil outside demo, where the real policy's pins can never match a fixture.
+    @MainActor
+    static var pinnedAccount: AccountUsage? { fixtureAccount(forKey: "UsageBarDemoPinnedAccount") }
+
+    /// `-UsageBarDemoHoverAccount <n>` (Debug builds only): the n-th fixture account's row draws as
+    /// hovered (drag handle, pin circle), which otherwise needs a real pointer over it.
+    @MainActor
+    static var hoveredAccountID: String? { fixtureAccount(forKey: "UsageBarDemoHoverAccount")?.id }
+
+    @MainActor
+    private static func fixtureAccount(forKey key: String) -> AccountUsage? {
+        #if DEBUG
+        guard isActive, UserDefaults.standard.object(forKey: key) != nil else { return nil }
+        let accounts = UsageStore.shared.accounts
+        let index = UserDefaults.standard.integer(forKey: key)
+        return accounts.indices.contains(index) ? accounts[index] : nil
+        #else
+        return nil
+        #endif
+    }
+
+    /// `-UsageBarDemoLaunchModel sonnet` (Debug builds only): the launch model the gauge focuses on,
+    /// in place of this Mac's own launch policy, so a capture can put a given model pool on screen
+    /// whatever the machine running it has declared. Nil without it, and always nil outside demo.
+    static var launchModelOverride: String? {
+        #if DEBUG
+        guard isActive, let model = UserDefaults.standard.string(forKey: "UsageBarDemoLaunchModel"),
+              !model.isEmpty else { return nil }
+        return model
+        #else
+        return nil
+        #endif
+    }
+
+    /// `-UsageBarDemoBurnScale 4` (Debug builds only): every fabricated burn rate multiplied, so a capture
+    /// can put a pool that runs dry within a day (the red forecast) on screen; no fixture burns
+    /// that fast on its own (B-1543). 1 without it, and always 1 outside demo.
+    static var burnScale: Double {
+        #if DEBUG
+        let scale = UserDefaults.standard.double(forKey: "UsageBarDemoBurnScale")
+        return isActive && scale > 0 ? scale : 1
+        #else
+        return 1
+        #endif
+    }
+
+    /// `-UsageBarDemoProviders codex` and `-UsageBarDemoAccountLimit claude=1,codex=2` or `codex=1+4`
+    /// (Debug builds only): the fixture fleet cut to the providers named and to the first N fixtures
+    /// of each (or to the 1-based ordinals joined by `+`), so a
+    /// capture can show a Codex-only panel or a single account. Applied after every other fixture
+    /// flag; a provider the limit does not name keeps all of its fixtures.
+    static func scoped(_ all: [AccountUsage]) -> [AccountUsage] {
+        #if DEBUG
+        guard isActive else { return all }
+        let defaults = UserDefaults.standard
+        func list(_ key: String) -> [String] {
+            (defaults.string(forKey: key) ?? "").split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
+        }
+        let providers = Set(list("UsageBarDemoProviders"))
+        var limits: [String: Set<Int>] = [:]
+        for pair in list("UsageBarDemoAccountLimit") {
+            let parts = pair.split(separator: "=")
+            guard parts.count == 2 else { continue }
+            if let count = Int(parts[1]) {
+                limits[String(parts[0])] = Set(stride(from: 1, through: count, by: 1))
+            } else {
+                // `codex=1+4`: the 1-based ordinals kept (here the first Pro and the Team).
+                let ordinals = parts[1].split(separator: "+").map { Int($0) }
+                if !ordinals.isEmpty, !ordinals.contains(where: { $0 == nil }) {
+                    limits[String(parts[0])] = Set(ordinals.compactMap { $0 })
+                }
+            }
+        }
+        var kept: [String: Int] = [:]
+        return all.filter { usage in
+            guard providers.isEmpty || providers.contains(usage.providerID) else { return false }
+            kept[usage.providerID, default: 0] += 1
+            return limits[usage.providerID]?.contains(kept[usage.providerID]!) ?? true
+        }
+        #else
+        return all
+        #endif
+    }
+
+    /// A fixture reading read again for the accounts `scoped` kept, so a single-account capture
+    /// shows what a real one-account owner sees rather than no advice at all (B-1524). Each plan
+    /// tier keeps its own per-account load over the seats still shown, which is what a smaller
+    /// fleet working the same way would read: the ratio behind the verdict is unchanged, so the
+    /// verdict and the starved hours (per pool, not per seat) stand. Nil for a provider with no
+    /// fixture left; the reading itself, untouched, while nothing was cut.
+    static func rescoped(_ reading: UsageAdvisor.Reading, shown: [AccountUsage]) -> UsageAdvisor.Reading? {
+        let mine = shown.filter { $0.providerID == reading.provider }
+        guard !mine.isEmpty else { return nil }
+        guard mine.count != reading.accountCount else { return reading }
+        func cut(_ tiers: [UsageAdvisor.TierDemand]) -> [UsageAdvisor.TierDemand] {
+            tiers.compactMap { tier in
+                let kept = mine.filter { $0.planName == tier.plan }.count
+                guard kept > 0 else { return nil }
+                return .init(plan: tier.plan,
+                             demandPerWeek: tier.demandPerWeek * Double(kept) / Double(max(1, tier.accountCount)),
+                             accountCount: kept)
+            }
+        }
+        var out = reading
+        out.tierDemands = cut(reading.tierDemands)
+        let pooled = out.tierDemands.reduce(0) { $0 + $1.demandPerWeek }
+        let scale = reading.demandPerWeek > 0 ? pooled / reading.demandPerWeek : 0
+        out.demandPerWeek = pooled
+        out.accountCount = mine.count
+        out.windowDemands = reading.windowDemands.map { window in
+            var window = window
+            window.demandPerWeek = window.demandPerWeek.map { $0 * scale }
+            window.tierDemands = cut(window.tierDemands)
+            return window
+        }
+        return out
+    }
+
+    /// The config home a fixture stands for, shown in the Settings rows only on this capture (the
+    /// plain demo keeps that list without homes, as it always has).
+    static func manyAccountsHome(accountID: String) -> String? {
+        manyAccountsCount > 0 ? launchHome(accountID: accountID) : nil
+    }
+}

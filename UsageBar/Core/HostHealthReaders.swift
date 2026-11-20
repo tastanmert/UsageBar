@@ -1,0 +1,275 @@
+import Darwin
+import Foundation
+
+/// WHAT THE MACHINE IS ASKED ABOUT ITSELF, for the watch next door (HostHealthLogic.swift).
+/// Split from the rules for the reason `ProcessTreeReaders.swift` is: everything here is a
+/// syscall with no decision in it and needs `Darwin`, and everything there is arithmetic an
+/// assertion harness can state with no machine under it.
+///
+/// WHAT AN ORDINARY SAMPLE COSTS, which is the whole reason this feature could be put on an
+/// existing tick at all: three syscalls that walk nothing. `getloadavg(3)`, `host_statistics64` and
+/// `host_page_size`, measured on this machine (2026-09-05, Apple silicon, 1,150 processes in the
+/// table, load 70): mean 1.8 microseconds over twenty runs, median 1.6, worst 3.0. At one sample a
+/// minute that is three parts in a hundred million of one core. The CPU witness adds one more of the
+/// same kind, `host_statistics(HOST_CPU_LOAD_INFO)` (`cpuCounters`), once every ten seconds.
+///
+/// AND WHAT THE EXPENSIVE ONE COSTS, which is why it is not on that path: `heaviest` walks the
+/// whole process table and asks the kernel for one `rusage_info` record per process, which is
+/// 3.9 ms on the same machine and the same table (mean of five runs, worst 4.4). That is the same
+/// walk the session footprint makes every two seconds while a panel is open, and it is made here
+/// exactly once per alarm, never on a sample that found nothing wrong. `sessionNames` makes the same
+/// walk once more, on the same alarm and only when the board has a session to match against.
+enum HostHealthReaders {
+
+    /// The one-minute load average, or nothing when the machine will not say.
+    ///
+    /// `getloadavg(3)` RATHER THAN `uptime` OR `sysctl vm.loadavg`: the first is a fork, an exec
+    /// and a parse for a number the libc call returns directly, and the second hands back a
+    /// fixed-point struct this would then have to scale itself. Nothing here is privileged.
+    static func loadAverage() -> Double? {
+        var samples = [Double](repeating: 0, count: 3)
+        guard getloadavg(&samples, 3) == 3 else { return nil }
+        return samples[0]
+    }
+
+    /// What the machine could hand out right now without paging, in bytes.
+    ///
+    /// FREE PLUS INACTIVE PLUS PURGEABLE, AND NOT THE COMPRESSOR. Inactive pages are handed over on
+    /// demand and purgeable ones are dropped on demand, so both are available in the sense this
+    /// watch means; compressed pages are memory already spent and counting them would report a
+    /// machine as comfortable at the exact moment it is compressing to stay alive. This is the
+    /// same arithmetic Activity Monitor's own "available" is, and it is deliberately a second
+    /// opinion to `MachineMemoryPressure`, which answers a LEVEL rather than a size: a level
+    /// cannot be put in a notification that has to say how much is left.
+    static func freeBytes() -> UInt64? {
+        var stats = vm_statistics64_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size
+            / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &stats) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return nil }
+        // Every term below is a page COUNT, so the multiply is the only place a unit could go
+        // wrong, and the page size is asked of the kernel rather than assumed: it is 16 KB on
+        // Apple silicon and 4 KB on Intel, and a constant here would be off by four on one of
+        // them. `host_page_size` rather than the `vm_kernel_page_size` global, which is a mutable
+        // global and so not readable from concurrent code under strict concurrency.
+        var pageSize = vm_size_t(0)
+        guard host_page_size(mach_host_self(), &pageSize) == KERN_SUCCESS, pageSize > 0 else {
+            return nil
+        }
+        return (UInt64(stats.free_count) + UInt64(stats.inactive_count)
+            + UInt64(stats.purgeable_count)) * UInt64(pageSize)
+    }
+
+    /// The cumulative busy and total CPU ticks across every core (busy = user + system + nice,
+    /// total = busy + idle), or nil when the kernel will not say. The same single syscall the CPU
+    /// alert reads (`CPUAlertReaders.ticks`); `HostCPUWindows` turns two of them into a share.
+    static func cpuCounters() -> (busy: UInt64, total: UInt64)? {
+        guard let t = CPUAlertReaders.ticks() else { return nil }
+        let busy = t.user + t.system + t.nice
+        return (busy, busy + t.idle)
+    }
+
+    /// One reading of the whole machine: the cores, what is free and what is in total, and the load
+    /// as a display value (zero when `getloadavg` refuses: nothing is decided on it any more). The
+    /// CPU share is the monitor's to fill in from its windows. Nothing at all when the memory
+    /// syscall refuses, which the caller reads as "this sample did not happen" rather than as a
+    /// reading of zero free bytes.
+    static func reading() -> HostHealthReading? {
+        guard let free = freeBytes() else { return nil }
+        return HostHealthReading(load1: loadAverage() ?? 0,
+                                 cores: ProcessInfo.processInfo.activeProcessorCount,
+                                 freeBytes: free, physicalBytes: ProcessInfo.processInfo.physicalMemory)
+    }
+
+    /// The percentage of memory free system-wide, the figure the `memory_pressure` tool prints as its
+    /// free percentage (the kernel's `kern.memorystatus_level`): the second witness of the gate that
+    /// opens a new session, kept in the load history. Nil when the kernel will not say.
+    static func memoryFreePercent() -> Int? {
+        var level: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        guard sysctlbyname("kern.memorystatus_level", &level, &size, nil, 0) == 0,
+              (0...100).contains(level) else { return nil }
+        return Int(level)
+    }
+
+    /// Bytes of swap in use right now, or nil when the kernel will not say. Zero is a real answer
+    /// (no swap file has been made yet), so a failed read must not be folded into it.
+    ///
+    /// THE USED FIGURE, NEVER THE TOTAL: macOS grows its swap files on demand, so `xsu_used` against
+    /// `xsu_total` sits near full whatever the load, and only the absolute amount in use says how
+    /// hard the machine has been pushed. The free percentage above stayed above 57% on the day swap
+    /// stood at 48.7 GB, which is why this is its own reading.
+    static func swapUsedBytes() -> UInt64? {
+        var usage = xsw_usage()
+        var size = MemoryLayout<xsw_usage>.size
+        guard sysctlbyname("vm.swapusage", &usage, &size, nil, 0) == 0,
+              size == MemoryLayout<xsw_usage>.size else { return nil }
+        return usage.xsu_used
+    }
+
+    /// When this boot began (`kern.boottime`), or nil when the kernel will not say. Wall-clock, so
+    /// a clock change moves it; compare it to an earlier reading with a tolerance, not for equality.
+    static func bootTime() -> Date? {
+        var stamp = timeval()
+        var size = MemoryLayout<timeval>.size
+        guard sysctlbyname("kern.boottime", &stamp, &size, nil, 0) == 0,
+              size == MemoryLayout<timeval>.size, stamp.tv_sec > 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(stamp.tv_sec) + TimeInterval(stamp.tv_usec) / 1_000_000)
+    }
+
+    /// The kernel's own memory pressure level, one of `hostLoadPressureLevels`
+    /// (`kern.memorystatus_vm_pressure_level`, the value Activity Monitor's graph is coloured by).
+    /// Nil for a refused read or any other value, rather than a guess.
+    static func pressureLevel() -> Int? {
+        var level: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        guard sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &size, nil, 0) == 0,
+              hostLoadPressureLevels.contains(Int(level)) else { return nil }
+        return Int(level)
+    }
+
+    /// The biggest memory holders on the machine, most first.
+    ///
+    /// THE ONE EXPENSIVE READING IN THIS FEATURE, and it is made only at the instant an alarm is
+    /// raised. A number says the machine is short; a name says what is holding it, and that is the
+    /// difference between somebody knowing to look and knowing where.
+    ///
+    /// ONE `proc_pid_rusage` PER PROCESS AND ONLY THREE `proc_pidpath` CALLS: the footprint of
+    /// every process is compared first and only the survivors are named, so the path lookups are
+    /// three rather than one per process on the machine.
+    ///
+    /// NAMES, NEVER ARGUMENTS (`HostHealthProcess` states the rule and where it comes from). A
+    /// process whose program cannot be read is left unnamed rather than guessed at, on the terms
+    /// `ProcessTree.executablePath` sets: it has ended, or it belongs to another user.
+    static func heaviest(_ limit: Int = 3) -> [HostHealthProcess] {
+        let pids = ProcessTree.liveProcesses().map(\.pid)
+        // The whole-machine reading this file needs is one field of the record the footprint
+        // sampler already asks for, so the call is shared rather than spelled a second time.
+        let sample = ProcessTree.resourceSample(of: pids)
+        // Ties broken on the pid so the answer cannot change between two calls while nothing else
+        // has, the rule the board's own heaviest-tree comparison is under.
+        let ranked = sample.memory.sorted {
+            $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value
+        }
+        return ranked.prefix(limit).map { entry in
+            let name = ProcessTree.executablePath(of: entry.key)
+                .flatMap(ProcessTree.displayName) ?? "unknown"
+            return HostHealthProcess(name: name, rss: entry.value)
+        }
+    }
+
+    /// Every readable process's threads: how many are running or uninterruptible (what the load
+    /// average counts), and which programs hold the most. Alarm-only, like `heaviest`: three libproc
+    /// calls per process plus one per thread, 6 ms over 1,000 processes and 7,500 threads here.
+    /// Run states are `TH_STATE_RUNNING` (1) and `TH_STATE_UNINTERRUPTIBLE` (4), mach/thread_info.h.
+    static func threadCensus(_ limit: Int = 5) -> HostHealthThreads {
+        var running = 0, uninterruptible = 0, total = 0
+        var byName: [String: Int] = [:]
+        for pid in ProcessTree.liveProcesses().map(\.pid) {
+            var task = proc_taskinfo()
+            let size = Int32(MemoryLayout<proc_taskinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &task, size) == size else { continue }
+            let count = Int(task.pti_threadnum)
+            total += count
+            let name = ProcessTree.executablePath(of: pid).flatMap(ProcessTree.displayName) ?? "unknown"
+            byName[name, default: 0] += count
+            // Slack for threads started between the two calls; the kernel fills what fits.
+            var ids = [UInt64](repeating: 0, count: count + 16)
+            let bytes = proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, &ids,
+                                     Int32(ids.count * MemoryLayout<UInt64>.size))
+            guard bytes > 0 else { continue }
+            for id in ids.prefix(Int(bytes) / MemoryLayout<UInt64>.size) {
+                var thread = proc_threadinfo()
+                let threadSize = Int32(MemoryLayout<proc_threadinfo>.size)
+                guard proc_pidinfo(pid, PROC_PIDTHREADINFO, id, &thread, threadSize) == threadSize
+                else { continue }
+                if thread.pth_run_state == 1 { running += 1 }
+                if thread.pth_run_state == 4 { uninterruptible += 1 }
+            }
+        }
+        let top = byName.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
+            .prefix(limit).map { HostHealthThreadHolder(name: $0.key, threads: $0.value) }
+        return HostHealthThreads(running: running, uninterruptible: uninterruptible, total: total,
+                                 processes: ProcessTree.machineProcessCount(), top: Array(top))
+    }
+
+    /// The busiest processes by CPU, most first, in share of one core. Two seconds of sampling
+    /// (`CPUAlertReaders.busiest`), made only by a load alarm. Owner: the session it runs under
+    /// (`sessionNames`), else the checkout its working directory is in (`CPUAlertLogic.processName`'s
+    /// walk), else for an OS executable the app macOS holds responsible for it (Docker's virtual machine
+    /// is Docker's), else just that it is the OS's.
+    static func busiest(_ limit: Int = 3, sessions: [HostHealthSession] = []) async
+        -> [HostHealthCPUProcess] {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let ranked = Array(await CPUAlertReaders.busiest().prefix(limit))
+        let named = sessionNames(of: ranked.map(\.pid), sessions: sessions, home: home)
+        return ranked.map { pid, percent in
+            let path = ProcessTree.executablePath(of: pid)
+            let system = path.map(hostHealthIsSystemPath) ?? false
+            // An empty executable makes the walk answer "" when no checkout encloses the cwd.
+            let project = CPUAlertLogic.processName(
+                cwd: MachineLoadRollup.workingDirectory(of: pid), executable: "", home: home
+            ) { FileManager.default.fileExists(atPath: $0 + "/.git") }
+            return HostHealthCPUProcess(name: path.flatMap(ProcessTree.displayName) ?? "unknown",
+                                        percent: percent, project: project.isEmpty ? nil : project,
+                                        system: system, session: named[pid],
+                                        app: system ? CPUAlertReaders.responsiblePath(of: pid)
+                                            .flatMap(CPUAlertLogic.appName) : nil)
+        }
+    }
+
+    /// Each pid's session, by the name Claude Code gave it, for the pids that have one.
+    ///
+    /// ONE TABLE WALK FOR ALL OF THEM, and only when there is a session to find: the order of the
+    /// three witnesses is `hostHealthSessionOwner`'s. The environment is read one key at a time
+    /// (`processEnvironmentValue`), never decoded whole, and only for a pid the parent chain could
+    /// not place; the ledger file is read at most once, and only when the marker could not answer.
+    /// A marker naming a supervisor that started AFTER the process is a recycled pid and refused.
+    static func sessionNames(of pids: [pid_t], sessions: [HostHealthSession],
+                             home: String) -> [pid_t: String] {
+        guard !pids.isEmpty, !sessions.isEmpty else { return [:] }
+        var identity: [pid_t: ProcessIdentity] = [:]
+        for one in ProcessTree.liveProcesses() { identity[one.pid] = one }
+        func began(_ pid: pid_t) -> Int64? { identity[pid]?.startedAt }
+        var live: [String: Int64] = [:]
+        var supervisors: Set<pid_t> = []
+        for session in sessions {
+            guard let at = began(session.supervisor) else { continue }
+            live[String(session.supervisor)] = at
+            supervisors.insert(session.supervisor)
+        }
+        let bySupervisor = Dictionary(sessions.map { ($0.supervisor, $0) },
+                                      uniquingKeysWith: { first, _ in first })
+        lazy var claims = SessionProcessGroups.Index(SessionProcessGroups.load())
+        var names: [pid_t: String] = [:]
+        for pid in pids {
+            let owner = hostHealthSessionOwner(
+                of: pid, supervisors: supervisors,
+                parent: { identity[$0]?.parent },
+                marker: { candidate in
+                    guard let raw = processEnvironmentValue(ofProcess: Int(candidate),
+                                                            key: hostHealthSupervisorEnvKey),
+                          let marked = pid_t(raw), let markedAt = began(marked),
+                          let at = began(candidate), at >= markedAt else { return nil }
+                    return marked
+                },
+                ledger: { candidate in
+                    guard let process = identity[candidate] else { return nil }
+                    return SessionProcessGroups.claimant(of: process, in: claims, sessions: live,
+                                                         startedAt: began).flatMap { pid_t($0) }
+                })
+            guard let owner, let session = bySupervisor[owner], let child = session.child,
+                  let configHome = hostHealthClaudeConfigHome(accountID: session.accountID,
+                                                              home: home),
+                  let data = try? Data(contentsOf: URL(fileURLWithPath: configHome)
+                      .appendingPathComponent("sessions/\(child).json")),
+                  let name = hostHealthRegistryName(data, childPid: child) else { continue }
+            names[pid] = name
+        }
+        return names
+    }
+}

@@ -1,0 +1,10 @@
+#!/bin/bash
+# Compiles the usage advisor's pure math (UsageBarCLI/UsageAdvisor.swift and its arithmetic half,
+# UsageBarCLI/UsageAdvisorMath.swift - one unit split only for file size) together with a small
+# assertion harness and runs it. No Xcode test target needed; exits non-zero on failure.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+out=$(mktemp -d)/run
+swiftc -o "$out" tests/advisor/main.swift UsageBarCLI/UsageAdvisor.swift \
+  UsageBarCLI/UsageAdvisorMath.swift
+"$out"

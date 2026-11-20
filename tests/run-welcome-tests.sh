@@ -1,0 +1,9 @@
+#!/bin/bash
+# Compiles the first-run welcome window's rules (UsageBar/Core/WelcomeFlow.swift, Foundation-only) with
+# a small assertion harness and runs it. No Xcode test target needed; exits non-zero on failure.
+# WelcomeCopy.swift is compiled against a pass-through L. Reads app sources as text for the orderings that matter (see main.swift).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+out=$(mktemp -d)/run
+swiftc UsageBar/Core/BrandPaths.swift -o "$out" tests/welcome/main.swift UsageBar/Core/WelcomeFlow.swift UsageBar/Core/WelcomeCopy.swift UsageBar/Core/CLIPathAdvice.swift
+"$out"

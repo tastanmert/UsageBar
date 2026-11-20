@@ -1,0 +1,177 @@
+import Foundation
+
+/// The one confirm-and-write behind every "use a reset" control (the account card's button and the
+/// banked-reset notification's action). Redeeming is the only write UsageBar ever performs, so it has
+/// exactly one path: one place the waste warning is worded and one place the credit is spent. The
+/// automatic redeem (`CodexAutoRedeemStore`) skips the question by the user's own setting and
+/// spends through `redeem` below, never a second call.
+///
+/// The spending itself is `CodexAppServerClient.consumeSoonestResetCredit`, which always picks the
+/// soonest-expiring credit; nothing here chooses for the user beyond that.
+@MainActor
+enum RedeemAction {
+    /// What one account has to spend, so the two card surfaces branch in ONE place rather than each
+    /// working it out from a provider id and a pair of optionals.
+    ///
+    /// PROVIDER-AWARE, NOT PROVIDER-BRANCHED. The two offers are different writes with different
+    /// mechanisms - Codex spends a banked credit through its own app server, Claude spends a weekly
+    /// reset by typing an interactive slash command into a live session - and neither is expressible
+    /// in the other's vocabulary. What they share is the rule this file exists for: exactly one
+    /// place asks the question, exactly one place performs the write, and no surface can skip
+    /// either. So each offer keeps its own confirm-and-spend pair below, and this is the one
+    /// question a card asks first.
+    typealias Offer = ResetOffer
+
+    /// Which of the four states this account is in (`ResetOffer`), never nothing: an account
+    /// nobody has observed is drawn as unknown rather than hidden, because a hidden control reads
+    /// as "there is no reset here".
+    ///
+    /// The Codex side is what the provider reports; the Claude side is the observed record plus
+    /// the CLI flag cache (`LimitResetStore.state`), which no poll produces.
+    static func offer(for usage: AccountUsage) -> Offer {
+        let claude = usage.providerID == "claude"
+            ? LimitResetStore.shared.state(accountID: usage.id) : .unknown
+        return ResetOffer.of(usage, claudeState: claude)
+    }
+
+    /// The confirmation's body: timing advice, cost + irreversibility, then the nearest expiry or
+    /// the plain fact that nobody reported one.
+    ///
+    /// The advice comes from `ResetHintLogic.redeemTiming`, so the hint and this dialog can never
+    /// disagree. "Mostly wasted" is only said when waiting really recovers more: the counters
+    /// refill before the credit expires. A credit that expires unused is lost, and saying so is
+    /// the opposite advice.
+    static func confirmMessage(for usage: AccountUsage, now: Date = Date()) -> String {
+        var parts: [String] = []
+        let timing = ResetHintLogic.redeemTiming(usage, now: now)
+        switch timing {
+        case .waitForRefill(let refill):
+            let when = UsageFormat.noticeCountdown(refill, now: now)
+            parts.append(String(format: L("This account still has plenty of quota left, and its counters refill on their own in %1$@ (%2$@). Waiting until just before then would recover more."),
+                                when.countdown, when.clock))
+        case .useOrLose(let expiry):
+            let when = UsageFormat.noticeCountdown(expiry, now: now)
+            parts.append(String(format: L("This reset expires in %1$@ (%2$@); unused it is lost."),
+                                when.countdown, when.clock))
+        case .worthIt, .expiryUnknown:
+            break
+        }
+        parts.append(L("Clears this account's current usage counters and consumes 1 banked reset. This cannot be undone."))
+        if case .useOrLose = timing {
+            // The advice already named the date.
+        } else if let expiry = usage.resetCreditsNextExpiry {
+            let when = UsageFormat.noticeCountdown(expiry, now: now)
+            parts.append(String(format: L("Nearest banked reset expires in %1$@ (%2$@)."),
+                                when.countdown, when.clock))
+        }
+        if usage.resetCreditsExpiryUnknown {
+            parts.append(L("UsageBar can't see when this reset expires."))
+        }
+        return parts.joined(separator: "\n\n")
+    }
+
+    /// Ask before spending. True means go ahead. The alert lives in its own window, detached from
+    /// the card (CentredAlert), so it must NAME the account it is about to reset.
+    static func confirm(usage: AccountUsage, label: String) -> Bool {
+        CentredAlert.confirm(title: "\(label) · \(L("Use a reset"))",
+                             body: confirmMessage(for: usage), confirmTitle: L("Redeem"))
+    }
+
+    /// Spend the soonest-expiring credit. Nil when this account has no CLI home to talk to, which
+    /// leaves nothing to report: no request was ever made. Callers own the refresh behind it, so a
+    /// card can show its outcome line before waiting on a 10-20s poll.
+    static func redeem(usage: AccountUsage) async -> CodexAppServerClient.RedeemOutcome? {
+        // `launchableHome`, not the renewal home: a signed-out account has no session for the app
+        // server to spend a credit on, and asking anyway would report a failure about a request
+        // that never should have been made.
+        let home = UsageStore.shared.discoveredAccounts
+            .first(where: { $0.id == usage.id })?.launchableHome
+        // Every entry point, the automatic one included, passes the same in-flight and per-wall
+        // check, so whichever redeem comes second (in either order) sends no request.
+        let autoRedeem = CodexAutoRedeemStore.shared
+        guard autoRedeem.beginRedeem(usage: usage) else { return nil }
+        var outcome: CodexAppServerClient.RedeemOutcome?
+        if let home {
+            outcome = await CodexAppServerClient.consumeSoonestResetCredit(codexHome: home)
+        }
+        autoRedeem.endRedeem(outcome, usage: usage)
+        return outcome
+    }
+
+    /// UsageBar's confirm card: spend exactly the credit the user agreed to, on exactly the
+    /// identity the card was opened for (`CodexAppServerClient.consume(expected:credit:)`). Shares
+    /// the in-flight and per-wall check with every other redeem. Nil when another redeem holds the
+    /// account: nothing was sent. An earlier attempt left open by a lost answer may be settled
+    /// here (the coordinator re-sends only that same request), so its "uncertain" mark does not
+    /// block this call.
+    static func redeem(usage: AccountUsage, approval: BrimCodexApproval) async
+        -> CodexAppServerClient.ConsumeOutcome? {
+        let autoRedeem = CodexAutoRedeemStore.shared
+        let open = CodexConsumeCoordinator.shared.pending(home: approval.identity.home)
+        guard autoRedeem.beginRedeem(usage: usage, settlesOpenAttempt: open.map { !$0.settled } ?? false)
+        else { return nil }
+        let outcome = await CodexAppServerClient.consume(expected: approval.identity, credit: approval.credit)
+        autoRedeem.endRedeem(consume: outcome, usage: usage)
+        return outcome
+    }
+
+    /// The refresh every redeem is followed by, in one place so no caller can pair a success with
+    /// a plain re-read. A success hands off to `RedeemPropagationStore`, which owns that first
+    /// refresh AND the retries behind it: the provider keeps serving the spent numbers for a few
+    /// more seconds, which would otherwise leave a green "Reset redeemed" sitting over a red
+    /// "Limit reached" at 0%. Anything else spent nothing, so one re-read says all there is.
+    static func followThrough(outcome: CodexAppServerClient.RedeemOutcome?,
+                              usage: AccountUsage) async {
+        if outcome == .redeemed {
+            RedeemPropagationStore.shared.begin(usage: usage)
+        } else {
+            await UsageStore.shared.refresh(userInitiated: true)
+        }
+    }
+
+    /// The outcome in the app's own voice. Every case is a translated sentence: the server's own
+    /// wording never reaches a row, only the tooltip.
+    static func outcomeMessage(_ outcome: CodexAppServerClient.RedeemOutcome) -> String {
+        switch outcome {
+        case .redeemed: return L("Reset redeemed")
+        case .alreadyUsed: return L("That credit was already used")
+        case .noCredit: return L("No reset credit available")
+        case .failed: return L("Redeem failed")
+        }
+    }
+
+    /// The server's own words for a failure, for a hover tooltip: diagnosable without putting a
+    /// protocol token in front of everyone.
+    static func outcomeDetail(_ outcome: CodexAppServerClient.RedeemOutcome) -> String? {
+        if case .failed(let detail) = outcome { return detail }
+        return nil
+    }
+
+    /// Where the banked-reset notification's action lands: the same confirmation the card opens,
+    /// never a redeem. The notification only ever knows an account id, so the account is resolved
+    /// here, and everything that cannot resolve to one live account opens the app instead of doing
+    /// nothing: a tap on the notification body rather than its button, a hint that outlived its
+    /// account (signed out, switched off), or a click so soon after launch that the first refresh
+    /// has not landed yet. The panel it opens carries the same button on the card.
+    static func present(accountID: String?) {
+        guard let accountID,
+              let usage = UsageStore.shared.accounts.first(where: { $0.id == accountID }) else {
+            MainWindowController.shared.show()
+            return
+        }
+        let label = SettingsStore.shared.displayLabel(accountID: usage.id,
+                                                      fallback: usage.accountLabel)
+        guard confirm(usage: usage, label: label) else { return }
+        Task {
+            let outcome = await redeem(usage: usage)
+            // With no card on screen the answer has nowhere else to go, and a redeem that failed
+            // must never pass for a quiet success. A success needs no alert: the panel, the menu
+            // bar numbers and the status line all move on the refresh right behind it.
+            if outcome != .redeemed {
+                CentredAlert.notice(title: "\(label) · \(L("Use a reset"))",
+                                    body: outcomeMessage(outcome ?? .failed(nil)))
+            }
+            await followThrough(outcome: outcome, usage: usage)
+        }
+    }
+}

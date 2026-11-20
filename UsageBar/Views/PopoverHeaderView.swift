@@ -1,0 +1,430 @@
+import SwiftUI
+
+/// The measured widths of the header parts that do NOT change when the refresh countdown is
+/// trimmed: the rigid cluster at each end, the switch between them, and an unrendered copy of the
+/// countdown slot. Because no member moves with the decision below, that decision can never feed
+/// back into its own inputs and oscillate - the numbers describe the row as it would be laid out
+/// with no countdown at all.
+struct HeaderWidths: Equatable {
+    var brand: CGFloat = 0
+    var picker: CGFloat = 0
+    var refresh: CGFloat = 0
+    var counter: CGFloat = 0
+    var shortCounter: CGFloat = 0
+}
+
+/// Which face of the refresh countdown the header has room for: the sentence, the bare figure
+/// ("58s"), or none (`nil`).
+enum CountdownForm { case full, short }
+
+/// The popover's header strip, split out of PopoverRootView for file size: the wordmark and its
+/// badges, the Usage / Tokens switch, the refresh countdown, and the refresh button.
+extension PopoverRootView {
+    /// The row's own geometry, read by both the layout below and the fit test that trims the clock,
+    /// so the two can never drift apart - an arithmetic slip there is a header wrapped onto two lines.
+    private static let gap: CGFloat = 6
+    /// The clear space the clock cluster's leading spacer never gives up, so the switch and the clock
+    /// read as two things rather than one run-on strip.
+    private static let clockLead: CGFloat = 8
+    var header: some View {
+        HStack(spacing: Self.gap) {
+            // EVERY part of this row moves the panel, and each part says how: the runs with nothing
+            // to click move it from the first frame of the press, the controls (the update badge,
+            // the tab switch, the refresh) move it only once the press has travelled far enough to
+            // not be a click. Laid OVER each region rather than behind it, which is the correction
+            // of 2026-08-07: mounted behind, the drag layer was never sent a press at all and this
+            // row's wordmark, badges and clock were dead to the pointer while reading as handles.
+            //
+            // The brand cluster is split for that reason: the wordmark, the version and the DEV tag
+            // are one continuous grab area (its own internal gaps included), and the update badge
+            // sits beside them keeping its click.
+            HStack(spacing: 6) {
+                HStack(spacing: 6) {
+                // The logotype: the product's name, set once, with its version on the baseline.
+                // The version sits on the wordmark's baseline, like a subscript to the name; the
+                // badges after it stay centred on the row.
+                HStack(alignment: .lastTextBaseline, spacing: 6) {
+                UsageBarWordmarkView(glyphHeight: 13)
+                // Against the wordmark, which is the whole point of it being here rather than in
+                // the footer: beside the product's own name it can only be read one way. Not
+                // localized: a dotted version is a token.
+                // Demo mode is for screenshots and promo footage: a version in them dates the shot.
+                if let version = BuildVariant.version, !DemoUsage.isActive, UsageLayout.active == nil {
+                    Text(version).font(.caption2).foregroundStyle(PanelStyle.text3)
+                }
+                }
+                overlayHeaderBadge
+                // The dev variant tags every surface (menu bar strip + panel header), so a test
+                // instance can never be mistaken for the installed app. Demo mode included: a demo
+                // launched from a Debug build is still a test instance, and README shots come from
+                // the Release build, where this is false anyway.
+                if BuildVariant.isDev {
+                    UsageBarDevTagView()
+                }
+                }
+                // The leading padding is inside the grab area on purpose: the margin that seats the
+                // wordmark on the panel's content line is space nothing else claims, so it may as
+                // well be somewhere to take hold of.
+                .padding(.leading, PanelGeometry.brandLead
+                         + (host == .window ? PanelGeometry.windowControlsWidth : 0))
+                .frame(maxHeight: .infinity)
+                .windowDragSurface()
+                // Docker-style nudge, two states: detected (accent ↑, click walks the install
+                // flow) and downloaded (green ↻, the Ghostty semantic - the payload is on disk,
+                // a click just restarts into the new version).
+                if let version = UpdateAvailability.shared.version {
+                    let ready = UpdateAvailability.shared.isDownloaded
+                    let busy = UpdateAvailability.shared.busy
+                    let stalled = UpdateAvailability.shared.stalled
+                    Button {
+                        startInstall()
+                    } label: {
+                        HStack(spacing: 4) {
+                            if stalled {
+                                // No spinner: nothing is moving, and this face is a button again.
+                                Text(L("Update stuck"))
+                            } else if let busy {
+                                // The native spinner, for the reason the refresh button uses one:
+                                // a hand-rolled rotation cannot be stopped cleanly. Scaled to the
+                                // caption line it sits on - the small control size is the height
+                                // of the whole capsule.
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .scaleEffect(0.6)
+                                    .frame(width: 10, height: 10)
+                                    .tint(.white)
+                                Text(Self.busyLabel(busy))
+                            } else {
+                                Text(verbatim: "\(ready ? "↻" : "↑") \(version)")
+                            }
+                        }
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(ready ? UsageBarColor.normal : UsageBarColor.ai))
+                    }
+                    .buttonStyle(.plain)
+                    // Nothing a second press could ask for that the first is not already doing,
+                    // and the reducer refuses one anyway - this is what makes the refusal visible
+                    // rather than a click that appears to have been swallowed.
+                    // The stuck face is the exception: quitting is the one thing left to ask for.
+                    .disabled(busy != nil && !stalled)
+                    // A control, so it takes the travelling form: the badge still installs on a
+                    // click and the panel still moves if the hand meant to move it.
+                    .windowDragOrTap { startInstall() }
+                    // Around the control rather than on it, because the busy chip is disabled and
+                    // a disabled control is routed no hover at all - which is the state that most
+                    // needs to be able to explain itself.
+                    .usageBarTooltipAroundControl(Self.installChipHelp(stalled: stalled, busy: busy,
+                                                                    ready: ready))
+                }
+            }
+            // Held at its ideal width, which is both what it is owed - the product's name and the
+            // one nudge that has to be seen to be clicked - and what makes the measurement below
+            // true: a cluster free to compress reports the width it was squeezed into, so the row
+            // would read "the clock still fits" from a number the clock itself caused.
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(maxHeight: .infinity)
+            .background { widthProbe { headerWidths.brand = $0 } }
+            // The slack on the switch's leading side, which is new: the row used to give all of it
+            // to the clock, so the switch sat against the wordmark. A grab area like the slack on
+            // the other side, or the pinned panel would lose half the strip it has always had.
+            Spacer(minLength: Self.gap)
+                .frame(maxHeight: .infinity)
+                .windowDragSurface()
+            // Every surface carries it: the pinned panel is where someone watches usage all day,
+            // and making them open a different window to see where the tokens went broke that. Not
+            // in the footer with the view controls - this switches WHAT the surface is showing, not
+            // how it looks.
+            //
+            // CENTRED ON THE HEADER, not between its neighbours, which are different points because
+            // the two end clusters are never the same width. Two equal spacers would centre it
+            // between them and it would drift with every change to either end - the mark that has
+            // missed its mark the footer credit was moved for. The offset below pays the difference
+            // to whichever side is short.
+            surfaceTabPicker
+                .padding(.leading, centreOffset.leading)
+                .padding(.trailing, centreOffset.trailing)
+                // The centring pad is the last unclaimed space in the row, and it is not small: it
+                // is whatever the wider end of the header owes the switch. Grabbed by a strip the
+                // exact width of the pad, at the edge the pad is on, so the switch itself is never
+                // covered by it (an overlay over the padded whole would sit on the segments and
+                // take their clicks - which is the mistake this row is being repaired from).
+                .overlay(alignment: .leading) { dragPad(centreOffset.leading) }
+                .overlay(alignment: .trailing) { dragPad(centreOffset.trailing) }
+            HStack(spacing: Self.gap) {
+                Spacer(minLength: Self.clockLead)
+                // TimelineView re-evaluates every second so the countdown ticks live (a plain
+                // render would freeze it at whatever it said on open). A heartbeat, so it dims - and
+                // is dropped when the row is tight. B-879: while another once-a-second redraw drives
+                // `SecondsClock` (a private build's panel section), the countdown ticks on that redraw instead, so
+                // the panel draws once a second rather than twice.
+                if let form = countdownForm {
+                    if SecondsClock.shared.drivers > 0 {
+                        ClockedCounter { now in counterSlot(countdownText(at: now, form), form) }
+                    } else {
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            counterSlot(countdownText(at: context.date, form), form)
+                        }
+                    }
+                }
+            }
+            // Held at its ideal width, for the reason the brand cluster is: a cluster free to
+            // compress absorbs whatever the row over-committed elsewhere, and what it absorbs it
+            // pays for by wrapping - which is the one thing this header may never do.
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(maxHeight: .infinity)
+            .windowDragSurface()
+            // One refresh for both tabs, because the header frames both: on Tokens it rescans the
+            // transcripts rather than re-polling the quota. A button that silently drove the other
+            // tab's store would look broken - the numbers under it would not move.
+            Button {
+                startRefresh()
+            } label: {
+                // A hand-rolled rotation cannot end cleanly: animating back after an interrupted
+                // repeatForever unwinds the arrow (a visible bob), and a nil animation does not
+                // cancel an in-flight repeat (the arrow spins forever). Swap to the native
+                // spinner while refreshing instead - no custom animation to get wrong.
+                Group {
+                    if isRefreshing {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                }
+                .frame(width: 28, height: 28)
+                .panelChip()
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(PanelStyle.chipInk)
+            .disabled(isRefreshing)
+            // The other end of the header's grab strip: on the pinned panel a press that travels
+            // moves the window, and one that does not is the refresh it always was. The overlay is
+            // above a DISABLED control here, which is why the tap path asks the same question the
+            // modifier above does rather than trusting SwiftUI to have stopped it.
+            .windowDragOrTap { startRefresh() }
+            .accessibilityLabel(L("Refresh"))
+            .usageBarTooltipAroundControl(L("Refresh"))
+            .padding(.trailing, host == .window ? PanelGeometry.windowRefreshTrail : 12)
+            .background { widthProbe { headerWidths.refresh = $0 } }
+        }
+        .frame(height: PanelMetrics.headerHeight)
+        .background(alignment: .topLeading) { clockProbes }
+    }
+
+    /// One refresh, reached two ways: the button's own action and the press that turned out not to
+    /// be a window move. Stated once so the second entrance cannot drift into refreshing a different
+    /// tab than the first, and it carries the guard the button expresses with `.disabled` - an
+    /// overlay is not a SwiftUI control and nothing stops it on the caller's behalf.
+    private func startRefresh() {
+        guard !isRefreshing else { return }
+        switch tab {
+        case .usage: Task { await store.refresh(userInitiated: true) }
+        case .cost: tokens.refresh()
+        // The board's own rescan, which is what this button means on that tab: the states on it are
+        // read from the supervisors' files, so re-polling the quota APIs would move nothing on
+        // screen (SessionRosterStore says what a scan costs and when it happens on its own).
+        case .sessions: SessionRosterStore.shared.refresh()
+        }
+    }
+
+    /// One install, reached the two ways the refresh above is, and carrying the guard the button
+    /// expresses with `.disabled`: the drag overlay is not a SwiftUI control, so nothing stops it
+    /// on the caller's behalf.
+    /// A stalled install is the one busy state a press may act on: it finishes by quitting.
+    private func startInstall() {
+        if UpdateAvailability.shared.stalled { return UpdaterController.shared.finishStalledUpdate() }
+        guard UpdateAvailability.shared.busy == nil else { return }
+        UpdaterController.shared.installNow()
+    }
+
+    /// What the chip says while it is working. The steps before the restart read as one line on
+    /// purpose: checking, downloading and unpacking are Sparkle's business, and what the person
+    /// waiting needs is that it is working and that the restart, when it comes, is not sudden.
+    private static func busyLabel(_ busy: UpdateBusy) -> String {
+        busy == .restarting ? L("Restarting…") : L("Updating…")
+    }
+
+    /// The install chip's hover text, one line per face it can show.
+    private static func installChipHelp(stalled: Bool, busy: UpdateBusy?, ready: Bool) -> String {
+        if stalled { return L("Quit UsageBar to finish installing. It reopens by itself.") }
+        if let busy { return busyLabel(busy) }
+        return ready ? L("Update downloaded - click to restart") : L("Update available - click to install")
+    }
+
+    /// A grab area exactly as wide as one side's centring pad, full height. Zero-width when that
+    /// side owes nothing, which is most rows.
+    private func dragPad(_ width: CGFloat) -> some View {
+        Color.clear
+            .frame(width: width)
+            .frame(maxHeight: .infinity)
+            .windowDragSurface()
+    }
+
+    /// Whichever store the visible tab reads from, so the spinner and the disabled state describe
+    /// the work the click actually started. The quota poll keeps its own schedule while the Cost
+    /// tab is up, so this is about which one the button is for, not which one is allowed to run.
+    private var isRefreshing: Bool {
+        switch tab {
+        case .usage: return store.isRefreshing
+        case .cost: return tokens.isScanning
+        // A board scan is a directory listing and one small file per session, done synchronously
+        // before this could draw anything: there is no in-flight state to report.
+        case .sessions: return false
+        }
+    }
+
+    /// Same control the footer uses for the meters, in the same size: two words, both always legible,
+    /// so the alternative view advertises itself instead of hiding behind an icon. Sized to its text
+    /// and placed before the flexible part of the header, so the clock beside it keeps the width it
+    /// reserves for its widest string even in the narrowest single-column panel.
+    private var surfaceTabPicker: some View {
+        // Read HERE rather than inside the badge closure, so the dependency lands on THIS surface's
+        // body: a session going blocked while the Usage tab is up has to light the switch, and this
+        // is the only read of the roster a surface on any other tab makes.
+        let waiting = SessionRosterStore.shared.blockedCount > 0
+        return NeutralSegmentedPicker(selection: $tabState.tab,
+                                      options: SurfaceTab.allCases,
+                                      size: .mini,
+                                      dragsWindow: true,
+                                      // The same red the board draws a blocked session with, and
+                                      // the menu bar's own dot: three marks, one condition, so they
+                                      // can never disagree about whether somebody is being waited
+                                      // for.
+                                      badged: { $0 == .sessions && waiting }) { $0.label }
+            .background { widthProbe { headerWidths.picker = $0 } }
+    }
+
+    /// What the switch has to be padded by to sit at the ROW's centre rather than at the midpoint
+    /// between its neighbours: the difference between the two end clusters, paid to the short side.
+    ///
+    /// Zero when the row cannot afford it, and that is the trimming order the header already ranks
+    /// by: the ends are identity and the only controls, so a centred switch is the first thing to
+    /// go. Giving it up costs a switch that sits off-centre; taking the space anyway would cost an
+    /// overlap, and at these widths an overlap is a switch drawn on top of the clock.
+    ///
+    /// Unmeasured parts read 0, which pays nothing - a switch one frame off-centre beats a header
+    /// that jumps while its own measurements settle.
+    private var centreOffset: (leading: CGFloat, trailing: CGFloat) {
+        let parts = headerWidths
+        guard parts.brand > 0, parts.picker > 0, parts.refresh > 0 else { return (0, 0) }
+        let leftEnd = parts.brand
+        let rightEnd = parts.refresh + clockZoneWidth
+        // Centring costs the WIDER end twice over, plus the switch and the minimum slack either
+        // side of it. Asked of the same numbers the layout uses, so the two cannot disagree about
+        // whether it fits.
+        // CLAMPED TO THE SLACK THAT ACTUALLY EXISTS, which the first version was not: it asked
+        // whether the centred row would fit and then took the whole difference, and the row has no
+        // way to refuse. The spacers collapse to their minimums and the overflow lands on the only
+        // child that can absorb it - the clock, which wrapped onto three lines (seen in the first
+        // capture). An off-centre switch is a compromise; a wrapped header is a broken one.
+        // The fixed spacing is counted as the row lays it out (`rowGaps`). It once counted one gap
+        // and a second clock lead, 22pt short, so a row whose slack ran out overflowed by exactly
+        // that and the stack centring it cut 11pt off each end (B-1253, the single-column window).
+        let slack = popoverWidth - (leftEnd + parts.picker + rightEnd + rowGaps)
+        let owed = min(abs(leftEnd - rightEnd), max(0, slack))
+        return (rightEnd > leftEnd ? owed : 0, leftEnd > rightEnd ? owed : 0)
+    }
+
+    /// The spacing the row adds to its measured parts: the four gaps between its five children,
+    /// the switch's leading spacer at its minimum, and inside the clock cluster either its bare
+    /// leading spacer (no countdown) or that spacer, already in `clockZoneWidth`, plus one more gap.
+    private var rowGaps: CGFloat {
+        5 * Self.gap + (countdownForm == nil ? Self.clockLead : Self.gap)
+    }
+
+    /// The narrowest the surface may be for the header to hold what it never gives up: the end
+    /// clusters (wordmark with its badges, the refresh), the switch and the row's fixed spacing. The
+    /// countdown is the only part that trims, so a surface narrower than this cannot be saved by it
+    /// and the row overflows, which the stack centring it shows as both ends cut off (the wordmark
+    /// under the traffic lights, the refresh button half outside the window). Every part is
+    /// measured at its ideal width, so this never reads the width it raises.
+    var headerMinWidth: CGFloat {
+        let parts = headerWidths
+        guard parts.brand > 0, parts.picker > 0, parts.refresh > 0 else { return 0 }
+        return ceil(parts.brand + parts.picker + parts.refresh + 5 * Self.gap + Self.clockLead)
+    }
+
+    /// How much of the row the countdown cluster is occupying right now, which is what the trimming
+    /// below has already decided. Read by the centring above so it measures the row as drawn.
+    private var clockZoneWidth: CGFloat {
+        switch countdownForm {
+        case .full: Self.clockLead + headerWidths.counter
+        case .short: Self.clockLead + headerWidths.shortCounter
+        case nil: 0
+        }
+    }
+
+    /// Whether the refresh countdown fits beside the switch. It is a heartbeat, and everything else
+    /// is either identity (wordmark, update badge) or the surface's only controls (the switch, the
+    /// refresh), so it is the one part that gives. There is no current-time clock beside it any
+    /// more: reset times read as countdowns, so a bare date-time here was the one reading on screen
+    /// that answered "when" rather than "how long" (B-650), and macOS shows the time already.
+    /// A 380pt single column, an update badge and a language whose two tab words are long
+    /// (Japanese) together want more than the row has: unmeasured parts read 0, which trims it,
+    /// because a countdown one frame late beats a header wrapped onto two lines.
+    /// B-1253: a row too tight for the sentence falls back to the bare figure ("58s") before it
+    /// gives the countdown up, which the single-column dashboard window (its wordmark shifted right
+    /// of the traffic lights) needs. Both slots are measured by hidden probes, so this still reads
+    /// none of its own output.
+    private var countdownForm: CountdownForm? {
+        let parts = headerWidths
+        guard parts.brand > 0, parts.picker > 0, parts.refresh > 0 else { return nil }
+        // What the row owes before the countdown: both end clusters (each measured with its own outer
+        // padding), the switch, the gaps between the children, and the slack the switch's own
+        // leading spacer never gives up (new with the centred switch, and the countdown is measured
+        // against the row it is actually in).
+        let rigid = parts.brand + parts.picker + parts.refresh + 3 * Self.gap + Self.gap
+        // Plus the clock cluster's own spacer and the gap between it and the countdown.
+        let fits = { (slot: CGFloat) in slot > 0 && rigid + Self.clockLead + 2 * Self.gap + slot <= popoverWidth }
+        if fits(parts.counter) { return .full }
+        return fits(parts.shortCounter) ? .short : nil
+    }
+
+    /// An unrendered, unlaid-out copy of the countdown slot: a background is sized by its
+    /// host, not the other way round, so these occupy no part of the row and their widths are known
+    /// even in the frames where the real ones are trimmed away - measuring the live pair could only
+    /// ever confirm the decision it is already the result of.
+    private var clockProbes: some View {
+        ZStack(alignment: .topLeading) {
+            counterSlot(nil, .full)
+                .background { widthProbe { headerWidths.counter = $0 } }
+            counterSlot(nil, .short)
+                .background { widthProbe { headerWidths.shortCounter = $0 } }
+        }
+        .hidden()
+    }
+
+    /// The short face drops "refreshing…" rather than abbreviating it: the refresh button beside it
+    /// is already spinning.
+    private func countdownText(at now: Date, _ form: CountdownForm) -> String? {
+        if form == .short {
+            return store.isRefreshing ? nil : UsageFormat.updatesInFigure(store.nextRefreshAt, now: now)
+        }
+        if store.isRefreshing { return UsageLayout.active == nil ? L("refreshing…") : nil }
+        return UsageFormat.updatesIn(store.nextRefreshAt, now: now)
+    }
+
+    /// The counter's string width changes every second; hidden templates (the widest forms,
+    /// localized) reserve a fixed slot so the ticking never pushes the date around. Trailing-aligned
+    /// to hug the button. Passing no counter leaves the bare reservation, which is what the probe
+    /// above measures.
+    private func counterSlot(_ counter: String?, _ form: CountdownForm) -> some View {
+        ZStack(alignment: .trailing) {
+            ForEach(form == .full ? UsageFormat.updatesInTemplates : UsageFormat.updatesInFigureTemplates, id: \.self) {
+                Text($0).hidden()
+            }
+            if let counter { Text(counter) }
+        }
+        .font(PanelStyle.font(12).monospacedDigit()).foregroundStyle(PanelStyle.text2)
+    }
+}
+
+/// B-879: the countdown on `SecondsClock`, read in a view of its own so a tick re-runs the counter
+/// and not the header around it (the same reason a private build's panel section reads its store in a view of its own).
+private struct ClockedCounter<Label: View>: View {
+    let label: (Date) -> Label
+    var body: some View { label(SecondsClock.shared.now) }
+}

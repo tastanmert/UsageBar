@@ -1,0 +1,132 @@
+import Foundation
+
+// What decides, on one poll tick, WHERE this session runs and WHAT it runs there.
+//
+// Three sources can change either answer while a conversation is alive, and they are ordered:
+//
+//   1. `usagebar switch` / a pin moved in the panel - the ACCOUNT (SessionSwitch.swift)
+//   2. `usagebar model` - the MODEL AND EFFORT, on whatever account the step above settled on
+//      (SessionModel.swift)
+//   3. the launch default in Settings - both axes, but only for a session that has not been told
+//      otherwise (FollowAdoption.swift)
+//
+// Lifted out of the poll loop, which is at the repo's file-size cap, in the shape its other deferred
+// decisions already use: each owns its own `inout` state, the plan they may write comes in as
+// another, and everything they consult is injected. What is new is only that the three arrive
+// TOGETHER, and that is the point of the file rather than a side effect of moving them.
+//
+// THE ORDER IS A RULE, NOT AN ARRANGEMENT, and having it in one function is what stops a later edit
+// from quietly changing it:
+//
+//   - The account instruction runs first because it is about a different question. "Run this
+//     conversation over there" and "run it on opus" compose - the second folds its pair onto
+//     whatever target the first chose - so a `usagebar switch` and a `usagebar model` typed in the same
+//     window are both honoured on the same restart rather than racing for it.
+//   - Both of them outrank the follow, and the follow STANDS DOWN entirely while a model pin
+//     stands. The session scope beats the fleet scope on this axis exactly as it does on the
+//     account one: a Settings change after a `usagebar model` is a change to what NEW sessions run,
+//     not an instruction to take this conversation off the pair its user just chose.
+//   - The follow runs last so that, when it does run, it can fold its pair into a relaunch one of
+//     the others already planned instead of costing a second one.
+
+/// One tick's answer to all three, in that order. `policy` comes in as the fleet's (the app's, with
+/// this project's profile over it) and goes out as this SESSION's, because the account pin can
+/// change inside this call and every mover after it must be judged by the pin the session has now
+/// (the reasoning is `applyManualMoves`'s own).
+///
+/// Both request readings are injected, for the reason every other file-touching helper here injects
+/// them: the sequence has to be reachable in a test without a home directory.
+///
+/// `primaryModel` comes in as what the session was understood to run and goes out as what it runs
+/// now, which the adoption below can change without any relaunch at all.
+///
+/// `following` is the session-lifetime opt-out, per axis: a typed `--model` or `--effort` at launch
+/// holds its own axis, and `--no-follow` holds both. The per-tick stand-down for a live model pin is
+/// decided here rather than by the caller, so the two cannot come apart.
+///
+/// `steering` is whether UsageBar may choose an account for this session (AutoSteering.swift), and it
+/// reaches the two stations below that would otherwise RE-PICK one as a side effect of an
+/// instruction about the model. Neither is refused by it: `usagebar model` and the launch-default
+/// follow both still land, on the account the session is already on, which is what both of them do
+/// for a pinned session today. The account instruction above is untouched - `usagebar account` and a
+/// pin moved in the panel are the user naming an account, which no mode has anything to say about.
+func applySessionDirectives(plan: inout RelaunchPlan?,
+                            moves: inout ManualMoveState,
+                            switchRecord: inout PendingSwitchConsumption?,
+                            model: inout SessionModelState,
+                            modelRecord: inout PendingModelConsumption?,
+                            follow: inout FollowState, following: FollowAxes,
+                            policy: inout LaunchPolicy, steering: Bool,
+                            account: Snapshot.Account, providerID: String, launchArgs: [String],
+                            primaryModel: inout String?,
+                            quarantine: [String: (model: String?, until: Date)],
+                            reserves: AccountReserves = .none,
+                            watcher: inout TranscriptWatcher, childAge: TimeInterval,
+                            keyboardIdle: (TimeInterval) -> Bool,
+                            modelRequest: (String) -> ModelRequest? = {
+                                readModelRequest(sessionKey: $0)
+                            },
+                            switchRequest: (String) -> SwitchRequest? = {
+                                readSwitchRequest(sessionKey: $0)
+                            },
+                            log: URL = handoffLog,
+                            heldElsewhere: (String) -> ConversationHolder? = { _ in nil }) {
+    // Claude Code's own `/model`, read out of the transcript and taken as the instruction it is.
+    // FIRST, because it changes what this session is understood to run, and everything after it -
+    // including the degradation rescue one call further down the tick - has to be judged against
+    // that rather than against the command line the session was launched with. It plans no
+    // relaunch, so it cannot compete with the two below for the tick's one restart.
+    adoptNativeModelChoice(state: &model, follow: &follow, watcher: watcher,
+                           primaryModel: primaryModel, launchArgs: launchArgs, log: log)
+    // The notice it leaves is NEWS on the status line rather than a line on the terminal (that
+    // adoption is the one model-axis event with no relaunch behind it), so something that runs every
+    // tick has to take it down again - the same shape, and the same reason, as the cancelled switch
+    // one axis over (`expireCancellation`, SessionSwitch.swift).
+    //
+    // AFTER the adoption, not before. The stamp is the event that confirmed the choice, so a prompt
+    // the user has ALREADY sent is newer than it and takes the notice down on this very tick; asking
+    // first meant asking about a badge that did not exist yet, and the answer arrived a whole turn
+    // late (review, 2026-08-07).
+    model.expireAdoption(lastUserTurnAt: watcher.lastUserTurnAt)
+    // Re-derived HERE rather than by the caller, exactly as `policy` is and for the same reason:
+    // this call can change the pin, and every reader after it - the degradation rescue above all -
+    // must judge the session by what it runs now.
+    primaryModel = sessionPrimaryModel(pin: model.pin, launchArgs: launchArgs,
+                                       providerID: providerID, policy: policy)
+    // `primaryModel` and `quarantine` go with it because the pin switch inside is a proactive mover
+    // and plays on the movers' shared field (`liveMoveField`): what a quarantine blocks depends on
+    // the model this session runs, and the account the cap handoff just walked out of is precisely
+    // the one a pin must not drag it back into (SessionSwitch.swift carries the incident).
+    applyManualMoves(plan: &plan, state: &moves, record: &switchRecord, policy: &policy,
+                     account: account, providerID: providerID, primaryModel: primaryModel,
+                     quarantine: quarantine, watcher: &watcher,
+                     childAge: childAge, keyboardIdle: keyboardIdle, request: switchRequest,
+                     heldElsewhere: heldElsewhere)
+    // Handed the tick's relaunch as something it may only ADD to: with an account already chosen
+    // above, this station folds its pair onto that plan and cannot replace it (`TickPlan`,
+    // SupervisorRuntime.swift). The wrap is here rather than around the whole sequence because the
+    // station before it is the one that legitimately DOES choose an account.
+    var planning = TickPlan(plan)
+    applySessionModel(plan: &planning, state: &model, record: &modelRecord, follow: &follow,
+                      policy: policy, account: account, providerID: providerID,
+                      launchArgs: launchArgs,
+                      // Every way an account can already be spoken for arrives as one question:
+                      // this session's own pin, the project's and the app's are all folded into
+                      // `policy.mode` by the call above (`sessionPolicy`), and a fleet set to
+                      // observe only is the fourth (AutoSteering.swift). It belongs in the same
+                      // reading rather than beside it: what all four say is "the account is not
+                      // this station's to choose", and `usagebar model` already knows what to do with
+                      // that - run the pair the user asked for, here.
+                      accountPinned: !steering || moves.sessionPin != nil
+                          || policy.mode == "manual",
+                      quarantine: quarantine, reserves: reserves,
+                      watcher: &watcher, childAge: childAge,
+                      keyboardIdle: keyboardIdle, request: modelRequest(model.sessionKey))
+    plan = planning.plan
+    applyFollowAdoption(plan: &plan, state: &follow,
+                        following: following.gated(by: !model.isPinned),
+                        policy: policy, account: account, providerID: providerID,
+                        steering: steering,
+                        launchArgs: launchArgs, quarantine: quarantine, reserves: reserves,
+                        watcher: &watcher, keyboardIdle: keyboardIdle)
+}

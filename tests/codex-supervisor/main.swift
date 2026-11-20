@@ -1,0 +1,422 @@
+import Darwin
+import Foundation
+
+var failures = 0
+func check(_ name: String, _ condition: Bool) {
+    print("\(condition ? "PASS" : "FAIL"): \(name)")
+    if !condition { failures += 1 }
+}
+
+let root = FileManager.default.temporaryDirectory.appendingPathComponent("usagebar-codex-tests-\(UUID().uuidString)")
+try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+defer { try? FileManager.default.removeItem(at: root) }
+let home = root.appendingPathComponent("home")
+let sessions = home.appendingPathComponent("sessions")
+try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+let start = Date(timeIntervalSince1970: 1_800_000_000)
+let sid = UUID().uuidString
+let turn = UUID().uuidString
+let nextTurn = UUID().uuidString
+let iso = ISO8601DateFormatter()
+
+func line(_ type: String, _ payload: [String: Any], after: TimeInterval = 1) throws -> Data {
+    var data = try JSONSerialization.data(withJSONObject: ["type": type, "payload": payload,
+        "timestamp": iso.string(from: start.addingTimeInterval(after))])
+    data.append(10)
+    return data
+}
+func meta(id: String = sid, source: String = "cli", parent: String? = nil) throws -> Data {
+    var payload: [String: Any] = ["id": id, "session_id": id, "source": source, "originator": "codex-tui"]
+    if let parent { payload["parent_thread_id"] = parent }
+    return try line("session_meta", payload, after: -1)
+}
+func event(_ type: String, turnID: String = turn, after: TimeInterval = 1) throws -> Data {
+    try line("event_msg", ["type": type, "turn_id": turnID], after: after)
+}
+func completedUserItem(_ text: String, turnID: String = turn, after: TimeInterval = 1,
+                       extraContent: [[String: Any]] = []) throws -> Data {
+    var content: [[String: Any]] = [["type": "text", "text": text, "text_elements": []]]
+    content.append(contentsOf: extraContent)
+    return try line("event_msg", ["type": "item_completed", "turn_id": turnID,
+        "item": ["type": "UserMessage", "content": content]], after: after)
+}
+func responseUserItem(_ role: String, text: String, after: TimeInterval = 1) throws -> Data {
+    try line("response_item", ["type": "message", "role": role,
+        "content": [["type": "input_text", "text": text],
+                    ["type": "input_text", "text": "injected context"]]], after: after)
+}
+func append(_ data: Data, to file: URL) throws {
+    let handle = try FileHandle(forWritingTo: file)
+    defer { try? handle.close() }
+    try handle.seekToEnd()
+    try handle.write(contentsOf: data)
+}
+func fixture(_ name: String, contents: Data? = nil) throws -> (URL, CodexSessionObserver) {
+    let file = sessions.appendingPathComponent(name + ".jsonl")
+    try (contents ?? meta()).write(to: file)
+    return (file, CodexSessionObserver(binding: CodexSessionBinding(nonce: "fresh", sessionID: sid,
+        transcriptPath: file.path, model: "requested"), launchedAt: start))
+}
+
+var (file, observer) = try fixture("root")
+observer.poll(home: home.path)
+check("metadata alone does not invent idle", observer.state == .unknown)
+try append(event("task_started"), to: file)
+observer.poll(home: home.path)
+check("root task started proves working", observer.state == .working)
+try append(line("turn_context", ["model": "observed-model"]), to: file)
+observer.poll(home: home.path)
+check("native turn model overrides requested model", observer.model == "observed-model")
+check("turn context without effort stays unknown", observer.hasTurnContext && observer.effort == nil)
+try append(line("turn_context", ["model": "gpt-6-astra", "effort": "high",
+    "collaboration_mode": ["settings": ["reasoning_effort": "medium"]]]), to: file)
+observer.poll(home: home.path)
+check("native effort comes from the turn rather than collaboration settings", observer.effort == "high")
+
+let contextDir = root.appendingPathComponent("context-state")
+var contextWriter = CodexSessionContextWriter()
+var contextNotices = 0
+func publishContext(_ observed: CodexSessionObserver?, after: TimeInterval = 0) {
+    contextWriter.sync(accountID: "codex:fixture", launchModel: "requested", launchEffort: "low",
+        observer: observed, pid: "123", dir: contextDir, now: start.addingTimeInterval(after),
+        notify: { _ in contextNotices += 1 })
+}
+func readContext() throws -> [String: Any] {
+    try JSONSerialization.jsonObject(with: Data(contentsOf: contextDir.appendingPathComponent("123.session")))
+        as! [String: Any]
+}
+publishContext(nil)
+var context = try readContext()
+check("launch effort is available before native hooks bind", context["runningEffort"] as? String == "low")
+check("identity sidecar does not fabricate a context reading or a session pin",
+      context["contextTokens"] == nil && context["sessionEffort"] == nil)
+publishContext(observer, after: 1)
+context = try readContext()
+check("observed model and effort reach the card's sidecar fields",
+      context["runningModel"] as? String == "gpt-6-astra" && context["runningEffort"] as? String == "high")
+publishContext(observer, after: 2)
+let unchangedContext = try readContext()
+check("unchanged model and effort do not rewrite or notify", contextNotices == 2
+      && unchangedContext["updatedAt"] as? String == context["updatedAt"] as? String)
+try append(line("turn_context", ["model": "gpt-6-astra", "effort": "medium"]), to: file)
+observer.poll(home: home.path)
+publishContext(observer, after: 3)
+check("effort-only change republishes and wakes the board",
+      (try readContext())["runningEffort"] as? String == "medium" && contextNotices == 3)
+try append(line("turn_context", ["model": "another-model"]), to: file)
+observer.poll(home: home.path)
+publishContext(observer, after: 4)
+context = try readContext()
+check("a new model without effort inherits neither the prior turn nor launch effort",
+      observer.effort == nil && context["runningEffort"] == nil
+      && context["runningModel"] as? String == "another-model")
+try append(line("turn_context", ["model": "another-model", "effort": ""]), to: file)
+observer.poll(home: home.path)
+check("empty effort remains unknown", observer.effort == nil)
+
+var retryWriter = CodexSessionContextWriter()
+let obstructed = root.appendingPathComponent("obstructed-context")
+try Data("file".utf8).write(to: obstructed)
+var retryNotices = 0
+retryWriter.sync(accountID: "codex:fixture", launchModel: nil, launchEffort: "high",
+    observer: nil, pid: "456", dir: obstructed, notify: { _ in retryNotices += 1 })
+check("failed sidecar write does not claim a successful publication", retryNotices == 0)
+try FileManager.default.removeItem(at: obstructed)
+retryWriter.sync(accountID: "codex:fixture", launchModel: nil, launchEffort: "high",
+    observer: nil, pid: "456", dir: obstructed, notify: { _ in retryNotices += 1 })
+check("failed sidecar write is retried without a model or effort change", retryNotices == 1
+      && FileManager.default.fileExists(atPath: obstructed.appendingPathComponent("456.session").path))
+try append(line("event_msg", ["type": "agent_message", "message": "Stop hook continued"]), to: file)
+observer.poll(home: home.path)
+check("assistant message alone does not imply idle", observer.state == .working)
+try append(event("task_complete"), to: file)
+observer.poll(home: home.path)
+
+var (paginatedFile, paginated) = try fixture("paginated-receipts", contents: meta() + event("task_complete"))
+try append(completedUserItem("prelaunch", after: -1), to: paginatedFile)
+try append(responseUserItem("user", text: "target prompt", after: 2), to: paginatedFile)
+try append(responseUserItem("developer", text: "target prompt", after: 3), to: paginatedFile)
+paginated.poll(home: home.path)
+check("response-item context and prelaunch user records never advertise an input receipt",
+      !paginated.inputReceiptsAvailable && !paginated.receivedInput("target prompt", after: start))
+try append(completedUserItem("target prompt", after: 4,
+    extraContent: [["type": "image", "image_url": "fixture"]]), to: paginatedFile)
+paginated.poll(home: home.path)
+check("attached paginated user content fails closed as a direct-input receipt",
+      !paginated.inputReceiptsAvailable && !paginated.receivedInput("target prompt", after: start))
+try append(completedUserItem("target ", after: 5,
+    extraContent: [["type": "text", "text": "prompt", "text_elements": []]]), to: paginatedFile)
+paginated.poll(home: home.path)
+check("multi-part paginated user content cannot guess a joined direct-input receipt",
+      !paginated.inputReceiptsAvailable && !paginated.receivedInput("target prompt", after: start))
+let partialReceipt = try completedUserItem("target prompt", after: 6)
+try append(partialReceipt.dropLast(), to: paginatedFile)
+paginated.poll(home: home.path)
+check("incomplete paginated receipt cannot enable input", !paginated.inputReceiptsAvailable)
+try append(Data([10]), to: paginatedFile)
+paginated.poll(home: home.path)
+check("completed paginated UserMessage is an exact native input receipt",
+      paginated.inputReceiptsAvailable && paginated.receivedInput(" target prompt\n", after: start)
+      && !paginated.receivedInput("another prompt", after: start))
+check("paginated user receipt updates the human-turn guard", paginated.lastUserTurnAt == start.addingTimeInterval(6))
+check("only a native user receipt records the startup draft release boundary",
+      paginated.lastInputReceiptAt == start.addingTimeInterval(6))
+try append(event("task_started", turnID: UUID().uuidString, after: 7), to: paginatedFile)
+paginated.poll(home: home.path)
+check("a later task-start event cannot advance the native input receipt boundary",
+      paginated.lastInputReceiptAt == start.addingTimeInterval(6))
+var (oversizedFile, oversizedReceipt) = try fixture("oversized-paginated-receipt", contents: meta())
+try append(completedUserItem(String(repeating: "x", count: 201), after: 2), to: oversizedFile)
+oversizedReceipt.poll(home: home.path)
+check("oversized native receipt enables the compatible route without retaining prompt text",
+      oversizedReceipt.inputReceiptsAvailable && !oversizedReceipt.receivedInput(String(repeating: "x", count: 201), after: start))
+
+check("Codex absence of user message does not fabricate a receipt", !observer.receivedInput("fixture prompt", after: start))
+try append(line("event_msg", ["type": "user_message", "message": "fixture prompt"], after: 2), to: file)
+observer.poll(home: home.path)
+check("Codex native receipt must match the exact requested text", observer.receivedInput("fixture prompt", after: start)
+    && !observer.receivedInput("another prompt", after: start))
+check("Codex receipt follows native edge-whitespace trimming", observer.receivedInput("  fixture prompt\n", after: start))
+check("Codex old matching text cannot confirm a new request", !observer.receivedInput("fixture prompt", after: start.addingTimeInterval(3)))
+check("Codex completed turn permits input only after catching up", observer.canAcceptInput)
+check("Codex records the latest actual user turn boundary", observer.lastUserTurnAt != nil)
+var submittedObserver = observer
+submittedObserver.inputSubmitted()
+submittedObserver.poll(home: home.path)
+check("Codex submission cannot reuse the previous idle boundary", !submittedObserver.canAcceptInput)
+let partialStarted = try event("task_started", turnID: UUID().uuidString, after: 5)
+try append(partialStarted.dropLast(), to: file)
+observer.poll(home: home.path)
+check("Codex partial lifecycle record holds input even with previous idle state", !observer.canAcceptInput)
+try append(Data([10]), to: file)
+observer.poll(home: home.path)
+check("Codex newly completed task-start record holds input", !observer.canAcceptInput && observer.state == .working)
+try runCodexWaitPermissionChecks()
+try runCodexWaitQuestionChecks()
+runCodexUpdateChecks()
+try runCodexStartupChecks()
+try runCodexStartupChoiceChecks()
+runCodexUpdateCommandChecks()
+
+var (historyFile, historical) = try fixture("history", contents: meta() + event("task_complete", after: -1))
+historical.poll(home: home.path)
+check("resume history cannot publish historical idle", historical.state == .unknown)
+try append(line("turn_context", ["model": "old-model", "effort": "xhigh"], after: -1), to: historyFile)
+historical.poll(home: home.path)
+check("resume history cannot publish historical effort", !historical.hasTurnContext && historical.effort == nil)
+try append(event("task_started"), to: historyFile)
+try append(event("task_started", turnID: nextTurn), to: historyFile)
+try append(event("task_complete"), to: historyFile)
+historical.poll(home: home.path)
+check("completion of one turn cannot clear a second active turn", historical.state == .working)
+try append(event("turn_aborted", turnID: nextTurn), to: historyFile)
+historical.poll(home: home.path)
+check("both active turns have to settle", historical.state == .idle)
+
+var (partialFile, partial) = try fixture("partial")
+let full = try event("task_started")
+try append(full.prefix(full.count - 4), to: partialFile)
+partial.poll(home: home.path)
+check("partial JSON line cannot invent working", partial.state == .unknown)
+try append(full.suffix(4), to: partialFile)
+partial.poll(home: home.path)
+check("partial JSON line is completed on a later poll", partial.state == .working)
+try append(Data("{bad}\n".utf8), to: partialFile)
+partial.poll(home: home.path)
+check("malformed record invalidates a prior working reading", partial.state == .unknown)
+try append(event("task_complete"), to: partialFile)
+partial.poll(home: home.path)
+check("malformed stream does not regain unsupported confidence", partial.state == .unknown)
+
+// The native writer places its envelope tag before the opaque payload, with an optional ordinal.
+// Large response content must not hide the real lifecycle record that follows its newline.
+let largeOutput = String(repeating: "x", count: 2 * 1024 * 1024)
+let fakeTerminal = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"\(turn)\"}}"
+let largePayload = try JSONSerialization.data(withJSONObject: ["type": "function_call_output",
+                                                              "output": fakeTerminal + largeOutput])
+func largeResponse(ordinal: Bool) -> Data {
+    var data = Data(("{\"timestamp\":\"\(iso.string(from: start.addingTimeInterval(1)))\","
+                    + (ordinal ? "\"ordinal\":17," : "")
+                    + "\"type\":\"response_item\",\"payload\":").utf8)
+    data.append(largePayload)
+    data.append(Data(",\"metadata\":{\"fixture\":true}}\n".utf8))
+    return data
+}
+for ordinal in [false, true] {
+    let large = largeResponse(ordinal: ordinal)
+    var (largeFile, largeObserver) = try fixture("large-\(ordinal)", contents: meta() + event("task_started"))
+    try append(large.dropLast(32), to: largeFile)
+    for _ in 0..<3 { largeObserver.poll(home: home.path) }
+    check("incomplete large response with ordinal=\(ordinal) keeps the real turn working", largeObserver.state == .working)
+    try append(large.suffix(32), to: largeFile)
+    largeObserver.poll(home: home.path)
+    check("fake terminal text inside large response with ordinal=\(ordinal) cannot settle the turn", largeObserver.state == .working)
+    try append(event("task_complete"), to: largeFile)
+    largeObserver.poll(home: home.path)
+    check("terminal after large response with ordinal=\(ordinal) is still observed", largeObserver.state == .idle)
+}
+var (sameChunkFile, sameChunk) = try fixture("large-same-chunk", contents: meta() + event("task_started"))
+try append(largeResponse(ordinal: true) + event("task_complete"), to: sameChunkFile)
+sameChunk.poll(home: home.path)
+sameChunk.poll(home: home.path)
+sameChunk.poll(home: home.path)
+check("large response tail and real terminal in the same read chunk are both consumed", sameChunk.state == .idle)
+
+var (largeCriticalFile, largeCritical) = try fixture("large-critical", contents: meta() + event("task_started"))
+try append(line("event_msg", ["type": "response_item", "output": largeOutput]) + event("task_complete"), to: largeCriticalFile)
+for _ in 0..<4 { largeCritical.poll(home: home.path) }
+check("payload response_item tag cannot make a required event opaque", largeCritical.state == .unknown)
+let payloadFirst = Data("{\"payload\":".utf8) + largePayload
+    + Data(",\"timestamp\":\"\(iso.string(from: start))\",\"type\":\"response_item\"}\n".utf8)
+var (payloadFirstFile, payloadFirstObserver) = try fixture("payload-first", contents: meta() + event("task_started"))
+try append(payloadFirst + event("task_complete"), to: payloadFirstFile)
+for _ in 0..<4 { payloadFirstObserver.poll(home: home.path) }
+check("oversized payload-first envelope remains unsupported rather than guessing its tag", payloadFirstObserver.state == .unknown)
+
+// Production historical rollouts contain multi-megabyte compaction snapshots. Their nested
+// replacement history is opaque context, never a current lifecycle or input receipt.
+func largeCompaction(after: TimeInterval = -1) throws -> Data {
+    let payload = try JSONSerialization.data(withJSONObject: [
+        "message": largeOutput,
+        "replacement_history": [["type": "event_msg", "payload": [
+            "type": "task_complete", "turn_id": turn]],
+            ["type": "event_msg", "payload": ["type": "user_message", "message": "nested receipt"]]]
+    ])
+    return Data(("{\"timestamp\":\"\(iso.string(from: start.addingTimeInterval(after)))\","
+        + "\"ordinal\":832,\"type\":\"compacted\",\"payload\":").utf8) + payload + Data("}\n".utf8)
+}
+let initializer = "\(BrandPaths.envPrefix)SESSION_READY initialization fixture"
+var (_, compactedResume) = try fixture("compacted-resume", contents: meta()
+    + largeCompaction() + event("task_started") + completedUserItem(initializer)
+    + event("task_complete"))
+let resumeActivity = CodexSessionActivity(nonce: "fresh", sessionID: sid, turnID: turn,
+    event: "UserPromptSubmit", at: start.addingTimeInterval(1))
+for _ in 0..<4 { compactedResume.poll(home: home.path, activity: resumeActivity) }
+check("historical compaction cannot hide the current initialization lifecycle",
+      !compactedResume.invalidated && compactedResume.canAcceptInput)
+check("historical compaction preserves the current native initialization receipt",
+      compactedResume.inputReceiptsAvailable && compactedResume.receivedInput(initializer, after: start))
+
+var (compactionFile, compactionObserver) = try fixture("partial-compaction",
+    contents: meta() + event("task_started"))
+let compaction = try largeCompaction(after: 1)
+try append(compaction.dropLast(), to: compactionFile)
+for _ in 0..<4 { compactionObserver.poll(home: home.path) }
+check("partial compaction cannot advertise caught-up input or consume nested receipts",
+      !compactionObserver.invalidated && !compactionObserver.inputCaughtUp
+      && compactionObserver.state == .working && !compactionObserver.inputReceiptsAvailable)
+try append(Data("\n".utf8), to: compactionFile)
+compactionObserver.poll(home: home.path)
+check("complete compaction cannot settle a real turn or manufacture a receipt",
+      compactionObserver.inputCaughtUp && compactionObserver.state == .working
+      && !compactionObserver.inputReceiptsAvailable)
+try append(completedUserItem(initializer) + event("task_complete"), to: compactionFile)
+compactionObserver.poll(home: home.path)
+check("only fresh native events after compaction establish direct-input readiness",
+      compactionObserver.canAcceptInput && compactionObserver.inputReceiptsAvailable)
+
+var (replaceFile, replaced) = try fixture("replace", contents: meta() + event("task_started"))
+replaced.poll(home: home.path)
+try (meta() + event("task_complete")).write(to: replaceFile, options: .atomic)
+replaced.poll(home: home.path)
+check("replacement inode invalidates the binding", replaced.state == .unknown)
+var (truncateFile, truncated) = try fixture("truncate", contents: meta() + event("task_started"))
+truncated.poll(home: home.path)
+let truncateHandle = try FileHandle(forWritingTo: truncateFile)
+try truncateHandle.truncate(atOffset: 0)
+try truncateHandle.close()
+truncated.poll(home: home.path)
+check("truncation invalidates the binding", truncated.state == .unknown)
+
+for (name, contents) in [("wrong-id", try meta(id: UUID().uuidString)),
+                          ("exec-source", try meta(source: "exec")),
+                          ("child", try meta(parent: UUID().uuidString))] {
+    var (_, candidate) = try fixture(name, contents: contents + event("task_started"))
+    candidate.poll(home: home.path)
+    check("root binding rejects \(name)", candidate.state == .unknown)
+}
+let otherHome = root.appendingPathComponent("other-home")
+try FileManager.default.createDirectory(at: otherHome, withIntermediateDirectories: true)
+check("same session name outside selected home is rejected", codexTranscriptURL(path: file.path, home: otherHome.path) == nil)
+try FileManager.default.createSymbolicLink(at: otherHome.appendingPathComponent("sessions"), withDestinationURL: sessions)
+check("shared canonical sessions symlink is accepted", codexTranscriptURL(path: file.path, home: otherHome.path) != nil)
+var (_, stale) = try fixture("stale")
+stale.poll(home: home.path, activity: CodexSessionActivity(nonce: "old", sessionID: sid,
+    turnID: turn, event: "UserPromptSubmit", at: start.addingTimeInterval(10)))
+check("old launch nonce cannot start this session", stale.state == .unknown)
+stale.poll(home: home.path, activity: CodexSessionActivity(nonce: "fresh", sessionID: UUID().uuidString,
+    turnID: turn, event: "UserPromptSubmit", at: start.addingTimeInterval(11)))
+check("another root session cannot start this session", stale.state == .unknown)
+
+let stateDir = root.appendingPathComponent("state")
+let currentPID = String(getpid())
+var identity = SessionMonitoring(provider: "codex", supervisorPID: getpid(),
+    supervisorStart: SessionMonitoring.generation(getpid())!, nonce: "identity", home: home.path)
+try identity.write(dir: stateDir)
+try (SessionMonitoring.presencePrefix + String(identity.supervisorStart)).write(
+    to: stateDir.appendingPathComponent(currentPID), atomically: true, encoding: .utf8)
+check("live monitoring generation is enumerated", liveSupervisorPids(dir: stateDir) == [getpid()])
+check("monitoring resident refuses mutations", sessionControlRefusal(pid: currentPID, dir: stateDir) != nil)
+identity.supervisorStart -= 1
+try identity.write(dir: stateDir)
+check("mismatched metadata generation is absent from roster", liveSupervisorPids(dir: stateDir).isEmpty)
+check("damaged metadata cannot revoke a live presence generation", !SessionMonitoring.staleGeneration(pid: currentPID, dir: stateDir))
+check("stale generation still cannot fall back to Claude control", sessionControlRefusal(pid: currentPID, dir: stateDir) != nil)
+try Data("broken".utf8).write(to: stateDir.appendingPathComponent(currentPID + SessionMonitoring.suffix))
+check("malformed monitoring metadata is absent from roster", liveSupervisorPids(dir: stateDir).isEmpty)
+try FileManager.default.removeItem(at: stateDir.appendingPathComponent(currentPID + SessionMonitoring.suffix))
+check("presence marker preserves refusal when metadata is missing", sessionControlRefusal(pid: currentPID, dir: stateDir) != nil)
+check("missing metadata never publishes a monitored ghost", liveSupervisorPids(dir: stateDir).isEmpty)
+
+let installRoot = root.appendingPathComponent("install-state")
+let hooksURL = home.appendingPathComponent("hooks.json")
+let user: [String: Any] = ["matcher": "*", "hooks": [["type": "command", "command": "echo user"]]]
+let original: [String: Any] = ["extra": ["keep": true], "hooks": ["SessionStart": [user], "Stop": [user]]]
+try JSONSerialization.data(withJSONObject: original).write(to: hooksURL)
+let installCommand = "/fixture/\(BrandPaths.cliName) codex-session-hook"
+try CodexSessionHooks.install(homes: [home.path], root: installRoot, command: installCommand)
+check("explicit installer registers three events", try CodexSessionHooks.installed(homes: [home.path], root: installRoot))
+check("selected installed home permits resume initialization", CodexSessionHooks.installed(home: home.path, root: installRoot))
+check("uninstalled home does not permit initialization", !CodexSessionHooks.installed(home: otherHome.path, root: installRoot))
+var multipleReceipt = try CodexSessionHooks.receipt(root: installRoot)!
+multipleReceipt.paths.append(otherHome.appendingPathComponent("hooks.json").path)
+try JSONEncoder().encode(multipleReceipt).write(to: CodexSessionHooks.receiptURL(root: installRoot))
+check("selected home remains installed when the receipt lists multiple account paths", CodexSessionHooks.installed(home: home.path, root: installRoot))
+multipleReceipt.paths.removeLast()
+try JSONEncoder().encode(multipleReceipt).write(to: CodexSessionHooks.receiptURL(root: installRoot))
+var installed = try CodexSessionHooks.document(path: hooksURL.path)
+var hooks = installed["hooks"] as! [String: Any]
+check("install preserves existing SessionStart registration", (hooks["SessionStart"] as! [[String: Any]]).contains { CodexSessionHooks.same($0, user) })
+check("install leaves unrelated events unchanged", (hooks["Stop"] as! [[String: Any]]).count == 1)
+check("install leaves top-level configuration unchanged", (installed["extra"] as? [String: Bool])?["keep"] == true)
+try CodexSessionHooks.install(homes: [home.path], root: installRoot, command: installCommand)
+check("repeated install is idempotent", (try CodexSessionHooks.receipt(root: installRoot))?.paths.count == 1)
+var editedOwned = CodexSessionHooks.group(command: installCommand)
+editedOwned["matcher"] = "user-edited"
+var promptHooks = hooks["UserPromptSubmit"] as! [[String: Any]]
+promptHooks.append(editedOwned)
+hooks["UserPromptSubmit"] = promptHooks
+installed["hooks"] = hooks
+try JSONSerialization.data(withJSONObject: installed).write(to: hooksURL)
+try CodexSessionHooks.remove(root: installRoot)
+let after = try CodexSessionHooks.document(path: hooksURL.path)
+let afterHooks = after["hooks"] as! [String: Any]
+check("remove preserves original SessionStart", (afterHooks["SessionStart"] as! [[String: Any]]).count == 1)
+check("remove preserves a user-edited lookalike", (afterHooks["UserPromptSubmit"] as! [[String: Any]]).count == 1)
+check("remove clears only owned PermissionRequest registration", afterHooks["PermissionRequest"] == nil)
+check("remove clears ownership receipt", try CodexSessionHooks.receipt(root: installRoot) == nil)
+check("removed hooks cannot initialize resumed sessions", !CodexSessionHooks.installed(home: home.path, root: installRoot))
+try FileManager.default.createSymbolicLink(at: otherHome.appendingPathComponent("hooks.json"), withDestinationURL: hooksURL)
+check("shared hooks symlink is deduplicated", CodexSessionHooks.paths(homes: [home.path, otherHome.path]).count == 1)
+try Data("broken".utf8).write(to: hooksURL)
+do {
+    try CodexSessionHooks.install(homes: [home.path], root: installRoot, command: installCommand)
+    check("malformed user hooks are refused", false)
+} catch { check("malformed user hooks are refused", true) }
+check("malformed user hooks remain untouched", try Data(contentsOf: hooksURL) == Data("broken".utf8))
+
+try runHandoffChecks()
+try runWallChecks()
+
+print("Codex supervisor checks: \(failures) failures")
+exit(failures == 0 ? 0 : 1)

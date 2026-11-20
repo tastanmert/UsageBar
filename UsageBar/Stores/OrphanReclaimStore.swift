@@ -1,0 +1,501 @@
+import Darwin
+import Foundation
+import Observation
+
+/// THE ROUND: everything the reclaim does between two moments, with the rules it does it by next
+/// door (`OrphanReclaim`, `OrphanVerdict.swift`, `OrphanKill`, `OrphanNotice`).
+///
+/// THE SEAM IS THE SAME ONE THE REST OF THIS PAGE USES (`ProjectLoadAccounting`): what is pure is
+/// pure and asserted with no processes around it, and what touches the machine is one struct of
+/// closures the harness can hand over (`Machine`). The difference is what the seam is worth here -
+/// everywhere else on this board an injected reader buys an assertion about arithmetic, and here it
+/// buys assertions about a code path whose failure mode is ending somebody's work. Nothing in this
+/// file signals a real process during a test run, and nothing in it can, because the signalling is
+/// a parameter.
+///
+/// A ROUND IS NOT A TICK. The sampler runs every two seconds; a reclaim ROUND is taken at most every
+/// five minutes (`OrphanReclaim.roundInterval`), because the evidence it needs is a pair of readings
+/// far enough apart to mean something. Every tick expires successful records and advances the
+/// sweep, also checked every fifth of a second while it waits (`OrphanKill.pollInterval`).
+/// The sweep itself is next door in OrphanReclaimStoreSweep.swift, which is where this file was cut
+/// when it passed the repo's 500-line cap.
+@MainActor
+@Observable
+final class OrphanReclaimStore {
+    static let shared = OrphanReclaimStore()
+
+    /// What the page shows: what this app has done, newest first.
+    private(set) var records: [Record] = []
+
+    /// And what it is currently watching but has not acted on - the trees that would qualify if
+    /// they read the same way again. Drawn so that the first a reader hears of a reclaim is not the
+    /// reclaim itself.
+    private(set) var watching: [Watch] = []
+
+    /// How many records are kept. A menu bar panel is not a log; what a reader wants is "did
+    /// something happen recently", and the inbox messages are the durable record.
+    static let keptRecords = 12
+    /// Successful results leave the panel after ten minutes. Reports and failures do not expire by age.
+    static let successfulRecordLifetime: TimeInterval = 10 * 60
+
+    /// EVERYTHING THIS STORE ASKS OF THE MACHINE.
+    struct Machine: Sendable {
+        var program: @Sendable (pid_t) -> String?
+        var directory: @Sendable (pid_t) -> String?
+        var connections: @Sendable (Set<pid_t>) -> OrphanReclaim.Sockets
+        var sample: @Sendable (Set<pid_t>, Date) -> ProcessResourceSample
+        var hasTerminal: @Sendable (pid_t) -> Bool
+        var leases: @Sendable () -> [OrphanLease]
+        var clearLease: @Sendable (OrphanLease) -> Void
+        var signals: OrphanKill.Signals
+        /// What a path really is, symlinks and all. The one reading here that exists to make two
+        /// spellings of one checkout compare equal (`round`).
+        var resolve: @Sendable (String) -> String
+        var gitEntry: @Sendable (String) -> OrphanNotice.GitEntry?
+        /// Hands a message over and returns at once: the real one runs the harness's delivery port
+        /// on a background queue, so its result is not available here.
+        var deliver: @Sendable (OrphanNotice.Letter, URL, String) -> Void
+        var home: URL
+        /// The supervisor pid a process's inherited `USAGEBAR_SUPERVISOR_PID` names; nil when unset or
+        /// unreadable. The default answers nothing, so a harness never reads a real environment.
+        var marker: @Sendable (pid_t) -> pid_t? = { _ in nil }
+        /// UsageBar's gate (BrimFeatures.orphanReclaim): whether this machine may signal, clear a
+        /// lease or deliver a notice. The rounds and the panel run either way. A field so the
+        /// checks' stand-in machine can open it.
+        var mayReclaim: Bool = BrimFeatures.orphanReclaim
+        /// The real machine reads the gate at each use: live mode starts and ends while the app runs.
+        var followsLiveMode = false
+        var reclaimAllowed: Bool { followsLiveMode ? BrimFeatures.orphanReclaim : mayReclaim }
+
+        static let real = Machine(
+            program: { ProcessTree.executablePath(of: $0) },
+            directory: { MachineLoadRollup.workingDirectory(of: $0) },
+            connections: { ProcessTree.connections(of: $0) },
+            sample: { ProcessTree.resourceSample(of: $0, at: $1) },
+            hasTerminal: { ProcessTree.hasTerminal(of: $0) },
+            leases: { OrphanLeases.all() },
+            clearLease: { OrphanLeases.clear($0) },
+            signals: .real,
+            resolve: { MachineLoadRollup.resolvedPath($0) },
+            gitEntry: { OrphanNotice.gitEntry($0) },
+            deliver: { letter, inbox, name in
+                let home = FileManager.default.homeDirectoryForCurrentUser
+                DispatchQueue.global(qos: .utility).async {
+                    OrphanNotice.send(letter, to: inbox, named: name, home: home)
+                }
+            },
+            home: FileManager.default.homeDirectoryForCurrentUser,
+            marker: { processEnvironmentValue(ofProcess: Int($0), key: hostHealthSupervisorEnvKey).flatMap { Int32($0) } },
+            followsLiveMode: true)
+    }
+
+    // THE FOUR BELOW ARE NOT `private` BECAUSE THE KILL IS NEXT DOOR. When this file passed the
+    // repo's 500-line cap the sweep went into OrphanReclaimStoreSweep.swift, along the seam the
+    // class already had: a ROUND stayed here, and ending something went there. Swift's `private` is
+    // file-scoped, so the machine, the sightings a report is drawn from and the sweeps themselves
+    // are module-visible - the same trade `UsageStore` and `ProcessFootprintStore` made for the
+    // same reason.
+    let machine: Machine
+    /// What each tree read last round, keyed by its root pid. The identity test is inside the value
+    /// (`Sighting.rootStartedAt`), so a recycled number cannot inherit the previous holder's case.
+    var sightings: [pid_t: OrphanReclaim.Sighting] = [:]
+    /// And what its counters were then, which is the other half of a rate.
+    private var counters: [pid_t: ProcessResourceSample] = [:]
+    /// When each fingerprint was last reported, so the same leftover is not announced hourly.
+    private var said: [String: Date] = [:]
+    /// And what was last said about each TREE, which is the half `said` cannot hold: a situation
+    /// whose ports move under it is a new fingerprint every round (`OrphanReclaim.Told`).
+    private var told: [pid_t: OrphanReclaim.Told] = [:]
+    /// When the last round was taken, which is what makes a round a round.
+    private var lastRound: Date?
+    /// Kills in flight.
+    var sweeps: [Sweep] = []
+    /// The live session each tree was attributed to, by root pid (`attribute`).
+    var owners: [pid_t: pid_t] = [:]
+    /// The timer that watches them, which exists only while they do (`watch`).
+    @ObservationIgnored var sweep: Timer?
+
+    init(machine: Machine = .real) {
+        self.machine = machine
+    }
+
+    /// ONE TICK'S WORTH OF ATTENTION: expire successful history, advance whatever is being killed,
+    /// and take a round if one is due.
+    ///
+    /// - Parameters:
+    ///   - strays: what no session accounts for, by project (`MachineLoadRollup.leftovers`).
+    ///   - processes: the whole table, out of the walk the tick already made.
+    ///   - sessions: the directories the LIVE sessions are working in, AND whether the board could
+    ///     place every one of them (`OrphanReclaim.Sessions`). A tree in one of these checkouts is
+    ///     never ended on inference alone (`OrphanReclaim.Veto.sessionPresent`), and a board that
+    ///     could not place a row leaves the whole round in doubt (`Veto.sessionUnknown`).
+    ///   - leases: the leases, when the caller already read them off the main thread for this round
+    ///     (`leaseReaderIfDue`); nil reads them here.
+    ///   - supervisors: the supervisor pids of the sessions on the board, which a leftover is
+    ///     attributed to when its inherited marker names one of them.
+    ///   - reads: the round's machine readings, when the caller already took them off the main
+    ///     thread (`roundReaderIfDue`, a field report); a tree they do not cover is read here.
+    func observe(strays: [pid_t: String], processes: [ProcessIdentity],
+                 sessions: OrphanReclaim.Sessions, at now: Date,
+                 leases prefetched: [OrphanLease]? = nil, supervisors: Set<pid_t> = [],
+                 reads: OrphanRoundReads? = nil) {
+        expireSuccessfulRecords(at: now)
+        advance(at: now)
+        // A CAPTURE MUST NEVER REACH THIS. The demo flag fabricates the board's readings
+        // (`DemoUsage`), and a screenshot run that ended a real process because a fixture said it
+        // was busy would be the worst possible version of this feature.
+        guard roundDue(at: now) else { return }
+        lastRound = now
+        // The table by pid, built once and handed down: every step below asks it something, and
+        // three copies of one index is three chances for two of them to disagree.
+        let table = Dictionary(processes.map { ($0.pid, $0) }) { first, _ in first }
+        let parents = table.mapValues(\.parent)
+        let fromLeases = leases(among: processes, table: table, parents: parents, at: now,
+                                prefetched: prefetched, supervisors: supervisors)
+        var acted = fromLeases.claimed
+        acted.formUnion(sweeps.flatMap(\.targets))
+        round(strays: strays.filter { !acted.contains($0.key) }, processes: processes,
+              table: table, parents: parents, sessions: sessions, leased: fromLeases.tended,
+              supervisors: supervisors, reads: reads, at: now)
+    }
+
+    /// Whether `observe` at this instant takes a round. A CAPTURE NEVER DOES (`DemoUsage`).
+    func roundDue(at now: Date) -> Bool {
+        !DemoUsage.isActive
+            && (lastRound.map { now.timeIntervalSince($0) >= OrphanReclaim.roundInterval } ?? true)
+    }
+
+    /// The lease reader, when a round is due: what the footprint pass calls off the main thread so
+    /// the round finds its leases already read (a field report, 2026-09-26). Nil when no round is due.
+    func leaseReaderIfDue(at now: Date) -> (@Sendable () -> [OrphanLease])? {
+        roundDue(at: now) ? machine.leases : nil
+    }
+
+    /// TIER A: the leases whose writer has gone (`OrphanLease` carries the whole contract).
+    ///
+    /// TAKEN BEFORE THE STRAYS AND ITS PIDS TAKEN OUT OF THEM, so one tree cannot be judged twice
+    /// in one round - once on the lease and once on two rounds of evidence - and end up signalled
+    /// from two places.
+    ///
+    /// AND THE SAME FILES READ FOR THE OPPOSITE ANSWER, which is the other thing this pass is the
+    /// only one able to say. A lease whose supervisor is running names a tree the harness itself is
+    /// answering for; before this it simply fell out of tier A and into the evidence tiers, which
+    /// know nothing about leases and judged the supervisor on what it looks like - a `bash` holding
+    /// two gigabytes, reported as a leftover three times in thirty minutes while `/dev-watch` was
+    /// doing exactly its job (2026-09-02). Gathered here rather than re-read below because the
+    /// verdict about a lease is this function's, and two readings of one file are two chances to
+    /// disagree.
+    ///
+    /// - Returns: every pid this tier claimed, whether or not the kill has finished, and the pids
+    ///   a live lease still speaks for (`OrphanReclaim.Veto.leased`).
+    private func leases(among processes: [ProcessIdentity], table: [pid_t: ProcessIdentity],
+                        parents: [pid_t: pid_t], at now: Date, prefetched: [OrphanLease]?,
+                        supervisors: Set<pid_t>) -> (claimed: Set<pid_t>, tended: Set<pid_t>) {
+        var claimed: Set<pid_t> = []
+        var tended: Set<pid_t> = []
+        for lease in prefetched ?? machine.leases() {
+            // WHERE THE TABLE IS SILENT ABOUT THE SUPERVISOR, THE KERNEL IS ASKED ABOUT IT
+            // DIRECTLY, and only a definite "no such process" gets past here (`OrphanReclaim.state`
+            // carries the incident). `unsure` claims nothing, so the tree is left in the strays and
+            // reaches tier B, which cannot end anything without two rounds and a clean sweep.
+            let state = OrphanReclaim.state(
+                of: lease, supervisorStartedAt: table[lease.supervisor]?.startedAt,
+                presence: { machine.signals.presence(lease.supervisor) },
+                childStartedAt: lease.child.flatMap { table[$0]?.startedAt })
+            guard case .abandoned(let root) = state else {
+                // ONLY `tended`, AND THE OTHER TWO DELIBERATELY NOT. `spent` has no tree left to
+                // speak for; `unsure` is the state where neither the table nor the kernel would
+                // answer, and turning "cannot tell" into a veto would put the one shape this
+                // feature exists for permanently out of reach on a machine whose probe is flaky.
+                // It already goes to tier B, which cannot end anything without two rounds and a
+                // clean sweep.
+                if state == .tended {
+                    tended.insert(lease.supervisor)
+                    // 🔴 AND THE CHILD ONLY WHERE IT IS STILL THE ONE THE FILE NAMED (codex review
+                    // of 80faa73). `state(of:)` answers `tended` off the SUPERVISOR alone and never
+                    // reaches its own child check on that path, so this had a bare integer out of a
+                    // file that is rewritten only on the next spawn: a live supervisor whose server
+                    // tree has died leaves that number standing, the kernel hands it to something
+                    // in an unrelated leftover, and any tree holding it took a HARD veto - never
+                    // reported, never reclaimed, silently, for as long as the stale file stood. The
+                    // same generation test the kill path already makes (`OrphanReclaim.holder`),
+                    // which can only ever remove protection from a number that is not the child.
+                    if let child = lease.child, let born = lease.childBornAt,
+                       OrphanReclaim.holder(table[child]?.startedAt, of: born) == true {
+                        tended.insert(child)
+                    }
+                }
+                continue
+            }
+            let members = ProcessTree.members(root: root, processes: processes)
+            guard !members.isEmpty else { continue }
+            claimed.formUnion(members)
+            let tree = OrphanReclaim.Tree(root: root, rootStartedAt: table[root]?.startedAt ?? 0,
+                                          members: members,
+                                          project: machine.directory(root) ?? "")
+            // Named before the kill starts, as tier B does: the record `announce` writes when the
+            // kill finishes reads `owners`, and a lease reclaimed on first sight was never watched.
+            _ = attribute(root, parents: parents, supervisors: supervisors)
+            begin(kill: tree, table: table, reason: .leaseOwnerGone, lease: lease,
+                  ports: ports(of: members), at: now)
+        }
+        return (claimed, tended)
+    }
+
+    /// TIER B AND C: everything else that is running in one of these checkouts.
+    ///
+    /// TIER A IS DELIBERATELY NOT SUBJECT TO THE SESSION VETO. A lease is a statement rather than
+    /// an inference - the harness's own supervisor named that tree and is no longer running - and
+    /// a session in the checkout says nothing about a server whose owner is provably gone. It is
+    /// only the evidence-based tier that has to defer to somebody being here.
+    private func round(strays: [pid_t: String], processes: [ProcessIdentity],
+                       table: [pid_t: ProcessIdentity], parents: [pid_t: pid_t],
+                       sessions: OrphanReclaim.Sessions,
+                       leased: Set<pid_t>, supervisors: Set<pid_t>, reads: OrphanRoundReads?, at now: Date) {
+        // THE CHECKOUTS SOMEBODY IS WORKING IN, folded to their repositories once for the round
+        // rather than once per tree: the fold is a walk of the filesystem, and the answer is the
+        // same for every tree on the round (`OrphanReclaim.checkout`).
+        //
+        // AND BOTH SIDES OF THE COMPARISON THROUGH ONE CALL (`checkout(of:)`), which is where the
+        // resolving lives and why it is a method rather than two expressions.
+        //
+        // THE SECOND FIELD IS CARRIED RATHER THAN DROPPED HERE, and it is the whole of the round's
+        // fail-closed arm: a board that would not place one of its own rows cannot be folded into a
+        // set of occupied checkouts at all, only into a set that is missing one
+        // (`OrphanReclaim.Sessions`).
+        let occupied = OrphanReclaim.Sessions(
+            checkouts: reads?.occupied ?? Set(sessions.checkouts.map(checkout(of:))),
+            unreadable: sessions.unreadable)
+        var seen: Set<pid_t> = []
+        var watches: [Watch] = []
+        for tree in OrphanReclaim.trees(of: strays, among: processes) {
+            let reading = read(tree, identities: table, parents: parents, occupied: occupied,
+                               leased: leased, prefetched: reads?.trees[tree.root], at: now)
+            seen.insert(tree.root)
+            let session = attribute(tree.root, parents: parents, supervisors: supervisors)
+            let decided = OrphanReclaim.verdict(for: reading, previous: sightings[tree.root])
+            sightings[tree.root] = decided.keep
+            switch decided.verdict {
+            case .reclaim:
+                begin(kill: tree, table: table, reason: .sustained, lease: nil,
+                      ports: reading.listeningPorts, at: now)
+            case .notify:
+                watches.append(watch(reading, session: session))
+                report(reading, at: now)
+            case .wait:
+                // Worth showing only once it is a candidate rather than merely old: a first
+                // sighting of something heavy is exactly what a reader wants warning of.
+                if reading.age >= OrphanReclaim.minimumAge, OrphanReclaim.heavy(reading) {
+                    watches.append(watch(reading, session: session))
+                }
+            case .leave:
+                break
+            }
+        }
+        // A tree that has gone takes its memory with it, so a number handed out again starts from
+        // nothing rather than from the previous holder's case (the identity test inside the
+        // sighting already refuses it; this keeps the dictionaries from growing all day).
+        sightings = sightings.filter { seen.contains($0.key) }
+        counters = counters.filter { seen.contains($0.key) }
+        pruneOwners(seen: seen)
+        // 🔴 AND `told` IS SWEPT BY IDENTITY RATHER THAN BY MEMBERSHIP OF THIS ROUND'S STRAYS
+        // (codex review of 80faa73). `seen` holds the roots of the trees built from the strays, and
+        // the strays are what no card is counting - a set a LIVE tree leaves and rejoins on its
+        // own: a session adopts it into the group ledger, or a card that was counting it is dropped
+        // for one pass (`ProcessFootprintStore` documents that flap). Swept on that, a leftover
+        // lost its memory the moment it briefly belonged to somebody, and the round after that said
+        // the whole thing again - the exact repeat this pair of memories was written to stop. What
+        // makes a memory stale is the tree being GONE, and the tree is the pid and the instant it
+        // began. The two above are conservative in the other direction (dropping them delays a
+        // verdict, never a message), so only this one is swept this way.
+        told = told.filter { table[$0.key]?.startedAt == $0.value.rootStartedAt }
+        if watching != watches { watching = watches }
+    }
+
+    /// EVERYTHING KNOWN ABOUT ONE TREE THIS ROUND, out of the readings the machine will state.
+    ///
+    /// The root's own start time comes off the TREE rather than off the table again: the two are
+    /// the same reading (`OrphanReclaim.trees` took it from this very walk), and asking twice is
+    /// how two spellings of one fact come to disagree.
+    private func read(_ tree: OrphanReclaim.Tree, identities: [pid_t: ProcessIdentity],
+                      parents: [pid_t: pid_t], occupied: OrphanReclaim.Sessions,
+                      leased: Set<pid_t>, prefetched: OrphanTreeRead?, at now: Date) -> OrphanReclaim.Reading {
+        // THE READINGS COME FROM OFF THE MAIN THREAD WHEN THEY WERE TAKEN FOR THESE VERY MEMBERS.
+        // `observe` drops what a sweep or a lease has claimed after they were taken, and a reading
+        // of a tree that still held a pid being ended would count it in the memory and the rate.
+        let read = prefetched.flatMap { $0.members == tree.members ? $0 : nil }
+            ?? Self.gather(tree, parents: parents, machine: machine, at: now)
+        let members = tree.members.compactMap { pid -> OrphanReclaim.Member? in
+            guard let identity = identities[pid] else { return nil }
+            return OrphanReclaim.Member(identity: identity, program: read.each[pid]?.program,
+                                        directory: read.each[pid]?.directory)
+        }
+        var reading = read.sample
+        // WHOSE LIFE EACH COUNTER IS, out of the table walk this tick already made.
+        // `proc_pid_rusage` carries no birth time, so a rate compared by pid alone would credit a
+        // recycled number's work to the process that used to hold it - the one arithmetic error
+        // here that ends in a signal (`OrphanReclaim.rate` refuses an unstamped pair outright, so
+        // forgetting this line reads as "nothing is ever busy" rather than as a wrong number).
+        for pid in reading.times.keys where reading.startedAt[pid] == nil {
+            reading.startedAt[pid] = identities[pid]?.startedAt
+        }
+        let percent = OrphanReclaim.rate(from: counters[tree.root], to: reading)
+        counters[tree.root] = reading
+        // Read once and used twice: what the tree is waiting on, and who is talking to it. A
+        // descriptor table the machine would not read comes back NAMED rather than empty, and the
+        // rule turns that into a doubt about the whole tree (`OrphanReclaim.Sockets`).
+        let sockets = read.sockets
+        var vetoes = OrphanReclaim.vetoes(of: tree, members: members, sockets: sockets,
+                                          ancestors: read.ancestorNames)
+        if read.terminalAbove { vetoes.insert(.terminal) }
+        // AND WHETHER ANYBODY IS WORKING IN THE CHECKOUT THIS TREE IS IN, which is the one reading
+        // here that comes off the BOARD rather than off the process table - and the one the
+        // 2026-09-02 incident was decided without. Two servers were ended in checkouts whose
+        // sessions were sitting right there, under a message that said no session was.
+        if occupied.checkouts.contains(read.checkout) {
+            vetoes.insert(.sessionPresent)
+        }
+        // AND A BOARD THAT WOULD NOT PLACE ONE OF ITS OWN ROWS LEAVES THE QUESTION ABOVE
+        // UNANSWERED, for this tree and for every other one on the round: the answer "not in the
+        // set" is worth nothing when the set is known to be short (`OrphanReclaim.Sessions`).
+        if occupied.unreadable { vetoes.insert(.sessionUnknown) }
+        // AND WHETHER A LEASE IS STILL ANSWERING FOR IT, which comes off the same files tier A
+        // reads and is that tier's mirror: it acts on a lease whose writer is gone, and this is the
+        // ordinary case it used to drop on the floor (`OrphanReclaim.Veto.leased`).
+        if !tree.members.isDisjoint(with: leased) { vetoes.insert(.leased) }
+        let began = Date(timeIntervalSince1970: Double(tree.rootStartedAt) / 1_000_000)
+        return OrphanReclaim.Reading(
+            tree: tree, takenAt: now, age: now.timeIntervalSince(began), cpuPercent: percent,
+            memoryBytes: reading.memoryBytes,
+            listeningPorts: OrphanReclaim.listening(sockets.connections),
+            name: members.first { $0.identity.pid == tree.root }.flatMap(OrphanReclaim.name)
+                ?? members.compactMap(OrphanReclaim.name).first,
+            vetoes: vetoes)
+    }
+
+    /// WHICH CHECKOUT A DIRECTORY IS IN, as the session veto compares them: the repository above it
+    /// (`OrphanReclaim.checkout`), resolved.
+    ///
+    /// A METHOD BECAUSE BOTH SIDES HAVE TO GO THROUGH IT. They arrive spelled differently - a
+    /// session's root has been through `realpath` before it ever reaches this store
+    /// (`ProjectLoadAccounting.roots`), and a worktree's repository is the text of a `.git` file,
+    /// which nothing resolves - so where the workspace sits behind a symlink they are one checkout
+    /// under two names, compare unequal, and the veto is missed in the one direction that ends a
+    /// process (codex review, 2026-09-02). Written twice, one of them could go on being the
+    /// resolved one alone; written once, that cannot happen.
+    private func checkout(of directory: String) -> String {
+        Self.checkout(of: directory, machine: machine)
+    }
+
+    private func watch(_ reading: OrphanReclaim.Reading, session: pid_t?) -> Watch {
+        Watch(project: reading.tree.project, program: reading.name ?? "?", pid: reading.tree.root,
+              cpuPercent: reading.cpuPercent, memoryBytes: reading.memoryBytes,
+              doubts: reading.vetoes.sorted(), session: session)
+    }
+
+    /// The ports a set of processes is waiting on, ascending. A table that would not be read is not
+    /// a doubt HERE, only a shorter list: the one caller is tier A, which acts on the lease rather
+    /// than on the vetoes, and what these ports are for is the report and the release check
+    /// (`OrphanKill.released`) - both of which say less rather than something wrong.
+    private func ports(of members: Set<pid_t>) -> [UInt16] {
+        OrphanReclaim.listening(machine.connections(members).connections)
+    }
+
+    // MARK: saying so
+
+    /// Say something about a tree that was NOT ended, subject to not having said it lately.
+    private func report(_ reading: OrphanReclaim.Reading, at now: Date) {
+        // TWO GATES, AND THEY CATCH DIFFERENT REPEATS. The tree's own memory refuses a second
+        // message about one unchanged tree however much moves around it (`OrphanReclaim.Told`); the
+        // fingerprint refuses a second message about one SITUATION however many pids pass through
+        // it (`OrphanReclaim.fingerprint`). Neither covers the other's case, and the machine has
+        // now produced both.
+        let doubts = reading.vetoes.sorted()
+        // WHAT OTHER PROCESSES, AND EARLIER LAUNCHES OF THIS ONE, HAVE ALREADY SAID, read at the
+        // moment it matters rather than at launch: another build may have written since
+        // (`OrphanReclaim.NoticeMemory`). What this process remembers itself is kept where both know.
+        // The file wins for this tree: it holds the last thing any process said about it, and this
+        // process's own entry may predate another's newer message.
+        var disk = OrphanReclaim.NoticeMemory.load(home: machine.home)
+        let key = String(reading.tree.root)
+        said.merge(disk.said, uniquingKeysWith: max)
+        if let shared = disk.told[key] { told[reading.tree.root] = shared }
+        guard OrphanReclaim.worthSaying(told[reading.tree.root],
+                                        rootStartedAt: reading.tree.rootStartedAt,
+                                        doubts: doubts) else { return }
+        let fingerprint = OrphanReclaim.fingerprint(reading)
+        guard !OrphanReclaim.silenced(fingerprint, said: said, at: now) else { return }
+        // 🔴 BOTH MEMORIES ARE WRITTEN WHERE THE MESSAGE IS, and not one line earlier (codex review
+        // of 80faa73). `told` used to be written above the fingerprint gate, so a tree the
+        // SITUATION key silenced was recorded as having been told about - and that key deliberately
+        // has no pid in it, so a different tree in the same project on the same port collides with
+        // it by design. The next round's answer about that second tree was then refused by its own
+        // memory, and it was never announced at all: a tree this app had plenty to say about, held
+        // quiet by a message that was about something else.
+        let record = OrphanReclaim.Told(rootStartedAt: reading.tree.rootStartedAt, doubts: doubts)
+        told[reading.tree.root] = record
+        said[fingerprint] = now
+        // ponytail: `told` on disk is keyed by pid and only replaced, never pruned, so it is bounded
+        // by the pids that ever held a reported tree; prune against the table if it ever grows.
+        disk.said = said.filter { now.timeIntervalSince($0.value) < OrphanReclaim.noticeInterval }
+        disk.told[key] = record
+        disk.save(home: machine.home)
+        announce(OrphanNotice.Report(
+            project: reading.tree.project, program: reading.name ?? "?", pid: reading.tree.root,
+            processes: reading.tree.members.count, cpuPercent: reading.cpuPercent,
+            memoryBytes: reading.memoryBytes, listeningPorts: reading.listeningPorts,
+            ageSeconds: reading.age, outcome: .reported(doubts: doubts)), at: now)
+    }
+
+    /// PUT IT ON THE PANEL AND IN THE PROJECT'S INBOX. Both, always: the panel is what somebody
+    /// sees when they happen to look, and the inbox is what the project's next session reads
+    /// whether or not anybody looked.
+    ///
+    /// Not `private` because a sweep ends here too (OrphanReclaimStoreSweep.swift): what this app
+    /// did is written down in one place whether the tree was ended or only mentioned.
+    func announce(_ report: OrphanNotice.Report, at now: Date) {
+        expireSuccessfulRecords(at: now)
+        records.insert(Record(at: now, project: report.project, program: report.program,
+                              pid: report.pid, processes: report.processes,
+                              outcome: report.outcome, session: owners[report.pid]), at: 0)
+        if records.count > Self.keptRecords { records.removeLast(records.count - Self.keptRecords) }
+        deliver(report, at: now)
+    }
+
+    /// A capture's panel, set once and never by a round (`demoEntries`).
+    func showDemo(_ entries: ([Watch], [Record])) {
+        if watching.isEmpty && records.isEmpty { (watching, records) = entries }
+    }
+
+    /// Only panel history expires here; reclaim evidence and inbox delivery keep their own state.
+    func expireSuccessfulRecords(at now: Date) {
+        guard now.timeIntervalSinceReferenceDate.isFinite else { return }
+        records.removeAll { record in
+            switch record.outcome {
+            case .reclaimedByLease, .reclaimedBySustained:
+                let age = now.timeIntervalSince(record.at)
+                return age.isFinite && age >= Self.successfulRecordLifetime
+            case .reported, .failed:
+                return false
+            }
+        }
+    }
+
+    /// Send the message to the owning repository's inbox.
+    private func deliver(_ report: OrphanNotice.Report, at now: Date) {
+        // BRIM-GATE: read-only process panel does not deliver reclaim notices.
+        guard machine.reclaimAllowed else { return }
+        guard !report.project.isEmpty,
+              let repository = OrphanNotice.repository(of: report.project, entry: machine.gitEntry)
+        else { return }
+        let workspace = machine.home.appendingPathComponent("workspace").path
+        let key = OrphanNotice.key(for: repository.root, workspace: workspace)
+        var letter = OrphanNotice.letter(report, to: key, worktree: repository.worktree, at: now)
+        letter.recipient = OrphanNotice.recipient(for: repository.root, workspace: workspace)
+        machine.deliver(letter,
+                        OrphanNotice.inbox(key, home: machine.home),
+                        OrphanNotice.filename(at: now, pid: getpid(),
+                                              random: UInt32.random(in: 0 ..< 100_000)))
+    }
+
+}

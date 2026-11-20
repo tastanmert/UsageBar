@@ -1,0 +1,259 @@
+import Foundation
+
+// HOW QUIET A CONVERSATION IS, which is the one question every gate in the poll loop asks before it
+// acts on a session: a relaunch, a self-update, a handoff that can wait, and the line
+// `usagebar session send` is holding.
+//
+// Split out of TranscriptWatcher.swift, which keeps the tailing itself (binding a file, following a
+// fork, reading the events). The seam is the one the readers already drew: nothing here reads an
+// event, and everything here is about mtimes and the walk beside them. It moved because the file it
+// came from is far over the size a file in this repo may be, and because the answer grew a third
+// value that has a reader of its own (below).
+
+/// How long a subagent must be silent before its session counts as idle. Deliberately NOT the
+/// caller's bar: a healthy subagent writes nothing for the whole of any single long tool call, so
+/// the caller's window measures the wrong thing entirely. Measured here 2026-07-25 across three
+/// healthy packages: 61s, 52s and 109s of silence, each inside an xcodebuild or a run of the eleven
+/// suites. 109s against the 120s follow bar leaves 11 seconds of margin, so a slightly slower build
+/// crosses it and the child is relaunched mid-package.
+///
+/// 600s because that sample of three cannot be the ceiling (a package running two xcodebuilds plus
+/// the eleven suites goes past it), because the owner's stop hook already uses 600s for this exact
+/// question ("has this subagent stopped writing"), so the product and the harness agree, and
+/// because there is no process to fall back on: subagents run inside the claude process rather than
+/// as separate PIDs, leaving file mtime as the only signal. The window therefore has to absorb the
+/// longest tool call, not the typical one.
+///
+/// The cost, accepted knowingly: for up to 600s after a subagent genuinely finishes, its session
+/// still reads busy, so a reload or self-update waiting on that session is delayed by that much.
+/// Every relaunch behind this bar is non-urgent by definition (a cap handoff never waits for
+/// quiet), and a late restart costs the user a wait while an early one destroys a work package.
+let subagentIdleSeconds: TimeInterval = 600
+
+/// What a session's silence is made of, in the three shapes that are worth telling apart.
+///
+/// THE READERS ARE NOT ALIKE, which is the whole reason this is not a Bool. Every gate that
+/// RESTARTS a child (a reload, a self-update, a pin follow, a rebalance) treats all three the same
+/// way and asks `isQuiet`: a restart kills whatever is running, so a work package writing in the
+/// background is exactly as fatal to it as a turn mid-stream. The gate that TYPES a line
+/// (`usagebar session send`, and the quota knock beside it) kills nothing of its own, and for it the
+/// difference is the feature: a head that has finished its answer and left agents running is a head
+/// whose context may be cleared, and holding its `/clear` until every subagent stops is what made a
+/// routine hand-over hang for minutes at a time (Albert, 2026-08-17, after four refusals the day
+/// before).
+///
+/// SO DISPATCHED WORK NEVER HOLDS A LINE, in any shape (Albert, 2026-08-18, closing the half of
+/// that rule the wording above left open). `quiet` and `subagentsWriting` are ONE answer to the
+/// typing gate (type it) and TWO to the restart gates (restart, do not restart), and that split is
+/// the whole of what this type exists for. So what the typing gate still waits for is the head's
+/// OWN turn - its transcript moving, or a tool call of its own inside the relaunch ceiling - and
+/// `busy` is exactly that. A `/clear` typed while agents are running does end them, and it says so
+/// rather than being refused (`landSessionInput`).
+enum SessionQuiet: Equatable {
+    /// Nothing outstanding at all: the file silent for the bar asked, no tool call open, no
+    /// unresolved fork, and no subagent that has written inside `subagentIdleSeconds`.
+    case quiet
+    /// The conversation's OWN context is as quiet as that, and the only thing still writing is work
+    /// it dispatched (`<session>/subagents/`). The bound file is silent for the bar asked and no
+    /// open tool call is still being honoured; whether an over-age one is lying there makes no
+    /// difference, exactly as it makes none to the row above (`boundFileQuietness` argues why).
+    case subagentsWriting
+    /// The conversation itself is moving: its transcript is being appended to, a tool call it opened
+    /// has not come back, or a fork it may have moved into cannot be told apart yet.
+    case busy
+}
+
+extension TranscriptWatcher {
+    /// True when the transcript has been silent for `seconds` - the between-turns proxy. An
+    /// active turn appends events (tool calls, messages) every few seconds, so a quiet file
+    /// means no response is being cut mid-stream. Non-urgent handoffs (pin follow, degradation
+    /// rescue, fallback profile) wait for this; a cap hit does not (that turn is already dead).
+    ///
+    /// The session file alone is not enough, in TWO ways, and silence looks identical in both.
+    ///
+    /// A turn blocked on a subagent appends NOTHING while it waits, so the stat below reads a live
+    /// work package as idle. Measured in this repo 2026-07-25: packages run 5 to 15 minutes against
+    /// the 120s follow bar, so the child was relaunched mid-package and the subagent died with it,
+    /// its work gone with no error anywhere.
+    ///
+    /// A turn inside a long TOOL CALL is the same trap one level in, and the subagent window cannot
+    /// see it: an 8-minute xcodebuild runs in the MAIN context with no subagent directory involved,
+    /// writing nothing between its `tool_use` and its `tool_result` (measured 2026-07-26: 153.7s of
+    /// silence inside one live turn, past the 120s bar). OpenTurn.swift reads that pair directly.
+    ///
+    /// Quiet therefore means all three: the file silent for `seconds`, no tool call still waiting,
+    /// and the newest subagent silent for `subagentIdleSeconds`.
+    ///
+    /// A fourth condition comes from the other direction and is not about the bound file at all:
+    /// while a NEWER transcript in this directory cannot yet be told apart from the file the
+    /// conversation just moved to (a `/clear` that has not been typed into), the bound file's
+    /// silence proves nothing, because it may be silent for having been abandoned. The answer is no
+    /// until that resolves - see the hold note in TranscriptFork.swift.
+    ///
+    /// `moving` IS FOR THE ONE GATE THAT IS SERVING A TYPED INSTRUCTION to change accounts, and all
+    /// it changes is how an open tool call is judged: by which child opened it rather than by the
+    /// 600s ceiling (`openTurnHoldsMovingSession` argues both halves). Every other gate here -
+    /// reload, self-update, follow, the preventive movers - keeps the ceiling exactly as it was,
+    /// because none of them is answering an instruction somebody typed.
+    mutating func isQuiet(_ seconds: TimeInterval = 5, moving: Bool = false) -> Bool {
+        quietness(seconds, moving: moving) == .quiet
+    }
+
+    /// The same reading with its three answers kept apart (`SessionQuiet` states who asks for
+    /// which). Everything `isQuiet` promises is promised here; that one is this one flattened.
+    mutating func quietness(_ seconds: TimeInterval = 5, moving: Bool = false) -> SessionQuiet {
+        locateFile()
+        if hasUnresolvedFork { return .busy }
+        return boundFileQuietness(seconds, moving: moving)
+    }
+
+    /// The quiet test itself, over the file already bound, with no fork discovery in front of it.
+    ///
+    /// Split out for a caller that has ALREADY enumerated the transcripts it means to judge (the
+    /// teardown gate, which asks about every session in a worktree at once). Going through
+    /// `isQuiet` there made each file re-scan its directory for fork markers and read up to a
+    /// megabyte of every sibling, turning one directory's worth of work into one per file: a
+    /// project with a hundred large transcripts read gigabytes and looked like a hang. The
+    /// supervisor keeps calling `isQuiet`, which is unchanged: it tails ONE live conversation and
+    /// must follow that conversation when it moves.
+    mutating func isBoundFileQuiet(_ seconds: TimeInterval) -> Bool {
+        boundFileQuietness(seconds) == .quiet
+    }
+
+    /// And that one in its three-valued form, which is where the distinction is actually made.
+    ///
+    /// A MISSING FILE READS AS `quiet` rather than as anything else, unchanged from the Bool this
+    /// grew out of: a session on a path that no longer exists has nothing outstanding, and the
+    /// callers that care whether a transcript exists at all ask that separately
+    /// (`supervisedSessionState` takes `hasTranscript` for exactly this reason).
+    mutating func boundFileQuietness(_ seconds: TimeInterval, moving: Bool = false) -> SessionQuiet {
+        // Fresh URL on purpose: resourceValues are cached per URL instance, and a cached
+        // mtime would report an active turn as quiet forever.
+        guard let file,
+              let modified = (try? URL(fileURLWithPath: file.path)
+                  .resourceValues(forKeys: [.contentModificationDateKey]))?
+                  .contentModificationDate else { return .quiet }
+        guard Date().timeIntervalSince(modified) > seconds else { return .busy }
+        // Past the mtime bar is exactly where an idle session lives, so the tail read behind this
+        // is cached against the mtime already in hand (see `openScanCache`) rather than repeated
+        // on every poll. The verdict itself is still computed here, against the current clock.
+        let call = openTurn(of: file, modified: modified)
+        // `since` is when THIS child was launched, which is the whole of what the moving reading
+        // asks about (`openTurnHoldsMovingSession`); it is the same qualifier the subagent walk
+        // below applies to the same directory, for the same reason.
+        let held = moving
+            ? openTurnHoldsMovingSession(openedAt: call?.startedAt, childStartedAt: since)
+            : openTurnHoldsSession(openedAt: call?.startedAt)
+        if held { return .busy }
+        guard let subagent = newestSubagentWrite(),
+              Date().timeIntervalSince(subagent) <= subagentIdleSeconds else { return .quiet }
+        // AND DISPATCHED WORK IS DISPATCHED WORK WHATEVER IS LYING BESIDE IT. This row used to
+        // answer `busy` when an over-age unmatched `tool_use` was there too, on the reasoning that a
+        // killed child writes no subagent transcripts, so a call plus a live subagent is a
+        // conversation genuinely inside a long turn (`fa9533b`, a `Workflow` fan-out being the
+        // ordinary case). The reasoning was sound and the answer was still wrong, because of who
+        // reads it: `busy` and `subagentsWriting` are the SAME answer to every restart gate (both
+        // are "not quiet"), so the only reader that ever saw the difference was the gate that types
+        // - and Albert's rule for that gate is that dispatched work is never a reason to refuse a
+        // line (2026-08-17, restated 2026-08-18 when the softer version of it turned a refusal into
+        // a ten-minute delay). What the typing gate still waits for is the head's own turn, and the
+        // two rows above are exactly that: the file moving, or a call inside the relaunch ceiling.
+        // A `/clear` that lands on a live fan-out does end it, and says how many it ended
+        // (`landSessionInput`), which is the trade Albert asked for rather than one this reading
+        // gets to make quietly.
+        return .subagentsWriting
+    }
+
+    /// The newest write under this session's subagent transcripts THAT THIS CHILD COULD HAVE MADE,
+    /// nil when it dispatched none (`<projectDir>/<session>.jsonl` pairs with
+    /// `<projectDir>/<session>/subagents/`).
+    ///
+    /// ONLY WRITES AFTER `since`, WHICH IS WHEN THIS CHILD STARTED, and that qualifier is a fix
+    /// rather than a nicety. A relaunch resumes the SAME transcript, so the directory it inherits
+    /// still holds whatever the child before it dispatched, and those files were written seconds
+    /// before the kill: to a window measured against the wall clock they look exactly like a live
+    /// package, so a brand new and completely idle child read as having work in flight for up to
+    /// `subagentIdleSeconds` after the handoff. Seen live in the four cap handoffs of 2026-08-17
+    /// 16:33, where it cost those sessions their queued `/clear` outright.
+    ///
+    /// WHO IT COSTS NOW IS THE RESTART GATES, and that is the whole of what this filter is for since
+    /// 2026-08-18: dispatched work no longer holds a typed line at all (`boundFileQuietness`), so
+    /// the reading this corrects is the one a reload, a self-update or a pin follow waits on - a
+    /// fresh child would decline to be restarted for ten minutes over transcripts written by the
+    /// child before it.
+    ///
+    /// A subagent of THIS child cannot predate it, so the filter costs nothing real and cannot hide
+    /// live work. Callers that are not a supervised child pass `.distantPast` (the worktree teardown
+    /// gate, `worktreeActivity`), which asks about every transcript in a directory rather than about
+    /// one running process, and for them this is a no-op by construction.
+    ///
+    /// Derived from the watched file, so it follows a fork for free: the subagents of a moved
+    /// conversation are written under the id actually running (`341bd05d/subagents/` filled up
+    /// while the pinned `3ee0aca7` sat still, 2026-07-26), and reading the old session's directory
+    /// answered a question about a session that no longer existed.
+    ///
+    /// Rescanned per call rather than bound to one file: a session runs several subagents and which
+    /// one is newest changes, and the directory only appears once the first one is dispatched. Most
+    /// sessions dispatch none, so that case costs one stat instead of a walk - this runs on every
+    /// 2s supervisor poll.
+    ///
+    /// The walk is RECURSIVE because the dispatch paths land at different depths. Censused
+    /// 2026-08-02 over every transcript on this machine (3,245 agent transcripts - 1,589 from the
+    /// Agent tool, 1,656 under workflow directories - across 273 workflow runs): not one agent
+    /// transcript lives outside a `subagents/` directory, and none nests deeper than the second
+    /// shape below.
+    ///
+    ///   - `subagents/agent-a<hex>.jsonl` - the Agent tool, in all of its forms. A plain subagent,
+    ///     an agent team member (whose dispatch name lands in the FILENAME,
+    ///     `agent-a<name>-<hex>.jsonl`), and a subagent dispatched BY a subagent, which stays flat
+    ///     here rather than nesting: spawnDepth reaches 4 in the corpus, the path never does.
+    ///   - `subagents/workflows/wf_<id>/` - a Workflow fan-out, holding its `agent-*.jsonl`, their
+    ///     `.meta.json` sidecars and the run's `journal.jsonl`. Every one of the 273 runs that
+    ///     dispatched an agent has this directory; the one run without it crashed in 6ms having
+    ///     dispatched none. These are the longest packages of all.
+    ///
+    /// Both are written as the work happens rather than flushed at the end, which is what makes an
+    /// mtime mean anything here: one workflow aborted 38s in had already left 122 KB of agent
+    /// transcript behind it.
+    ///
+    /// The sibling `<session>/workflows/` is deliberately NOT walked, and that is a measurement
+    /// rather than an oversight. It holds the run's state json and generated script, and the json is
+    /// written exactly once, when the run ENDS (its mtime minus the run's end time is 0.0s across
+    /// all 273 runs), so it is a stale file for the whole of the run it describes. By the time it
+    /// does move, the `Workflow` tool call has returned and the session's own mtime has already
+    /// answered. Rooting the walk one level higher to reach it would cost a directory on every poll
+    /// and detect nothing - and would read a session whose packages all finished as busy forever.
+    ///
+    /// Cost, since this is a per-poll walk: the largest subagents tree on this machine is 973
+    /// entries and takes 3.8ms, against a 2s poll.
+    ///
+    /// No extension filter: the directory holds only per-agent transcripts, their metadata sidecars
+    /// and the workflow journal, and a write to any of them is this session waiting on a subagent.
+    func newestSubagentWrite() -> Date? {
+        guard let file else { return nil }
+        return subagentTreeNewestWrite(transcript: file, since: since)
+    }
+}
+
+/// The walk behind `newestSubagentWrite`, at file scope so a hook can ask it of the transcript
+/// path its payload names: the newest write under `<transcript stem>/subagents/` after `since`.
+func subagentTreeNewestWrite(transcript file: URL, since: Date) -> Date? {
+    let dir = file.deletingPathExtension().appendingPathComponent("subagents")
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDirectory),
+          isDirectory.boolValue else { return nil }
+    let keys: [URLResourceKey] = [.contentModificationDateKey]
+    // Safe against the cached-mtime trap above for the same reason: every poll walks the
+    // directory afresh, so these URLs (and their prefetched values) are built from scratch and
+    // never held across polls.
+    guard let walk = FileManager.default.enumerator(
+        at: dir, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])
+    else { return nil }
+    var newest: Date?
+    for case let entry as URL in walk {
+        guard let modified = (try? entry.resourceValues(forKeys: Set(keys)))?
+            .contentModificationDate, modified > since else { continue }
+        if modified > newest ?? .distantPast { newest = modified }
+    }
+    return newest
+}
