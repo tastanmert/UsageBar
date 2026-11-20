@@ -13,10 +13,10 @@ func source(_ path: String) -> String { (try? String(contentsOfFile: path, encod
 let runtime = BrimRuntime.shared
 
 let opensInLive = ["liveProbes", "providerHomeMutation", "orphanReclaim", "userNotifications",
-                   "panelResetUse", "cliWrites", "integrationInstall"]
+                   "panelResetUse", "cliWrites", "integrationInstall", "autoUpdate"]
 let closedAlways = ["backgroundHomeWrites", "integrationsSelfHeal",
                     "integrationsAutoFollow", "keychainPartitionRepair", "earlyStart", "typesIntoSessions",
-                    "autoUpdate", "chromeStep", "codexAutoRedeem",
+                    "chromeStep", "codexAutoRedeem",
                     "codexCLIAutoUpdate", "launchAtLoginDefault", "mcpGrantSeeding", "closesOlderDevInstances"]
 check("the gate table names every gate once", Set(BrimFeatures.table.keys) == Set(opensInLive + closedAlways)
       && BrimFeatures.table.count == opensInLive.count + closedAlways.count)

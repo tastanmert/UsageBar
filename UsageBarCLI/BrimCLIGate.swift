@@ -1,14 +1,14 @@
 import Foundation
 
-// BRIM-GATE: `usagebar` runs every verb except the four that repair the Keychain,
-// update a binary or run the Chrome step (`brimCLIClosed`). The integration verbs (`codex-session-status
+// BRIM-GATE: `usagebar` runs every verb except the three that repair the Keychain,
+// update the Codex binary or run the Chrome step (`brimCLIClosed`). The integration verbs (`codex-session-status
 // install`, `harness install`) and the hooks the integrations register (`hook-*`, `codex-session-hook`,
 // `mcp-serve`) run: the user installs them from Settings or the CLI (BrimFeatures.integrationInstall).
 
 /// Closed: the Keychain repair, binary updates and the Chrome step.
 func brimCLIClosed(_ arguments: [String]) -> Bool {
     switch arguments.first {
-    case "keychain-repair", "update", "codex-update", "chrome":
+    case "keychain-repair", "codex-update", "chrome":
         return true
     default:
         return false

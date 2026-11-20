@@ -43,7 +43,6 @@ final class UpdaterController: NSObject {
     private static let checksKey = "UsageBarChecksForUpdatesAutomatically"
 
     func start() {
-        // BRIM-GATE: Phase 1 keeps this external action disabled.
         guard BrimFeatures.autoUpdate else { return }
         let info = Bundle.main.infoDictionary
         guard let feed = info?["SUFeedURL"] as? String, !feed.isEmpty,

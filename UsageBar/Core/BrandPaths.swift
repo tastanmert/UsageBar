@@ -89,6 +89,9 @@ enum BrimFeatures {
     /// (IntegrationsBackup). Nothing here runs at launch or on a timer: the self-heal, the
     /// auto-follow and the launch-time upkeep stay behind the gates below.
     static let integrationInstall = true
+    /// Sparkle updates from the tastanmert/UsageBar releases feed (UpdaterController). Release builds
+    /// only: Debug carries no feed URL, so the updater stays dormant there either way.
+    static let autoUpdate = true
 
     // MARK: Closed
 
@@ -105,7 +108,6 @@ enum BrimFeatures {
     /// Typing into a session's composer for the user: the quota knock, automatic input, the
     /// clearance lines and Codex's automatic resume line. The handoff itself still happens.
     static let typesIntoSessions = false
-    static let autoUpdate = false
     static let chromeStep = false
     /// Spending a Codex reset on its own. The manual, confirmed path stays.
     static let codexAutoRedeem = false

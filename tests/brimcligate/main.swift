@@ -33,7 +33,7 @@ let writes: [[String]] = [
 ]
 
 let liveClosed: [[String]] = [
-    ["codex-update"], ["update"], ["keychain-repair"], ["chrome", "x"],
+    ["codex-update"], ["keychain-repair"], ["chrome", "x"],
 ]
 let liveOpen = (reads + writes).filter { !liveClosed.contains($0) }
 check("opened, every other verb runs",
