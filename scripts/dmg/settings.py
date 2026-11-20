@@ -12,7 +12,8 @@ format = "UDZO"
 filesystem = "HFS+"
 files = [(app, "UsageBar.app")]
 symlinks = {"Applications": "/Applications"}
-hide_extensions = ["UsageBar.app"]
+# No hide_extensions: it sets com.apple.FinderInfo on the bundle root, which breaks
+# `codesign --verify --strict` on the copy users drag out. Finder hides ".app" anyway.
 
 default_view = "icon-view"
 window_rect = ((400, 280), (660, 432))

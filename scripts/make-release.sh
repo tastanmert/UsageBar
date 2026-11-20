@@ -162,6 +162,15 @@ smoke() {
   "$APP/Contents/Helpers/usagebar" help > /dev/null || die "the embedded usagebar entry does not run"
 }
 
+dmg_check() {  # dmg_check <dmg>: the app users drag out of the DMG must still pass a strict verify
+  local mnt
+  mnt=$(mktemp -d)
+  hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mnt" "$1"
+  codesign --verify --strict --deep "$mnt/UsageBar.app" \
+    || { hdiutil detach -quiet "$mnt"; die "the app inside $1 fails codesign --verify --strict"; }
+  hdiutil detach -quiet "$mnt"
+}
+
 VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist")
 
 if [ "$MODE" = unsigned ]; then
@@ -171,6 +180,7 @@ if [ "$MODE" = unsigned ]; then
   DMG="$OUT/UsageBar-$VERSION-unsigned.dmg"
   step "dmg"
   scripts/dmg/make-dmg.sh "$APP" "$DMG"
+  dmg_check "$DMG"
   echo "==> done: $DMG (ad-hoc signed, not notarized: macOS will warn on first open)"
   exit 0
 fi
@@ -200,6 +210,7 @@ DMG="$OUT/UsageBar-$VERSION.dmg"
 step "dmg"
 scripts/dmg/make-dmg.sh "$APP" "$DMG"
 codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG"
+dmg_check "$DMG"
 
 if [ "$NOTARIZE" = 1 ]; then
   step "notarize the dmg"

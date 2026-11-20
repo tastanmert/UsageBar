@@ -20,8 +20,6 @@ ROOT=$(cd "$HERE/../.." && pwd)
 BG="${USAGEBAR_DMG_BACKGROUND:-$HERE/background.tiff}"
 case "$BG" in /*) ;; *) BG="$PWD/$BG" ;; esac
 [ -s "$BG" ] || die "missing $BG"
-# dmgbuild hides the .app extension with SetFile and ignores its exit status.
-xcrun --find SetFile > /dev/null 2>&1 || die "SetFile not found; install the Xcode command line tools"
 
 PIN="dmgbuild==1.6.7"
 VENV="${USAGEBAR_DMGBUILD_VENV:-$ROOT/build/dmgbuild-venv}"
