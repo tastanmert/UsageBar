@@ -15,6 +15,8 @@ struct BrimPanelActions {
     var useReset: (() -> Void)? = nil
     /// The view menu's choices, saved by the host.
     var setLayout: (BrimPanelLayout) -> Void = { _ in }
+    /// A card's "Sign in again" for an account whose login was refused. nil: no button.
+    var signIn: ((String) -> Void)? = nil
 }
 
 /// The UsageBar menu bar panel: a header (mark, name, update time, refresh, view menu, settings),
@@ -34,9 +36,19 @@ struct BrimPanelView: View {
     var showsLayoutMenu = false
     /// The open confirm card: which account, which kind.
     var prompt: (accountID: String, kind: BrimPanelModel.ResetKind)? = nil
+    /// A refresh round is running (`UsageStore.isRefreshing`): the refresh button spins.
+    var refreshing = false
 
     @Environment(\.colorScheme) private var scheme
     @State private var menuOpen = false
+    /// Clicked and the round has not started yet: the button answers at once, not when the
+    /// store's Task gets to run.
+    @State private var refreshRequested = false
+    /// The clicked round just ended: a check for a moment, so "it did refresh" is visible.
+    @State private var refreshDone = false
+    /// The store reported a round running since the click. State, not `refreshing`: a closure
+    /// would read the copy of `refreshing` taken at click time.
+    @State private var refreshSeenRunning = false
     @State private var listHeight: CGFloat = 0
     @State private var chromeTop: CGFloat = 0
     @State private var chromeBottom: CGFloat = 0
@@ -107,7 +119,7 @@ struct BrimPanelView: View {
                     .font(.system(size: 11)).foregroundStyle(theme.text2)
                     .lineLimit(1).fixedSize()
             }
-            iconButton("arrow.clockwise", label: L("Refresh now"), action: actions.refresh)
+            refreshButton
             iconButton("square.grid.2x2", label: L("View"), action: { menuOpen.toggle() })
                 .popover(isPresented: $menuOpen, arrowEdge: .bottom) {
                     BrimLayoutMenu(layout: layoutBinding)
@@ -117,6 +129,54 @@ struct BrimPanelView: View {
             iconButton("gearshape", label: L("Settings"), action: actions.openSettings)
         }
         .padding(EdgeInsets(top: 10, leading: 16, bottom: 8, trailing: 8))
+    }
+
+    /// Spins while a round runs (a click, or the timer's own) and shows a check for a moment after
+    /// a clicked round ends. A click during the timer's round still counts (the store queues a full
+    /// read behind it); a second click on the same request does nothing.
+    private var refreshButton: some View {
+        let busy = refreshing || refreshRequested
+        return Button {
+            guard !refreshRequested else { return }
+            refreshDone = false
+            refreshRequested = true
+            refreshSeenRunning = refreshing
+            actions.refresh()
+            // A round that never reports itself running (demo fixtures, a store that returned at
+            // once) must not leave the spinner up.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                if refreshRequested && !refreshSeenRunning { finishRefresh() }
+            }
+        } label: {
+            Group {
+                if busy {
+                    ProgressView().controlSize(.small).scaleEffect(0.75)
+                } else if refreshDone {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(theme.accent)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 13, weight: .regular))
+                        .foregroundStyle(theme.text2)
+                }
+            }
+            .frame(width: 26, height: 26)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(busy ? L("Refreshing…") : L("Refresh now"))
+        .accessibilityLabel(busy ? L("Refreshing…") : L("Refresh now"))
+        .onChange(of: refreshing) { was, now in
+            if now && refreshRequested { refreshSeenRunning = true }
+            if was && !now && refreshRequested { finishRefresh() }
+        }
+    }
+
+    private func finishRefresh() {
+        refreshRequested = false
+        refreshDone = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { refreshDone = false }
     }
 
     private func iconButton(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
@@ -219,7 +279,10 @@ struct BrimPanelView: View {
         }
     }
 
-    private func dimmed(_ row: BrimPanelModel.Row) -> Double { model.dimmed || row.heldOver ? 0.55 : 1 }
+    /// A card asking for a sign-in stays at full strength: its button is the thing to read.
+    private func dimmed(_ row: BrimPanelModel.Row) -> Double {
+        (model.dimmed || row.heldOver) && !row.needsSignIn ? 0.55 : 1
+    }
 
     /// The windows a card shows: 5 hours only when the account reports one (Codex does not), weekly
     /// always, the model window when there is one.
@@ -483,17 +546,43 @@ struct BrimPanelView: View {
     }
 
     @ViewBuilder private func refreshFailure(_ row: BrimPanelModel.Row) -> some View {
-        if row.refreshFailed {
+        if row.needsSignIn {
+            // The provider refused the login: the numbers cannot come back on their own, so the
+            // card says so and offers the same sign-in Settings does (RenewLoginStore).
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: "exclamationmark.circle").font(.system(size: 11)).foregroundStyle(theme.warn)
+                Text(L("Sign-in needed")).font(.system(size: 11)).foregroundStyle(theme.warn)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if let signIn = actions.signIn {
+                    Button(row.signingIn ? L("Signing in…") : L("Sign in again")) { signIn(row.id) }
+                        .controlSize(.small)
+                        .disabled(row.signingIn)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(row.refreshProblem?.isEmpty == false ? row.refreshProblem! : L("Sign-in needed"))
+        } else if row.refreshFailed {
             let base = row.refreshReading.map { String(format: L("Could not refresh · %@ data"), $0) } ?? L("Could not refresh")
             // A server-stated 429 hold: say when the next read happens, so a stale card is not
             // mistaken for a broken account and the refresh button is not pressed into the window.
             let retry = ProbeCadence.UsageReadHold.shared.firmUntil(row.id, now: Date()).map {
                 String(format: L("retrying at %@"), $0.formatted(date: .omitted, time: .shortened))
             }
-            Text([base, retry].compactMap { $0 }.joined(separator: " · "))
-                .font(.system(size: 11)).foregroundStyle(theme.text2)
-                .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
-                .help(row.refreshProblem?.isEmpty == false ? row.refreshProblem! : L("Could not refresh"))
+            // The reason's first paragraph is on the card: hidden in a tooltip, "Could not refresh"
+            // alone left the user guessing what to do. The full text stays in the tooltip.
+            let reason = row.refreshProblem?.components(separatedBy: "\n\n").first?.nilIfEmpty
+            VStack(alignment: .leading, spacing: 2) {
+                Text([base, retry].compactMap { $0 }.joined(separator: " · "))
+                    .font(.system(size: 11)).foregroundStyle(theme.text2)
+                    .lineLimit(1)
+                if let reason {
+                    Text(reason).font(.system(size: 11)).foregroundStyle(theme.text2)
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(row.refreshProblem?.isEmpty == false ? row.refreshProblem! : L("Could not refresh"))
         }
     }
 

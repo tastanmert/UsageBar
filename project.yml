@@ -318,8 +318,8 @@ targets:
         ENABLE_USER_SCRIPT_SANDBOXING: NO
         CODE_SIGN_ENTITLEMENTS: UsageBar/Resources/UsageBar.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: app.usagebar.UsageBar
-        MARKETING_VERSION: "0.86.3"
-        CURRENT_PROJECT_VERSION: "1674"
+        MARKETING_VERSION: "0.86.4"
+        CURRENT_PROJECT_VERSION: "1675"
         SWIFT_VERSION: "6.0"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         # UsageBar has no signing team yet: ad-hoc signing, so any machine can build it.

@@ -267,6 +267,11 @@ struct BrimPanelModel: Equatable {
         var refreshFailed = false
         var refreshReading: String? = nil
         var refreshProblem: String? = nil
+        /// The provider refused this account's login: the card offers a sign-in in place of the
+        /// failure line. Set by the host from `LoginStatusStore`, not from the snapshot.
+        var needsSignIn = false
+        /// A sign-in for this account is running or settling (`RenewLoginStore.isRenewing`).
+        var signingIn = false
         /// At least one reset line opens the confirm card (`ResetLine.action == .confirm`).
         var resetUsable: Bool = false
         /// A reset being spent or just spent here.

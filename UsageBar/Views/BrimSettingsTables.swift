@@ -110,7 +110,14 @@ struct BrimAccountsPane: View {
             Text(verbatim: row.folder).font(.system(size: 12, design: .monospaced)).foregroundStyle(theme.text2)
                 .lineLimit(1).truncationMode(.middle).frame(maxWidth: .infinity, alignment: .leading)
             VStack(alignment: .leading, spacing: 2) {
-                if let panelRow, panelRow.refreshFailed {
+                if let panelRow, panelRow.needsSignIn {
+                    // The verdict LoginStatusStore holds, not a guess from the error's wording
+                    // (which is translated, so the keyword match in `login(_:)` misses it).
+                    login(.needsSignIn)
+                    Button(panelRow.signingIn ? L("Signing in…") : L("Sign in again")) { actions.signIn?(row.id) }
+                        .controlSize(.mini)
+                        .disabled(actions.signIn == nil || panelRow.signingIn)
+                } else if let panelRow, panelRow.refreshFailed {
                     Text(L("Could not refresh")).font(.system(size: 11)).foregroundStyle(theme.text2)
                     if let reading = panelRow.refreshReading {
                         Text(reading).font(.system(size: 10)).foregroundStyle(theme.text2)

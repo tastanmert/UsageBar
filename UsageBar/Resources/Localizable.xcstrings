@@ -29755,6 +29755,28 @@
         }
       }
     },
+    "Refreshing…": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Yenileniyor…"
+          }
+        }
+      }
+    },
+    "Signing in…": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Giriş yapılıyor…"
+          }
+        }
+      }
+    },
     "Held over": {
       "extractionState": "manual",
       "localizations": {
