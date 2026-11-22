@@ -26,7 +26,11 @@ final class TokenStatsStore {
     /// found" from "not looked yet" for the empty state.
     private(set) var hasScanned = false
 
-    private var samples: [TokenSample] = []
+    private var samples: [TokenSample] = [] {
+        didSet { usageCells = Self.cells(samples) }
+    }
+    /// The Usage tab's input: every sample priced per day, project, provider and model.
+    private(set) var usageCells: [UsageBreakdown.Cell] = []
     /// When the last scan began, for the background cadence (`refreshIfStale`). Any visit's scan
     /// counts, so opening the tab pushes the next background one back.
     private var lastScanStart: Date?
@@ -78,6 +82,17 @@ final class TokenStatsStore {
     func dailyTotals(forProject key: String) -> [Int: Int64] {
         let totals = tokenDailyTotals(samples: samples.map(\.ffi), project: key)
         return Dictionary(uniqueKeysWithValues: totals.map { (Int($0.key), $0.value) })
+    }
+
+    func usage(group: UsageBreakdown.Group, range: TokenStatsRange) -> UsageBreakdown {
+        UsageBreakdown.make(cells: usageCells, group: group, dayCount: range.dayCount, today: LocalDayStamper.today())
+    }
+
+    private static func cells(_ samples: [TokenSample]) -> [UsageBreakdown.Cell] {
+        tokenStatsCostCells(samples: samples.map(\.ffi)).map {
+            UsageBreakdown.Cell(day: Int($0.day), project: $0.project, providerID: $0.providerId, model: $0.model,
+                                cost: $0.cost, tokens: TokenTotals($0.tokens).total, output: TokenTotals($0.tokens).output)
+        }
     }
 
     private func rebuild() {

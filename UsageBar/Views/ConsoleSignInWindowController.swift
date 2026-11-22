@@ -15,7 +15,37 @@ import WebKit
 /// one place that reads them.
 @MainActor
 final class ConsoleSignInWindowController: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
-    static let shared = ConsoleSignInWindowController()
+    static let shared = ConsoleSignInWindowController(target: .console)
+    /// The same window for claude.ai: the session that reads the plan's renewal date
+    /// (SubscriptionFetch). Its own per-account store, never the Console's.
+    static let claudeWeb = ConsoleSignInWindowController(target: .claudeWeb)
+
+    /// What one kind of sign-in opens, where its session lives, and how it knows it worked.
+    struct Target {
+        var title: String
+        var loginURL: URL
+        var host: String
+        var dataStore: @MainActor (String) -> WKWebsiteDataStore
+        var isSignedIn: @Sendable (String) async -> Bool
+        var defaultConnected: @MainActor (String) -> Void
+
+        static var console: Target {
+            Target(title: "Connect to Console", loginURL: ConsoleCreditsFetch.loginURL, host: ConsoleCreditsFetch.host,
+                   dataStore: { ConsoleCreditsFetch.dataStore(forAccount: $0) },
+                   isSignedIn: { await ConsoleCreditsFetch.isSignedIn(jar: ConsoleCreditsFetch.WebKitJar(account: $0)) },
+                   defaultConnected: { id in Task { await ConsoleCreditsStore.shared.didConnect(accountID: id) } })
+        }
+
+        static var claudeWeb: Target {
+            Target(title: "Connect to claude.ai", loginURL: SubscriptionFetch.claudeLoginURL, host: SubscriptionFetch.claudeHost,
+                   dataStore: { SubscriptionFetch.claudeDataStore(forAccount: $0) },
+                   isSignedIn: { await SubscriptionFetch.claudeOrganizations(store: SubscriptionFetch.claudeStoreID(for: $0)) != nil },
+                   defaultConnected: { _ in })
+        }
+    }
+
+    private let target: Target
+    private init(target: Target) { self.target = target }
 
     private static let log = Logger(subsystem: "app.usagebar", category: "ConsoleSignIn")
 
@@ -38,12 +68,11 @@ final class ConsoleSignInWindowController: NSObject, WKNavigationDelegate, WKUID
         }
         window?.close()
         self.accountID = accountID
-        self.onConnected = onConnected ?? {
-            Task { await ConsoleCreditsStore.shared.didConnect(accountID: accountID) }
-        }
+        let fallback = target.defaultConnected
+        self.onConnected = onConnected ?? { fallback(accountID) }
         finished = false
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = ConsoleCreditsFetch.dataStore(forAccount: accountID)
+        configuration.websiteDataStore = target.dataStore(accountID)
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 520, height: 720), configuration: configuration)
         prepare(webView)
@@ -53,13 +82,13 @@ final class ConsoleSignInWindowController: NSObject, WKNavigationDelegate, WKUID
         let window = NSWindow(contentRect: webView.frame,
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
-        window.title = L("Connect to Console")
+        window.title = L(target.title)
         window.contentView = webView
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.center()
         self.window = window
-        webView.load(URLRequest(url: ConsoleCreditsFetch.loginURL))
+        webView.load(URLRequest(url: target.loginURL))
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -85,7 +114,7 @@ final class ConsoleSignInWindowController: NSObject, WKNavigationDelegate, WKUID
     }
 
     private func probeIfOnConsole() {
-        guard !finished, !probing, let url = webView?.url, url.host == ConsoleCreditsFetch.host,
+        guard !finished, !probing, let url = webView?.url, url.host == target.host,
               !url.path.hasPrefix("/login"), !url.path.hasPrefix("/logout") else { return }
         probe()
     }
@@ -96,7 +125,7 @@ final class ConsoleSignInWindowController: NSObject, WKNavigationDelegate, WKUID
         probing = true
         Task { [weak self] in
             guard let self, let accountID = self.accountID else { return }
-            let signedIn = await ConsoleCreditsFetch.isSignedIn(jar: ConsoleCreditsFetch.WebKitJar(account: accountID))
+            let signedIn = await self.target.isSignedIn(accountID)
             self.probing = false
             guard signedIn, !self.finished else { return }
             self.finished = true
@@ -121,7 +150,7 @@ final class ConsoleSignInWindowController: NSObject, WKNavigationDelegate, WKUID
         popupWindow.contentView = popup
         popupWindow.isReleasedWhenClosed = false
         popupWindow.delegate = self
-        popupWindow.title = L("Connect to Console")
+        popupWindow.title = L(target.title)
         if let parent = window {
             popupWindow.setFrameOrigin(NSPoint(x: parent.frame.midX - popupWindow.frame.width / 2,
                                                y: parent.frame.midY - popupWindow.frame.height / 2))

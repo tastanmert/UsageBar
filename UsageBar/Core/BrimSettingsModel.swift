@@ -142,6 +142,8 @@ struct BrimAccountsTable: Equatable {
         /// Who the account is signed in as (LoginStatusStore's answer, filled in by the app, never
         /// from the snapshot, which carries no identity). Nil shows the folder alone.
         var email: String? = nil
+        /// The plan's renewal line (SubscriptionStore's answer, filled in by the app). Nil shows nothing.
+        var renewal: Renewal? = nil
         var login: Login
         /// Read and published (Settings > Accounts' Monitor switch, live mode).
         var monitored = true
@@ -161,6 +163,20 @@ struct BrimAccountsTable: Equatable {
     var count: Int { groups.reduce(0) { $0 + $1.rows.count } }
 
     /// Puts each account's address on its row; an empty answer leaves the row without one.
+    /// What the plan column says under the plan's name.
+    enum Renewal: Equatable {
+        case known(SubscriptionRenewal)
+        /// Claude: no claude.ai sign-in yet (or it expired), so the date is unknown.
+        case connect
+        /// Claude: the claude.ai login belongs to another account.
+        case differentAccount
+    }
+
+    mutating func fillRenewals(_ renewal: (String) -> Renewal?) {
+        for g in groups.indices { for r in groups[g].rows.indices {
+            groups[g].rows[r].renewal = renewal(groups[g].rows[r].id) } }
+    }
+
     mutating func fillEmails(_ email: (String) -> String?) {
         for g in groups.indices {
             for r in groups[g].rows.indices {
@@ -387,6 +403,8 @@ struct BrimMenuSelection: Equatable {
     enum Window: String, CaseIterable { case fiveHour, weekly, fable }
     var windows: [String: [String]] = [:]
     var showLabels = false
+    /// The 5H / W / F name before each figure.
+    var showWindowTags = true
 
     func contains(_ id: String, _ window: Window) -> Bool {
         windows[id]?.contains(window.rawValue) == true
@@ -417,6 +435,31 @@ struct BrimMenuSelection: Equatable {
         var provider: String
         var label: String?
         var text: String
+        /// Each shown window with its figure, in order, so the menu bar can tag it (5H, W, F).
+        var parts: [Part] = []
+        /// The reading is an old one kept on screen (the last refresh failed): drawn without colour.
+        var stale = false
+
+    }
+
+    struct Part: Equatable {
+        var window: Window
+        var value: String
+        /// How much is left, for the figure's colour (always judged on what remains).
+        var level: BrimPanelModel.Level? = nil
+        /// Percent left, 0...100, whichever way the figure is shown.
+        var remaining: Double? = nil
+
+        /// The menu bar's three colours, fuel-gauge style: half or more left is fine, under half
+        /// is worth a glance, under a fifth needs attention. Wider than the panel's 30/10 on
+        /// purpose: in a glanceable strip, 43% left should not look like 98% left.
+        enum Tone: Equatable { case fine, watch, low }
+        var tone: Tone? {
+            guard let remaining else { return nil }
+            if remaining >= 50 { return .fine }
+            if remaining >= 20 { return .watch }
+            return .low
+        }
     }
 
     func tightestRemaining(rows: [BrimPanelModel.Row]) -> Double? {
@@ -436,14 +479,16 @@ struct BrimMenuSelection: Equatable {
             let cells: [(Window, BrimPanelModel.Cell?)] = [
                 (.fiveHour, row.fiveHour), (.weekly, row.weekly), (.fable, row.model?.cell)
             ]
-            let values = cells.filter { selection.contains(row.id, $0.0) }.compactMap { _, cell -> String? in
+            let parts = cells.filter { selection.contains(row.id, $0.0) }.compactMap { window, cell -> Part? in
                 guard let cell, cell.remaining != nil else { return nil }
-                return cell.displayed(used: used, format: format).percentText
+                return Part(window: window, value: cell.displayed(used: used, format: format).percentText,
+                            level: cell.level, remaining: cell.remaining)
             }
-            guard !values.isEmpty else { return nil }
+            guard !parts.isEmpty else { return nil }
             return Segment(id: row.id, provider: row.provider,
                            label: showLabels ? String(row.label.prefix(8)) : nil,
-                           text: values.joined(separator: " · "))
+                           text: parts.map(\.value).joined(separator: " · "), parts: parts,
+                           stale: row.heldOver)
         }
     }
 }

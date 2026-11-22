@@ -38,6 +38,13 @@ struct BrimPanelView: View {
     var prompt: (accountID: String, kind: BrimPanelModel.ResetKind)? = nil
     /// A refresh round is running (`UsageStore.isRefreshing`): the refresh button spins.
     var refreshing = false
+    /// The Usage tab's content for a width and the height it may take (BrimUsageView). nil: no
+    /// tab switch, the accounts only (screenshots render the panel without the token scan).
+    var usageContent: ((_ width: CGFloat, _ maxHeight: CGFloat) -> AnyView)? = nil
+
+    enum Tab: String { case accounts, usage }
+    @AppStorage("brimPanelTab") private var tabRaw = Tab.accounts.rawValue
+    private var tab: Tab { usageContent == nil ? .accounts : Tab(rawValue: tabRaw) ?? .accounts }
 
     @Environment(\.colorScheme) private var scheme
     @State private var menuOpen = false
@@ -57,9 +64,11 @@ struct BrimPanelView: View {
     private var words: BrimPanelText { BrimPanelText(localize: L) }
     private var columns: Int { layout.columnCount(accounts: model.accountCount, screenWidth: screenWidth) }
     private var width: CGFloat {
-        model.body == .accounts ? layout.panelWidth(accounts: model.accountCount, screenWidth: screenWidth)
+        let accounts = model.body == .accounts ? layout.panelWidth(accounts: model.accountCount, screenWidth: screenWidth)
             : BrimPanelLayout.singleCardWidth
+        return tab == .usage ? max(accounts, Self.usageWidth) : accounts
     }
+    static let usageWidth: CGFloat = 600
 
     var body: some View {
         VStack(spacing: 0) {
@@ -68,7 +77,11 @@ struct BrimPanelView: View {
                 banner
             }
             .background(measure { chromeTop = $0 })
-            accountsArea
+            if tab == .usage, let usageContent {
+                usageContent(width, max(200, maxHeight - chromeTop - 140))
+            } else {
+                accountsArea
+            }
         }
         .frame(width: width)
         .fixedSize(horizontal: false, vertical: true)
@@ -112,9 +125,13 @@ struct BrimPanelView: View {
                         ink: theme.text, liquid: theme.accentFill, dimmed: model.glyph.dashed)
                 .frame(width: 18, height: 18)
             Text(verbatim: "UsageBar").font(.system(size: 15, weight: .semibold)).padding(.leading, 2)
-            Text(L(used ? "Used" : "Remaining")).font(.system(size: 11)).foregroundStyle(theme.text2)
+            if usageContent != nil {
+                tabSwitch.padding(.leading, 6)
+            } else {
+                Text(L(used ? "Used" : "Remaining")).font(.system(size: 11)).foregroundStyle(theme.text2)
+            }
             Spacer(minLength: 8)
-            if let updated = model.updated {
+            if tab == .accounts, let updated = model.updated {
                 Text(String(format: L("Updated %@"), updated))
                     .font(.system(size: 11)).foregroundStyle(theme.text2)
                     .lineLimit(1).fixedSize()
@@ -129,6 +146,23 @@ struct BrimPanelView: View {
             iconButton("gearshape", label: L("Settings"), action: actions.openSettings)
         }
         .padding(EdgeInsets(top: 10, leading: 16, bottom: 8, trailing: 8))
+    }
+
+    /// Accounts (remaining or used, as Settings has it) and Usage, as two quiet words; the chosen
+    /// one in the text colour on a soft fill.
+    private var tabSwitch: some View {
+        HStack(spacing: 2) {
+            ForEach([(Tab.accounts, L(used ? "Used" : "Remaining")), (Tab.usage, L("Usage"))], id: \.0) { item in
+                Button { tabRaw = item.0.rawValue } label: {
+                    Text(item.1).font(.system(size: 11, weight: tab == item.0 ? .medium : .regular))
+                        .foregroundStyle(tab == item.0 ? theme.text : theme.text2)
+                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(tab == item.0 ? theme.mutedFill.opacity(0.6) : .clear, in: Capsule())
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+        }
     }
 
     /// Spins while a round runs (a click, or the timer's own) and shows a check for a moment after
@@ -362,7 +396,8 @@ struct BrimPanelView: View {
     @ViewBuilder private func statusMark(_ row: BrimPanelModel.Row) -> some View {
         let levels = windows(row).compactMap(\.1.level)
         if row.refreshFailed {
-            dot(theme.warnFill, label: row.refreshProblem?.isEmpty == false ? row.refreshProblem! : L("Could not refresh"))
+            dot(theme.warnFill, label: row.serverHoldUntil != nil ? row.refreshFailureTitle
+                : row.refreshProblem?.isEmpty == false ? row.refreshProblem! : L("Could not refresh"))
         } else if levels.contains(where: { $0 == .limit || $0 == .critical }) {
             dot(theme.criticalFill, label: L("Near the limit"))
         } else if levels.contains(.low) {
@@ -563,12 +598,12 @@ struct BrimPanelView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .help(row.refreshProblem?.isEmpty == false ? row.refreshProblem! : L("Sign-in needed"))
         } else if row.refreshFailed {
-            let base = row.refreshReading.map { String(format: L("Could not refresh · %@ data"), $0) } ?? L("Could not refresh")
-            // A server-stated 429 hold: say when the next read happens, so a stale card is not
-            // mistaken for a broken account and the refresh button is not pressed into the window.
-            let retry = ProbeCadence.UsageReadHold.shared.firmUntil(row.id, now: Date()).map {
-                String(format: L("retrying at %@"), $0.formatted(date: .omitted, time: .shortened))
-            }
+            // A server-stated 429 hold leads with the wait, so a stale card is not mistaken for a
+            // broken account and neither a refresh nor a fresh sign-in is tried inside the window.
+            let held = row.serverHoldUntil != nil
+            let base = held ? row.refreshFailureTitle
+                : row.refreshReading.map { String(format: L("Could not refresh · %@ data"), $0) } ?? L("Could not refresh")
+            let retry = held ? row.refreshReading.map { String(format: L("%@ data"), $0) } : nil
             // The reason's first paragraph is on the card: hidden in a tooltip, "Could not refresh"
             // alone left the user guessing what to do. The full text stays in the tooltip.
             let reason = row.refreshProblem?.components(separatedBy: "\n\n").first?.nilIfEmpty
@@ -691,4 +726,16 @@ struct BrimPanelView: View {
 
 private extension String {
     var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
+extension BrimPanelModel.Row {
+    /// When a server-stated read hold (an HTTP 429 with its wait, ProbeCadence.UsageReadHold) ends.
+    var serverHoldUntil: Date? { ProbeCadence.UsageReadHold.shared.firmUntil(id, now: Date()) }
+
+    /// The failed-refresh headline: the server's wait when there is one ("Rate limited · retrying
+    /// at 17:08"), since a fresh sign-in or a manual refresh does not lift it; else "Could not refresh".
+    var refreshFailureTitle: String {
+        guard let until = serverHoldUntil else { return L("Could not refresh") }
+        return String(format: L("Rate limited · retrying at %@"), until.formatted(date: .omitted, time: .shortened))
+    }
 }

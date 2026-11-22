@@ -108,6 +108,8 @@ To package a DMG, run `scripts/make-release.sh --unsigned` for a local test buil
 - The Cost tab reads the CLIs' local transcripts on your Mac. They never leave it.
 - UsageBar has no telemetry: no usage ping, no analytics and no crash reporting.
 - The network requests are the ones the official CLIs make to read usage, plus requests to `api.anthropic.com` that list and claim Claude reset credits, which run only for those features.
+- Plan renewal dates are read a few times a day with one GET per account. For Codex, UsageBar asks the official CLI for its access token, keeps it in memory for one request to `chatgpt.com/backend-api/subscriptions` and drops it. `auth.json` is never opened.
+- For Claude, the renewal date is only on claude.ai. It is read after you sign in to claude.ai inside UsageBar, in a web session kept apart from your browser and from every other account. Without that sign-in nothing is sent.
 - Local state lives in `~/.usagebar`, including the snapshot at `~/.usagebar/snapshot.json`, which holds percentages and paths and no tokens.
 
 ## Documentation

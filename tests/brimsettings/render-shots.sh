@@ -8,7 +8,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 awk '/^\/\/\/ Like `ProviderIconShape`/ {exit} {print}' UsageBar/Views/ProviderIconShape.swift > "$work/ProviderShape.swift"
 swiftc -Xfrontend -disable-sandbox "$work/ProviderShape.swift" UsageBar/Providers/ProviderMarks.swift UsageBar/Core/ProviderBrand.swift UsageBar/Stores/DisplaySettings.swift -o "$work/render" UsageBar/Core/BrandPaths.swift UsageBar/Core/UsageSnapshot.swift \
-  UsageBar/Providers/ProviderModels.swift UsageBar/Core/BrimPanelModel.swift UsageBar/Core/BrimPanelLayout.swift UsageBar/Core/BrimSettingsModel.swift \
+  UsageBar/Providers/ProviderModels.swift UsageBar/Core/BrimPanelModel.swift UsageBar/Core/BrimPanelLayout.swift UsageBar/Core/BrimSettingsModel.swift UsageBar/Core/SubscriptionRenewal.swift \
   UsageBar/Views/BrimGlyph.swift UsageBar/Views/BrimSettingsParts.swift UsageBar/Views/BrimPanelParts.swift UsageBar/Views/BrimSettingsPanes.swift \
   UsageBar/Views/BrimSettingsTables.swift tests/brimpanel/fixtures.swift tests/brimsettings/disk.swift \
   tests/brimsettings/render/main.swift

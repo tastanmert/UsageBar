@@ -16,26 +16,19 @@ extension StatusItemController {
         let segments = prefs.menuBarText == .selected
             ? prefs.menuSelection.segments(rows: rows, used: prefs.displayMode == .used, format: BrimPanelHost.format) : []
         let tooltip = Self.brimTooltip(model) + (segments.isEmpty ? "" : "\n" + segments.map { segment in
-            (rows.first { $0.id == segment.id }?.name ?? segment.id) + ": " + segment.text
+            (rows.first { $0.id == segment.id }?.name ?? segment.id) + ": "
+                + segment.parts.map { $0.window.tag + " " + $0.value }.joined(separator: " · ")
         }.joined(separator: "\n"))
         let glyph = BrimSettingsPrefs.menuBarGlyph(for: model)
-        let face = BrimFace(glyph: glyph, tooltip: tooltip, segments: segments)
+        let style = BrimMenuStrip.Style(showWindowTags: prefs.menuSelection.showWindowTags,
+                                        monochrome: BrimMenuStrip.currentMonochrome)
+        let face = BrimFace(glyph: glyph, tooltip: tooltip, segments: segments, style: style)
         if !BrimMenuBarText.showsCup(prefs.menuBarText, segments: segments) {
             guard face != Self.lastBrimFace else { return }
             Self.lastBrimFace = face
-            button.image = nil
-            let title = NSMutableAttributedString()
-            for (index, segment) in segments.enumerated() {
-                if index > 0 { title.append(NSAttributedString(string: "   ")) }
-                let attachment = NSTextAttachment()
-                attachment.image = BrimProviderMark.image(segment.provider)
-                attachment.bounds = NSRect(x: 0, y: -2, width: 14, height: 14)
-                title.append(NSAttributedString(attachment: attachment))
-                title.append(NSAttributedString(string: " " + [segment.label, segment.text].compactMap { $0 }.joined(separator: " "),
-                                                attributes: [.font: Self.rowFont]))
-            }
-            button.attributedTitle = title
-            button.imagePosition = .imageLeading
+            button.image = BrimMenuStrip.image(segments, style: style)
+            button.attributedTitle = NSAttributedString()
+            button.imagePosition = .imageOnly
             button.toolTip = tooltip
             button.setAccessibilityLabel(tooltip)
             return
@@ -60,6 +53,7 @@ extension StatusItemController {
         var glyph: BrimPanelModel.Glyph
         var tooltip: String
         var segments: [BrimMenuSelection.Segment]
+        var style: BrimMenuStrip.Style
     }
 
     private static var lastBrimFace: BrimFace?

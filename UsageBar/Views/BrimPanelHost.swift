@@ -20,7 +20,10 @@ struct BrimPanelHost: View {
                           screenWidth: hostScreen()?.visibleFrame.width,
                           onContentSize: onContentSize,
                           prompt: BrimResetUseStore.shared.prompt.map { ($0.accountID, $0.kind) },
-                          refreshing: store.isRefreshing)
+                          refreshing: store.isRefreshing,
+                          usageContent: { width, height in
+                              AnyView(BrimUsageView(store: .shared, width: width, maxHeight: height))
+                          })
         }
     }
 

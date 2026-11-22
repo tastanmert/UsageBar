@@ -443,6 +443,9 @@ final class UsageStore {
         // never connected, and throttles its own repeats (ConsoleCreditsStore.minimumInterval, per account).
         let claudeIDs = known.filter { $0.providerID == ClaudeAccounts.providerID }.map(\.id)
         Task { await ConsoleCreditsStore.shared.refresh(accountIDs: claudeIDs, force: userInitiated) }
+        // Plan renewals ride it too, throttled to a few reads a day per account (SubscriptionStore).
+        let subscribed = known.filter { SettingsStore.shared.isAccountEnabled($0.id) }
+        Task { await SubscriptionStore.shared.refresh(accounts: subscribed) }
         // Any failed account → probe again soon (backoff) instead of waiting the full interval.
         scheduleRetryIfNeeded(anyFailure: results.contains { $0.error != nil },
                               soon: retriesSoon(results, streaks: failureStreak))

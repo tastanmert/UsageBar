@@ -13,6 +13,7 @@ final class BrimSettingsPrefs {
             guard menuSelection != oldValue else { return }
             UserDefaults.standard.set(menuSelection.windows, forKey: "brimMenuWindows")
             UserDefaults.standard.set(menuSelection.showLabels, forKey: "brimMenuLabels")
+            UserDefaults.standard.set(menuSelection.showWindowTags, forKey: "brimMenuWindowTags")
             UsageStore.shared.onChange?()
         }
     }
@@ -51,7 +52,8 @@ final class BrimSettingsPrefs {
         let defaults = UserDefaults.standard
         menuSelection = BrimMenuSelection(
             windows: defaults.dictionary(forKey: "brimMenuWindows") as? [String: [String]] ?? [:],
-            showLabels: defaults.bool(forKey: "brimMenuLabels"))
+            showLabels: defaults.bool(forKey: "brimMenuLabels"),
+            showWindowTags: defaults.object(forKey: "brimMenuWindowTags") as? Bool ?? true)
         displayMode = DisplayMode(rawValue: defaults.string(forKey: "brimDisplayMode") ?? "") ?? .remaining
         panelLayout = BrimPanelLayout.load { defaults.object(forKey: $0) }
         let savedMenuText = BrimMenuBarText(rawValue: defaults.string(forKey: BrimMenuBarText.defaultsKey) ?? "")

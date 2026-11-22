@@ -13,9 +13,9 @@ struct BrimAccountsPane: View {
     /// Name | Plan | Account (address over profile folder) | Login | Resets | Monitor | actions.
     private enum Column {
         // Narrowed so the address column fits a typical email whole (880pt window).
-        static let name: CGFloat = 100
-        static let plan: CGFloat = 60
-        static let credit: CGFloat = 120
+        static let name: CGFloat = 92
+        static let plan: CGFloat = 84
+        static let credit: CGFloat = 104
         static let login: CGFloat = 106
         static let resets: CGFloat = 116
         static let monitor: CGFloat = 52
@@ -106,8 +106,7 @@ struct BrimAccountsPane: View {
                 Text(verbatim: row.name).font(.system(size: 13, weight: .medium)).foregroundStyle(theme.text)
                     .lineLimit(1).truncationMode(.middle)
             }.frame(width: Column.name, alignment: .leading)
-            Text(verbatim: row.plan ?? "—").font(.system(size: 13)).foregroundStyle(theme.text2)
-                .lineLimit(1).frame(width: Column.plan, alignment: .leading)
+            planCell(row, theme).frame(width: Column.plan, alignment: .leading)
             // The address first (which login this is), the profile folder under it; the folder
             // alone when the account has not named itself yet.
             VStack(alignment: .leading, spacing: 1) {
@@ -131,7 +130,8 @@ struct BrimAccountsPane: View {
                         .controlSize(.mini)
                         .disabled(actions.signIn == nil || panelRow.signingIn)
                 } else if let panelRow, panelRow.refreshFailed {
-                    Text(L("Could not refresh")).font(.system(size: 11)).foregroundStyle(theme.text2)
+                    Text(panelRow.refreshFailureTitle).font(.system(size: 11)).foregroundStyle(theme.text2)
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                     if let reading = panelRow.refreshReading {
                         Text(reading).font(.system(size: 10)).foregroundStyle(theme.text2)
                             .lineLimit(1).minimumScaleFactor(0.7)
@@ -181,6 +181,73 @@ struct BrimAccountsPane: View {
             .accessibilityLabel(String(format: L("Actions for %@"), row.name))
         }
         .padding(.horizontal, 12).frame(height: 42)
+    }
+
+    /// The plan's name, and under it when it renews ("8 Dec"), when a cancelled plan ends, or a
+    /// link to sign in to claude.ai where only that session knows the date. The rest on hover.
+    @ViewBuilder
+    private func planCell(_ row: BrimAccountsTable.Row, _ theme: BrimTheme) -> some View {
+        let now = Date()
+        VStack(alignment: .leading, spacing: 1) {
+            Text(verbatim: row.plan ?? "—").font(.system(size: 13)).foregroundStyle(theme.text2).lineLimit(1)
+            switch row.renewal {
+            case .known(let renewal):
+                if let ends = renewal.accessEnds(now: now) {
+                    Text(String(format: L("Ends %@"), Self.shortDate(ends, now: now)))
+                        .font(.system(size: 10.5)).monospacedDigit().foregroundStyle(theme.warn).lineLimit(1)
+                } else if let next = renewal.nextRenewal(now: now) {
+                    Text(verbatim: Self.shortDate(next, now: now))
+                        .font(.system(size: 10.5)).monospacedDigit().foregroundStyle(theme.text2).lineLimit(1)
+                }
+            case .connect:
+                Button(L("Renewal date")) { actions.connectClaudeWeb?(row.id) }
+                    .buttonStyle(.link).font(.system(size: 10.5)).lineLimit(1)
+                    .disabled(actions.connectClaudeWeb == nil)
+            case .differentAccount:
+                Button(L("Other account")) { actions.connectClaudeWeb?(row.id) }
+                    .buttonStyle(.link).font(.system(size: 10.5)).foregroundStyle(theme.warn).lineLimit(1)
+                    .disabled(actions.connectClaudeWeb == nil)
+            case nil:
+                EmptyView()
+            }
+        }
+        .help(Self.renewalHelp(row.renewal, now: now))
+    }
+
+    private static func shortDate(_ date: Date, now: Date) -> String {
+        let format = DateFormatter()
+        format.locale = Locale(identifier: AppLocale.identifier)
+        let sameYear = Calendar.current.component(.year, from: date) == Calendar.current.component(.year, from: now)
+        format.setLocalizedDateFormatFromTemplate(sameYear ? "dMMM" : "dMMMyy")
+        return format.string(from: date)
+    }
+
+    private static func renewalHelp(_ renewal: BrimAccountsTable.Renewal?, now: Date) -> String {
+        switch renewal {
+        case .known(let r):
+            let full = DateFormatter()
+            full.locale = Locale(identifier: AppLocale.identifier)
+            full.dateStyle = .long
+            var lines: [String] = []
+            if let ends = r.accessEnds(now: now) {
+                lines.append(String(format: L("Cancelled, access ends on %@"), full.string(from: ends)))
+            } else if let next = r.nextRenewal(now: now) {
+                lines.append(String(format: L("Renews on %@"), full.string(from: next)))
+            }
+            switch r.interval {
+            case .monthly: lines.append(L("Billed monthly"))
+            case .yearly: lines.append(L("Billed yearly"))
+            case nil: break
+            }
+            lines.append(String(format: L("Last checked %@"), full.string(from: r.checkedAt)))
+            return lines.joined(separator: "\n")
+        case .connect:
+            return L("Only claude.ai knows when this plan renews. Sign in once inside UsageBar to show it here.")
+        case .differentAccount:
+            return L("The claude.ai login is a different account. Sign in with this account's email.")
+        case nil:
+            return ""
+        }
     }
 
     /// The panel shows a reset line only when there is a reset left; here every account says

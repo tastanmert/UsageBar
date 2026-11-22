@@ -166,6 +166,83 @@ expect(BrimMenuBarText.showsCup(.selected, segments: modelSelection.segments(row
        "all unavailable readings fall back to the mark")
 expect(modelSelection.pruned(rows: [missingRow]).contains(selectedRow.id, .fable),
        "only deleted accounts lose preferences")
+// Menu bar colours: fine from half left, watch from a fifth, low below.
+expect(BrimMenuSelection.Part(window: .weekly, value: "", remaining: 50).tone == .fine, "50% left is fine")
+expect(BrimMenuSelection.Part(window: .weekly, value: "", remaining: 43).tone == .watch, "43% left is worth a glance")
+expect(BrimMenuSelection.Part(window: .weekly, value: "", remaining: 19).tone == .low, "under a fifth is low")
+expect(BrimMenuSelection.Part(window: .weekly, value: "").tone == nil, "no reading, no colour")
+
+// Plan renewals (SubscriptionRenewal): the shapes measured live on 2026-11-22.
+let renewalNow = SubscriptionRenewal.date("2026-11-22T12:00:00Z")!
+let chatgptBody = Data(#"{"entitlement":{"renews_at":"2027-01-31T08:32:58+00:00","cancels_at":null,"billing_period":"yearly"},"active_until":"2027-01-31T08:32:58Z","billing_period":"yearly","will_renew":true}"#.utf8)
+let chatgpt = SubscriptionRenewal.chatGPT(chatgptBody, now: renewalNow)
+expect(chatgpt?.interval == .yearly && chatgpt?.willRenew == true, "ChatGPT: yearly, renewing")
+expect(chatgpt?.nextRenewal(now: renewalNow) == SubscriptionRenewal.date("2027-01-31T08:32:58Z"), "ChatGPT: renews_at as stated")
+let cancelledBody = Data(#"{"entitlement":{"renews_at":null,"cancels_at":"2026-12-05T00:00:00Z"},"will_renew":false}"#.utf8)
+let cancelled = SubscriptionRenewal.chatGPT(cancelledBody, now: renewalNow)
+expect(cancelled?.nextRenewal(now: renewalNow) == nil && cancelled?.accessEnds(now: renewalNow) == SubscriptionRenewal.date("2026-12-05T00:00:00Z"),
+       "ChatGPT: a cancelled plan shows when it ends, not a renewal")
+expect(SubscriptionRenewal.chatGPT(Data(#"{"plan_type":"free"}"#.utf8), now: renewalNow) == nil, "ChatGPT: no date, no renewal")
+let claudeBody = Data(#"{"status":"active","next_charge_date":"2026-12-08","billing_interval":"monthly","currency":"USD"}"#.utf8)
+let claudeRenewal = SubscriptionRenewal.claude(claudeBody, now: renewalNow)
+expect(claudeRenewal?.interval == .monthly && claudeRenewal?.nextRenewal(now: renewalNow) == SubscriptionRenewal.date("2026-12-08"),
+       "Claude: next_charge_date and billing_interval")
+// Read on 22 Nov, shown on 10 Dec: the 8 Dec charge has happened, so the next one is 8 Jan.
+let later = SubscriptionRenewal.date("2026-12-10T00:00:00Z")!
+expect(claudeRenewal?.nextRenewal(now: later) == SubscriptionRenewal.date("2027-01-08"), "monthly rolls forward a month")
+var noInterval = claudeRenewal!; noInterval.interval = nil
+expect(noInterval.nextRenewal(now: later) == nil, "a past date without a period is not guessed forward")
+expect(SubscriptionRenewal.claude(Data(#"{"status":"active","plan_ending_at":"2026-12-01T00:00:00Z"}"#.utf8), now: renewalNow)?.accessEnds(now: renewalNow) != nil,
+       "Claude: plan_ending_at is an end, not a renewal")
+expect(SubscriptionRenewal.date("2026-11-03T09:37:28.897130+00:00") != nil, "six-digit fractions parse")
+
+// Renewal reminders: three days ahead, once per date.
+let soon = SubscriptionRenewal.date("2026-12-06T00:00:00Z")!
+let reminders = RenewalReminder.due(["max": claudeRenewal!, "gone": cancelled!], sent: [:], now: soon)
+expect(reminders.map(\.accountID) == ["max"] && reminders.first?.kind == .renews, "a renewal two days off is due; an end past is not")
+expect(RenewalReminder.due(["max": claudeRenewal!], sent: ["max": reminders[0].stamp], now: soon).isEmpty, "warned once per date")
+expect(RenewalReminder.due(["max": claudeRenewal!], sent: [:], now: renewalNow).isEmpty, "sixteen days off is not due yet")
+let endsSoon = RenewalReminder.due(["gone": cancelled!], sent: [:], now: SubscriptionRenewal.date("2026-12-03T00:00:00Z")!)
+expect(endsSoon.first?.kind == .ends, "a cancelled plan warns before access ends")
+
+// Usage tab breakdown.
+func usageCell(_ day: Int, _ project: String, _ provider: String = "claude", _ model: String = "claude-opus-5-5",
+               cost: Double? = 1, tokens: Int64 = 100) -> UsageBreakdown.Cell {
+    UsageBreakdown.Cell(day: day, project: project, providerID: provider, model: model, cost: cost, tokens: tokens, output: tokens / 10)
+}
+let usageToday = 20_000
+let usageCells = [
+    usageCell(20_000, "/p/a", cost: 3), usageCell(19_999, "/p/b", cost: 1),
+    usageCell(19_996, "/p/a", cost: 2), usageCell(19_993, "/p/a", cost: 9), // 19_993 is outside 7 days, inside the previous 7
+    usageCell(20_000, "/p/c", "codex", "gpt-6.2-astra", cost: nil, tokens: 500),
+    usageCell(19_987, "/p/z", cost: 0, tokens: 0), // the history reaches the previous window's first day
+]
+let week = UsageBreakdown.make(cells: usageCells, group: .project, dayCount: 7, today: usageToday)
+expect(week.totals.cost == 6 && week.totals.tokens == 800 && week.totals.unpricedTokens == 500, "usage: window totals, unpriced kept apart")
+expect(week.previous?.cost == 9, "usage: previous window of equal length")
+expect(week.bars.count == 7 && week.bars.last?.day == usageToday, "usage: one bar per day, idle days included")
+expect(week.rows.map(\.key) == ["/p/a", "/p/b", "/p/c"] && week.rows.first?.share == 5.0 / 6.0, "usage: rows by cost, share of cost")
+expect(UsageBreakdown.change(week.totals.cost, week.previous?.cost) == -33, "usage: change in percent")
+let shortHistory = UsageBreakdown.make(cells: Array(usageCells.dropLast()), group: .project, dayCount: 7, today: usageToday)
+expect(shortHistory.previous == nil && shortHistory.rows.allSatisfy { $0.previous == nil }, "usage: no comparison when the history is shorter than two windows")
+let models = UsageBreakdown.make(cells: usageCells, group: .model, dayCount: nil, today: usageToday)
+expect(!models.monthly && models.previous == nil && models.rows.count == 2 && models.bars.count == 14, "usage: a short All is daily, no comparison")
+let longAll = UsageBreakdown.make(cells: usageCells + [usageCell(19_700, "/p/a")], group: .model, dayCount: nil, today: usageToday)
+expect(longAll.monthly && longAll.bars.count <= 12, "usage: a long All is monthly")
+let many = (0..<14).map { usageCell(usageToday, "/p/\($0)", cost: Double($0 + 1)) }
+let pooled = UsageBreakdown.make(cells: many, group: .project, dayCount: 1, today: usageToday)
+expect(pooled.rows.count == UsageBreakdown.rowLimit && pooled.rows.last?.key == UsageBreakdown.otherKey
+       && pooled.rows.reduce(0) { $0 + $1.totals.cost } == pooled.totals.cost, "usage: the tail pools into Other and still adds up")
+expect(pooled.rows.last?.members == 14 - UsageBreakdown.rowLimit + 1, "usage: the pooled row counts what it holds")
+let scratch = UsageBreakdown.make(cells: [usageCell(usageToday, "/Users/u/Library/Application Support/Claude/x/scratch-1"),
+                                          usageCell(usageToday, "/Users/u/Library/Application Support/Claude/y/scratch-2")],
+                                  group: .project, dayCount: 1, today: usageToday)
+expect(scratch.rows.map(\.key) == [UsageBreakdown.claudeAppKey], "usage: Claude app scratch folders are one row")
+expect(UsageBreakdown.modelName("claude-opus-5-5") == "Opus 5.5" && UsageBreakdown.modelName("claude-haiku-4-5-20251001") == "Haiku 4.5"
+       && UsageBreakdown.modelName("gpt-6.2-astra") == "GPT-6.2 Astra", "usage: model names")
+expect(TokenCount.short(950) == "950" && TokenCount.short(12_400, locale: Locale(identifier: "en")) == "12.4K"
+       && TokenCount.short(3_100_000_000, locale: Locale(identifier: "en")) == "3.1B", "usage: short token counts")
+
 if failures > 0 {
     print("brimsettings: \(failures) of \(checks) checks FAILED")
     exit(1)

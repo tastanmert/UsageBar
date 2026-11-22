@@ -97,7 +97,13 @@ struct BrimSettingsView: View {
                 Task { await store.refresh(userInitiated: true) }
             },
             remove: { Self.remove($0, store: store) },
-            clearCodexAttempt: { Self.clearCodexAttempt($0, store: store) })
+            clearCodexAttempt: { Self.clearCodexAttempt($0, store: store) },
+            connectClaudeWeb: { id in
+                guard let account = store.discoveredAccounts.first(where: { $0.id == id }) else { return }
+                ConsoleSignInWindowController.claudeWeb.show(accountID: id) {
+                    Task { await SubscriptionStore.shared.didConnectClaude(account: account) }
+                }
+            })
     }
 
     /// Forgets UsageBar's record of an open Codex reset attempt left by an earlier login, after a
@@ -180,6 +186,18 @@ struct BrimSettingsView: View {
         let polled = Dictionary(store.accounts.map { ($0.id, $0.accountEmail) }, uniquingKeysWith: { a, _ in a })
         accounts.fillEmails { id in
             LoginStatusStore.shared.identityEmail(accountID: id, polled: polled[id] ?? nil)
+        }
+        let subscriptions = SubscriptionStore.shared
+        let claudeIDs = Set(store.discoveredAccounts.filter { $0.providerID == ClaudeAccounts.providerID }.map(\.id))
+        accounts.fillRenewals { id in
+            if let renewal = subscriptions.renewals[id] { return .known(renewal) }
+            guard claudeIDs.contains(id) else { return nil }
+            if !subscriptions.isConnectedToClaudeWeb(id) { return .connect }
+            switch subscriptions.statuses[id] {
+            case .differentAccount: return .differentAccount
+            case .notConnected: return .connect
+            default: return nil
+            }
         }
         return BrimSettingsData(
             panel: panel, snapshot: snapshot, now: now, format: format,

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Everything a settings pane reads, gathered by the host (BrimSettingsView) or a fixture, so the
@@ -37,6 +38,8 @@ struct BrimSettingsActions {
     var remove: ((String) -> Void)?
     /// Codex: forget an earlier login's open reset attempt after a confirmation.
     var clearCodexAttempt: ((String) -> Void)?
+    /// Claude: sign in to claude.ai inside UsageBar so the plan's renewal date can be read.
+    var connectClaudeWeb: ((String) -> Void)?
 }
 
 /// One pane by tab.
@@ -182,8 +185,11 @@ struct BrimGeneralPane: View {
                     }
                 }
             }
-            Toggle(L("Short account labels"), isOn: bindings.menuSelection.showLabels)
-                .toggleStyle(.checkbox)
+            HStack(spacing: 16) {
+                Toggle(L("Short account labels"), isOn: bindings.menuSelection.showLabels)
+                Toggle(L("Window labels"), isOn: bindings.menuSelection.showWindowTags)
+            }
+            .toggleStyle(.checkbox)
         }.font(.system(size: 12)).tint(BrimTheme.of(scheme).accent).padding(12)
     }
 
@@ -248,8 +254,24 @@ struct BrimGeneralPane: View {
             ForEach(segments, id: \.id) { segment in
                 HStack(spacing: 4) {
                     BrimProviderMark(provider: segment.provider, monochrome: true)
-                    Text(verbatim: [segment.label, segment.text].compactMap { $0 }.joined(separator: " "))
-                        .font(.system(size: 12)).monospacedDigit().fixedSize()
+                    if let label = segment.label {
+                        Text(verbatim: label).font(.system(size: 12)).fixedSize()
+                    }
+                    let selection = bindings.menuSelection.wrappedValue
+                    HStack(spacing: 5) {
+                        ForEach(Array(segment.parts.enumerated()), id: \.offset) { _, part in
+                            HStack(spacing: 2) {
+                                if selection.showWindowTags {
+                                    Text(verbatim: part.window.tag).font(.system(size: 11, weight: .semibold))
+                                }
+                                Text(verbatim: part.value.menuBarFigure)
+                                    .font(.system(size: 11, weight: .medium)).monospacedDigit()
+                                    .foregroundStyle(segment.stale ? Color.secondary : Color(nsColor: part.tone.menuColor))
+                            }
+                        }
+                    }
+                    .fixedSize()
+                    .padding(.leading, 2)
                 }
             }
         }
@@ -438,4 +460,33 @@ struct BrimRoutingPane: View {
                                              set: { store.setMode(providerID, $0) }))
         }
     }
+}
+
+extension BrimMenuSelection.Window {
+    /// The small dimmed name before a figure in the menu bar: 5H / W / F (Turkish 5S / H / F).
+    var tag: String {
+        switch self {
+        case .fiveHour: L("5H")
+        case .weekly: L("W")
+        case .fable: L("F")
+        }
+    }
+}
+
+extension BrimMenuSelection.Part.Tone? {
+    /// Green, orange, red: the system tones, which macOS already tunes for light and dark bars.
+    var menuColor: NSColor {
+        switch self {
+        case .fine: .systemGreen
+        case .watch: .systemOrange
+        case .low: .systemRed
+        case nil: .labelColor
+        }
+    }
+}
+
+extension String {
+    /// A figure as the menu bar shows it: the window tag already says it is a share, so the
+    /// percent sign is dropped ("%84" / "84%" -> "84").
+    var menuBarFigure: String { replacingOccurrences(of: "%", with: "").trimmingCharacters(in: .whitespaces) }
 }
