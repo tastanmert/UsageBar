@@ -173,10 +173,17 @@ struct BrimSettingsView: View {
                       home: home, current: CodexIdentityBook.shared.identity(home: home)) != nil else { return nil }
             return account.id
         })
+        var accounts = BrimAccountsTable.make(snapshot: snapshot, folders: folders, home: home, probe: .live,
+                                              discovered: discovered, strandedCodexAttempts: strandedCodexAttempts)
+        // The same chain the panel's hover asks (probe, this round's poll, then memory), so a
+        // switched-off account keeps its address here too.
+        let polled = Dictionary(store.accounts.map { ($0.id, $0.accountEmail) }, uniquingKeysWith: { a, _ in a })
+        accounts.fillEmails { id in
+            LoginStatusStore.shared.identityEmail(accountID: id, polled: polled[id] ?? nil)
+        }
         return BrimSettingsData(
             panel: panel, snapshot: snapshot, now: now, format: format,
-            accounts: BrimAccountsTable.make(snapshot: snapshot, folders: folders, home: home, probe: .live,
-                                             discovered: discovered, strandedCodexAttempts: strandedCodexAttempts),
+            accounts: accounts,
             integrations: integrations,
             version: Self.version)
     }

@@ -139,6 +139,9 @@ struct BrimAccountsTable: Equatable {
         var name: String
         var plan: String?
         var folder: String
+        /// Who the account is signed in as (LoginStatusStore's answer, filled in by the app, never
+        /// from the snapshot, which carries no identity). Nil shows the folder alone.
+        var email: String? = nil
         var login: Login
         /// Read and published (Settings > Accounts' Monitor switch, live mode).
         var monitored = true
@@ -156,6 +159,16 @@ struct BrimAccountsTable: Equatable {
     /// Account-shaped profile folders on disk that the snapshot does not list ("~/.claude-old").
     var untracked: [String]
     var count: Int { groups.reduce(0) { $0 + $1.rows.count } }
+
+    /// Puts each account's address on its row; an empty answer leaves the row without one.
+    mutating func fillEmails(_ email: (String) -> String?) {
+        for g in groups.indices {
+            for r in groups[g].rows.indices {
+                let value = email(groups[g].rows[r].id)
+                groups[g].rows[r].email = value?.isEmpty == false ? value : nil
+            }
+        }
+    }
 
     /// - Parameter discovered: live mode's whole account list; the ones the snapshot leaves out
     ///   (switched off) follow as not monitored. Empty in mirror mode.

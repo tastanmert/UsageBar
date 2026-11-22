@@ -10,7 +10,7 @@ struct BrimAccountsPane: View {
     var actions = BrimSettingsActions()
     @Environment(\.colorScheme) private var scheme
 
-    /// Name | Plan | Profile folder | Login | Resets | Monitor | actions.
+    /// Name | Plan | Account (address over profile folder) | Login | Resets | Monitor | actions.
     private enum Column {
         static let name: CGFloat = 120
         static let plan: CGFloat = 80
@@ -86,7 +86,7 @@ struct BrimAccountsPane: View {
         HStack(spacing: 12) {
             BrimColumnHeader(text: L("Name")).frame(width: Column.name, alignment: .leading)
             BrimColumnHeader(text: L("Plan")).frame(width: Column.plan, alignment: .leading)
-            BrimColumnHeader(text: L("Profile folder")).frame(maxWidth: .infinity, alignment: .leading)
+            BrimColumnHeader(text: L("Account")).frame(maxWidth: .infinity, alignment: .leading)
             BrimColumnHeader(text: L("Login")).frame(width: Column.login, alignment: .leading)
             BrimColumnHeader(text: L("Reset credits")).frame(width: Column.resets, alignment: .leading)
             BrimColumnHeader(text: L("Credit")).frame(width: Column.credit, alignment: .center)
@@ -107,8 +107,20 @@ struct BrimAccountsPane: View {
             }.frame(width: Column.name, alignment: .leading)
             Text(verbatim: row.plan ?? "—").font(.system(size: 13)).foregroundStyle(theme.text2)
                 .lineLimit(1).frame(width: Column.plan, alignment: .leading)
-            Text(verbatim: row.folder).font(.system(size: 12, design: .monospaced)).foregroundStyle(theme.text2)
-                .lineLimit(1).truncationMode(.middle).frame(maxWidth: .infinity, alignment: .leading)
+            // The address first (which login this is), the profile folder under it; the folder
+            // alone when the account has not named itself yet.
+            VStack(alignment: .leading, spacing: 1) {
+                if let email = row.email {
+                    Text(verbatim: email).font(.system(size: 12)).foregroundStyle(theme.text)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+                Text(verbatim: row.folder)
+                    .font(.system(size: row.email == nil ? 12 : 10.5, design: .monospaced))
+                    .foregroundStyle(theme.text2)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help([row.email, row.folder].compactMap { $0 }.joined(separator: "\n"))
             VStack(alignment: .leading, spacing: 2) {
                 if let panelRow, panelRow.needsSignIn {
                     // The verdict LoginStatusStore holds, not a guess from the error's wording
