@@ -12,12 +12,13 @@ struct BrimAccountsPane: View {
 
     /// Name | Plan | Account (address over profile folder) | Login | Resets | Monitor | actions.
     private enum Column {
-        static let name: CGFloat = 120
-        static let plan: CGFloat = 80
+        // Narrowed so the address column fits a typical email whole (880pt window).
+        static let name: CGFloat = 100
+        static let plan: CGFloat = 60
         static let credit: CGFloat = 120
         static let login: CGFloat = 106
         static let resets: CGFloat = 116
-        static let monitor: CGFloat = 64
+        static let monitor: CGFloat = 52
         static let actions: CGFloat = 32
     }
 
@@ -112,7 +113,7 @@ struct BrimAccountsPane: View {
             VStack(alignment: .leading, spacing: 1) {
                 if let email = row.email {
                     Text(verbatim: email).font(.system(size: 12)).foregroundStyle(theme.text)
-                        .lineLimit(1).truncationMode(.middle)
+                        .lineLimit(1).minimumScaleFactor(0.8).truncationMode(.middle)
                 }
                 Text(verbatim: row.folder)
                     .font(.system(size: row.email == nil ? 12 : 10.5, design: .monospaced))
