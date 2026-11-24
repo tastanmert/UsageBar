@@ -231,5 +231,12 @@ for linkedParent in [false, true] {
            "raw and resolved legacy directories removed from child PATH: \(linkedParent)")
 }
 
+// A parent Claude Code session's gateway and ids never reach a probe (2026-11-24).
+let inherited = ["PATH": "/usr/bin", "HOME": "/Users/u", "ANTHROPIC_BASE_URL": "http://127.0.0.1:1",
+                 "ANTHROPIC_API_KEY": "x", "CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "s",
+                 "CLAUDE_AGENT_SDK_VERSION": "1", "CLAUDE_CONFIG_DIR": "/Users/u/.claude2", "CODEX_HOME": "/c"]
+let cleaned = CLISearchPath.withoutSessionVariables(inherited)
+expect(Set(cleaned.keys) == ["PATH", "HOME", "CODEX_HOME"], "session variables dropped from a child env (kept \(cleaned.keys.sorted()))")
+
 print("\(checks) checks, \(failures) failed")
 if failures > 0 { exit(1) }

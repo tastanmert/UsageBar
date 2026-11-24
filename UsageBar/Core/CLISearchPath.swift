@@ -95,12 +95,27 @@ final class CLISearchPath: @unchecked Sendable {
             .joined(separator: ":")
     }
 
-    /// The app's environment with PATH replaced by `childPATH`. Every spawn of a resolved provider
-    /// CLI goes through here.
+    /// The app's environment with PATH replaced by `childPATH`, less what a parent Claude Code
+    /// session left in it (`withoutSessionVariables`). Every spawn of a resolved provider CLI goes
+    /// through here.
     func environment(for executable: String) -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
+        var env = Self.withoutSessionVariables(ProcessInfo.processInfo.environment)
         env["PATH"] = childPATH(for: executable, inherited: env["PATH"])
         return env
+    }
+
+    /// An app started from inside a Claude Code session (an `open` typed in its terminal, a script
+    /// it ran) inherits that session's variables: its API gateway (`ANTHROPIC_BASE_URL`), the key
+    /// for it, its session ids. Handed on to `claude -p /usage`, they send the read through a
+    /// gateway that dies with that session: on 2026-11-24 every read for twelve hours took 18 s to
+    /// first byte and came back without the account's limits, until the app was restarted. A probe
+    /// speaks for an account, never for the session that happened to launch the app, so these are
+    /// dropped. `CLAUDE_CONFIG_DIR` goes too: each read names its own home.
+    static func withoutSessionVariables(_ env: [String: String]) -> [String: String] {
+        let exact: Set<String> = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                                  "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_CONFIG_DIR"]
+        let prefixes = ["CLAUDE_CODE_", "CLAUDE_AGENT_SDK_", "CLAUDE_PREVIEW_"]
+        return env.filter { key, _ in !exact.contains(key) && !prefixes.contains { key.hasPrefix($0) } }
     }
 
     // MARK: - Login PATH cache
