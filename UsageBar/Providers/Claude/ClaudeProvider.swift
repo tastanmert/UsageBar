@@ -37,7 +37,7 @@ struct ClaudeProvider: UsageProvider {
         let configDir = (home == defaultHome) ? nil : home
 
         let authMark = await LoginStatusStore.shared.beginUsageAuthentication()
-        let (text, timedOut, serverWait) = await ClaudeUsageCLI.fetchUsage(configDir: configDir, userInitiated: userInitiated)
+        let (text, timedOut, serverWait, unreachable) = await ClaudeUsageCLI.fetchUsage(configDir: configDir, userInitiated: userInitiated)
         // The probe takes seconds; a login that had only just landed has written its profile by
         // now, so a card no longer waits a whole retry to say whose it is (B-1702).
         profile = ClaudeAccounts.profile(configDir: home, unlessNamed: profile)
@@ -52,6 +52,11 @@ struct ClaudeProvider: UsageProvider {
             return failed(L("No credentials: run `claude` to sign in"))
         }
         let metrics = ClaudeUsageTextMapper.map(text: text)
+        if metrics.isEmpty, unreachable {
+            // No network, or no DNS: nothing was refused, so no hold. The next round asks again.
+            return failed(L("Could not reach Claude: showing the last reading"),
+                          detail: L("The usage read could not reach Anthropic: the network or DNS on this Mac did not answer. UsageBar asks again on its usual schedule and keeps the last reading."))
+        }
         guard !metrics.isEmpty else {
             // The CLI ran and was not refused, yet printed no `Current ...` line: Claude answered
             // without this account's limits. Mostly HTTP 429 behind a clean exit (2026-11-17), once

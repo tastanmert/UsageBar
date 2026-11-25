@@ -77,7 +77,7 @@ enum ClaudeUsageCLI {
     /// wait the CLI reported after an HTTP 429 on the usage endpoint (see `rateLimitWait`).
     static func fetchUsage(configDir: String?, userInitiated: Bool = false, executable: String? = nil,
                            probeHomeRoot: URL = probeHomeRoot, timeout: TimeInterval = readTimeout,
-                           now: Date = Date()) async -> (text: String?, timedOut: Bool, serverWait: TimeInterval?) {
+                           now: Date = Date()) async -> (text: String?, timedOut: Bool, serverWait: TimeInterval?, unreachable: Bool) {
         let debugFile = probeHomeRoot.deletingLastPathComponent()
             .appendingPathComponent("probe", isDirectory: true)
             .appendingPathComponent("\(probeHomeName(configDir: configDir)).usage-debug.log")
@@ -85,12 +85,16 @@ enum ClaudeUsageCLI {
         let result = await fetchUsageReading(configDir: configDir, userInitiated: userInitiated,
                                              executable: executable, probeHomeRoot: probeHomeRoot,
                                              timeout: timeout, now: now, debugFile: debugFile)
-        let wait = rateLimitWait(debugLog: debugFile)
+        let debugText = (try? String(contentsOf: debugFile, encoding: .utf8)) ?? ""
+        let wait = rateLimitWait(debugText: debugText)
+        let unreachable = wait == nil && usageUnreachable(debugText: debugText)
         try? FileManager.default.removeItem(at: debugFile)
         if let wait {
             log.notice("probe rate-limited account=\(probeHomeName(configDir: configDir), privacy: .public) serverWaitS=\(Int(wait), privacy: .public)")
+        } else if unreachable {
+            log.notice("probe unreachable account=\(probeHomeName(configDir: configDir), privacy: .public)")
         }
-        return (result.text, result.timedOut, wait)
+        return (result.text, result.timedOut, wait, unreachable)
     }
 
     /// The server's wait from the CLI's debug log after a 429 on `GET /api/oauth/usage`. Claude Code
@@ -102,13 +106,36 @@ enum ClaudeUsageCLI {
         return rateLimitWait(debugText: text)
     }
 
+    ///
+    /// Any status the CLI holds off for counts, not only 429: Claude Code 2.1.323 treats a 403 the
+    /// same way ("fetchUtilization: 403 remembered ... not asking again for 3600s"), and a run that
+    /// replays an answer it already holds says "the endpoint answered 429 12s ago; not asked again
+    /// for 3588s". Reading only 429 left a 403 spell without a hold, asked again every few minutes.
     static func rateLimitWait(debugText text: String) -> TimeInterval? {
-        for line in text.split(separator: "\n") where line.contains("fetchUtilization") && line.contains("429") {
-            guard let range = line.range(of: #"not asking again for (\d+)s"#, options: .regularExpression) else { continue }
+        for line in text.split(separator: "\n") where line.contains("fetchUtilization") || line.contains("the endpoint answered") {
+            guard let range = line.range(of: #"not ask(ing|ed) again for (\d+)s"#, options: .regularExpression) else { continue }
             let digits = line[range].filter(\.isNumber)
             if let seconds = Double(digits), seconds > 0 { return seconds }
         }
         return nil
+    }
+
+    /// The usage request never reached Anthropic: the CLI logged the failure with no HTTP status
+    /// ("Failed to load usage data:" with nothing after it, the shape a dropped network gives,
+    /// measured 2026-11-25), or a DNS or socket error. On 2026-11-24 and 25 the Mac's resolver
+    /// (Tailscale's MagicDNS) answered ENOTFOUND for hours; the card said Anthropic was limiting
+    /// reads, and the user went looking for a rate limit that was not there.
+    static func usageUnreachable(debugText text: String) -> Bool {
+        let markers = ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENETUNREACH", "EHOSTUNREACH"]
+        for line in text.split(separator: "\n") {
+            if line.contains("Failed to load usage data") {
+                if markers.contains(where: line.contains) { return true }
+                if line.range(of: #"status code \d{3}"#, options: .regularExpression) == nil,
+                   line.trimmingCharacters(in: .whitespaces).hasSuffix("Failed to load usage data:") { return true }
+            }
+            if line.contains("fetchUtilization") && markers.contains(where: line.contains) { return true }
+        }
+        return false
     }
 
     private static func fetchUsageReading(configDir: String?, userInitiated: Bool, executable: String?,
@@ -132,7 +159,11 @@ enum ClaudeUsageCLI {
         ], timeout: timeout, directory: directory, debugFile: debugFile)
         // A 429 is the server refusing this bearer for a stated time. The old read uses the same
         // bearer, so asking it as well only spends a second request inside the same window.
-        if rateLimitWait(debugLog: debugFile) != nil { return (isolated.text, isolated.timedOut) }
+        // Unreachable is the same: the old read would only fail the same way a second time.
+        if let text = try? String(contentsOf: debugFile, encoding: .utf8),
+           rateLimitWait(debugText: text) != nil || usageUnreachable(debugText: text) {
+            return (isolated.text, isolated.timedOut)
+        }
         let verdict = isolatedVerdict(isolated.text, shapeVerified: await routes.shapeVerified(key))
         switch verdict {
         case .accept(let sawModelWindow):

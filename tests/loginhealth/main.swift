@@ -409,6 +409,19 @@ expect(ClaudeUsageCLI.rateLimitWait(debugText: "fetchUtilization: GET /api/oauth
        "(r) a log without a 429 names no wait")
 expect(ClaudeUsageCLI.rateLimitWait(debugText: "other: 429 not asking again for 50s\n") == nil,
        "(r) only the usage fetch line counts")
+expect(ClaudeUsageCLI.rateLimitWait(debugText: "2026-11-25T10:22:08Z [DEBUG] fetchUtilization: 403 remembered for this bearer; not asking again for 3600s\n") == 3600,
+       "(r) a 403 hold names its wait too")
+expect(ClaudeUsageCLI.rateLimitWait(debugText: "[ERROR] Failed to load usage data: the endpoint answered 429 12s ago; not asked again for 3588s\n") == 3588,
+       "(r) a replayed answer names its remaining wait")
+// (u) The read never reached Anthropic (2026-11-25): no status, or a DNS error.
+expect(ClaudeUsageCLI.usageUnreachable(debugText: """
+2026-11-25T14:37:26.323Z [DEBUG] fetchUtilization: GET /api/oauth/usage (attempt 1)
+2026-11-25T14:37:26.340Z [ERROR] Failed to load usage data:
+"""), "(u) a usage failure with no status is unreachable")
+expect(ClaudeUsageCLI.usageUnreachable(debugText: "[ERROR] Failed to load usage data: getaddrinfo ENOTFOUND api.anthropic.com\n"),
+       "(u) a DNS failure is unreachable")
+expect(!ClaudeUsageCLI.usageUnreachable(debugText: "[ERROR] Failed to load usage data: Request failed with status code 429\n"),
+       "(u) a 429 is not unreachable")
 let providerSource = (try? String(contentsOfFile: "UsageBar/Providers/Claude/ClaudeProvider.swift", encoding: .utf8)) ?? ""
 expect(providerSource.contains("timedOut ? L(\"This Mac is busy: the read timed out, it will retry next round\")")
        && providerSource.contains(": L(\"Claude CLI read failed\")"), "(c) the provider words a timeout apart from a read failure")

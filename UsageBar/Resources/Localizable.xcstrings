@@ -32111,6 +32111,28 @@
           }
         }
       }
+    },
+    "Could not reach Claude: showing the last reading": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Claude’a ulaşılamadı (ağ): son okuma gösteriliyor"
+          }
+        }
+      }
+    },
+    "The usage read could not reach Anthropic: the network or DNS on this Mac did not answer. UsageBar asks again on its usual schedule and keeps the last reading.": {
+      "extractionState": "manual",
+      "localizations": {
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Kota okuması Anthropic’e ulaşamadı: bu Mac’in ağı ya da DNS’i yanıt vermedi. UsageBar her zamanki aralıkla yeniden sorar ve son okumayı gösterir."
+          }
+        }
+      }
     }
   },
   "version": "1.0"
