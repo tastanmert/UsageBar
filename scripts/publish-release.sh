@@ -35,7 +35,8 @@ gh release view "v$VERSION" --repo "$REPO" > /dev/null 2>&1 && die "release v$VE
 
 # ---------------------------------------------------------------- version
 step "version $VERSION"
-CURRENT_BUILD=$(sed -n 's/^ *CURRENT_PROJECT_VERSION: "\([0-9]*\)"$/\1/p' project.yml)
+# The app and the widget carry the same two numbers; the first is read, every one is rewritten.
+CURRENT_BUILD=$(sed -n 's/^ *CURRENT_PROJECT_VERSION: "\([0-9]*\)"$/\1/p' project.yml | head -n 1)
 [ -n "$CURRENT_BUILD" ] || die "CURRENT_PROJECT_VERSION not found in project.yml"
 BUILD=$((CURRENT_BUILD + 1))
 sed -i '' -E "s/^( *MARKETING_VERSION: )\"[^\"]*\"$/\1\"$VERSION\"/; s/^( *CURRENT_PROJECT_VERSION: )\"[0-9]*\"$/\1\"$BUILD\"/" project.yml
@@ -110,3 +111,23 @@ Installed copies update themselves. New install: open the DMG and drag UsageBar 
 gh release create "v$VERSION" "$DMG" "$PUB/appcast.xml" --repo "$REPO" --target main \
   --title "UsageBar $VERSION" --notes "$BODY"
 echo "==> published: https://github.com/$REPO/releases/tag/v$VERSION"
+
+# ---------------------------------------------------------------- homebrew
+# The tap's cask names this version and the DMG's checksum, so `brew install --cask usagebar`
+# hands out what the release page does. A failure here leaves the release published; the cask
+# then still points at the previous version, which installs and updates itself through Sparkle.
+step "homebrew tap"
+TAP_REMOTE="https://github.com/tastanmert/homebrew-tap.git"
+SHA=$(shasum -a 256 "$DMG" | cut -d' ' -f1)
+if git clone --quiet --depth 1 "$TAP_REMOTE" "$WORK/tap"; then
+  sed -i '' -E "s/^( *version )\"[^\"]*\"/\1\"$VERSION\"/; s/^( *sha256 )\"[0-9a-f]*\"/\1\"$SHA\"/" "$WORK/tap/Casks/usagebar.rb"
+  if git -C "$WORK/tap" diff --quiet; then
+    echo "    cask already current"
+  else
+    git -C "$WORK/tap" -c user.name="$(git config user.name)" -c user.email="$(git config user.email)" \
+      commit --quiet -am "UsageBar $VERSION" && git -C "$WORK/tap" push --quiet origin main \
+      && echo "    cask: $VERSION" || echo "    cask update failed; update Casks/usagebar.rb by hand"
+  fi
+else
+  echo "    could not clone $TAP_REMOTE; update Casks/usagebar.rb by hand"
+fi

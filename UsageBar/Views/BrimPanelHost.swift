@@ -12,10 +12,11 @@ struct BrimPanelHost: View {
     var body: some View {
         // Countdowns move on their own between snapshot reads.
         TimelineView(.periodic(from: .now, by: 30)) { context in
-            BrimPanelView(model: Self.model(store: store, now: context.date),
+            let model = Self.model(store: store, now: context.date)
+            BrimPanelView(model: model,
                           layout: BrimSettingsPrefs.shared.panelLayout,
                           used: BrimSettingsPrefs.shared.displayMode == .used,
-                          actions: Self.actions,
+                          actions: Self.actions(copying: model, screenWidth: hostScreen()?.visibleFrame.width),
                           maxHeight: (hostScreen()?.visibleFrame.height ?? 900) - 40,
                           screenWidth: hostScreen()?.visibleFrame.width,
                           onContentSize: onContentSize,
@@ -23,7 +24,8 @@ struct BrimPanelHost: View {
                           refreshing: store.isRefreshing,
                           usageContent: { width, height in
                               AnyView(BrimUsageView(store: .shared, width: width, maxHeight: height))
-                          })
+                          },
+                          incidents: ServiceStatusStore.shared.incidents(now: context.date))
         }
     }
 
@@ -51,7 +53,24 @@ struct BrimPanelHost: View {
     }
 
     @MainActor
-    static var actions: BrimPanelActions {
+    static var actions: BrimPanelActions { actions(copying: nil, screenWidth: nil) }
+
+    /// `copying`: the model the copy button pictures; nil leaves the button out.
+    @MainActor
+    static func actions(copying model: BrimPanelModel?, screenWidth: CGFloat?) -> BrimPanelActions {
+        var actions = baseActions
+        if let model, model.body == .accounts {
+            actions.copyImage = {
+                PanelSnapshot.copy(model: model, layout: BrimSettingsPrefs.shared.panelLayout,
+                                   used: BrimSettingsPrefs.shared.displayMode == .used, screenWidth: screenWidth)
+            }
+        }
+        actions.openStatusPage = { NSWorkspace.shared.open($0) }
+        return actions
+    }
+
+    @MainActor
+    private static var baseActions: BrimPanelActions {
         BrimPanelActions(
             refresh: refreshNow,
             openSettings: {

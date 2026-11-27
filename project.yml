@@ -225,6 +225,38 @@ targets:
         DEVELOPMENT_TEAM: ""
         SWIFT_STRICT_CONCURRENCY: complete
 
+  # The desktop widget (WidgetKit). Sandboxed, as widget extensions must be, with one read-only
+  # exception: ~/.usagebar, where the app writes the snapshot it draws.
+  UsageBarWidget:
+    type: app-extension
+    platform: macOS
+    configFiles:
+      Debug: Config/Overlay.xcconfig
+      Release: Config/Overlay.xcconfig
+    sources:
+      - UsageBarWidget
+    settings:
+      base:
+        PRODUCT_NAME: UsageBarWidget
+        PRODUCT_BUNDLE_IDENTIFIER: app.usagebar.UsageBar.widget
+        INFOPLIST_FILE: UsageBarWidget/Info.plist
+        CODE_SIGN_ENTITLEMENTS: UsageBarWidget/UsageBarWidget.entitlements
+        MARKETING_VERSION: "0.88.0"
+        CURRENT_PROJECT_VERSION: "1681"
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: ""
+        ENABLE_HARDENED_RUNTIME: YES
+        SWIFT_STRICT_CONCURRENCY: complete
+        SKIP_INSTALL: YES
+      configs:
+        Debug:
+          # Prefixed by the Debug app's own id, as an embedded extension's must be.
+          PRODUCT_BUNDLE_IDENTIFIER: $(USAGEBAR_DEV_BUNDLE_IDENTIFIER).widget
+          ENABLE_HARDENED_RUNTIME: NO
+
   UsageBar:
     type: application
     platform: macOS
@@ -292,6 +324,8 @@ targets:
       - target: UsageBarCLI
         embed: false
       - package: Sparkle
+      # The desktop widget, embedded in Contents/PlugIns.
+      - target: UsageBarWidget
     # UsageBarCLI builds the shared Rust library before this dependent app links.
     # An overlay linked at ./overlay may add files to the built app; absent in the public tree.
     postBuildScripts:
@@ -318,8 +352,8 @@ targets:
         ENABLE_USER_SCRIPT_SANDBOXING: NO
         CODE_SIGN_ENTITLEMENTS: UsageBar/Resources/UsageBar.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: app.usagebar.UsageBar
-        MARKETING_VERSION: "0.87.2"
-        CURRENT_PROJECT_VERSION: "1680"
+        MARKETING_VERSION: "0.88.0"
+        CURRENT_PROJECT_VERSION: "1681"
         SWIFT_VERSION: "6.0"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         # UsageBar has no signing team yet: ad-hoc signing, so any machine can build it.

@@ -17,6 +17,10 @@ struct BrimPanelActions {
     var setLayout: (BrimPanelLayout) -> Void = { _ in }
     /// A card's "Sign in again" for an account whose login was refused. nil: no button.
     var signIn: ((String) -> Void)? = nil
+    /// Copy a picture of the accounts to the clipboard. nil: no button.
+    var copyImage: (() -> Void)? = nil
+    /// Open a provider's status page from its incident line.
+    var openStatusPage: (URL) -> Void = { _ in }
 }
 
 /// The UsageBar menu bar panel: a header (mark, name, update time, refresh, view menu, settings),
@@ -41,6 +45,10 @@ struct BrimPanelView: View {
     /// The Usage tab's content for a width and the height it may take (BrimUsageView). nil: no
     /// tab switch, the accounts only (screenshots render the panel without the token scan).
     var usageContent: ((_ width: CGFloat, _ maxHeight: CGFloat) -> AnyView)? = nil
+    /// Providers whose status page reports an incident (ServiceStatusStore), one line each.
+    var incidents: [BrimServiceIncident] = []
+    /// A picture for the clipboard: no header buttons.
+    var snapshotMode = false
 
     enum Tab: String { case accounts, usage }
     @AppStorage("brimPanelTab") private var tabRaw = Tab.accounts.rawValue
@@ -136,6 +144,17 @@ struct BrimPanelView: View {
                     .font(.system(size: 11)).foregroundStyle(theme.text2)
                     .lineLimit(1).fixedSize()
             }
+            if !snapshotMode {
+                headerButtons
+            }
+        }
+        .padding(EdgeInsets(top: 10, leading: 16, bottom: 8, trailing: snapshotMode ? 16 : 8))
+    }
+
+    @ViewBuilder private var headerButtons: some View {
+            if tab == .accounts, let copyImage = actions.copyImage {
+                CopyImageButton(theme: theme, action: copyImage)
+            }
             refreshButton
             iconButton("square.grid.2x2", label: L("View"), action: { menuOpen.toggle() })
                 .popover(isPresented: $menuOpen, arrowEdge: .bottom) {
@@ -144,8 +163,6 @@ struct BrimPanelView: View {
                         .environment(\.colorScheme, scheme)
                 }
             iconButton("gearshape", label: L("Settings"), action: actions.openSettings)
-        }
-        .padding(EdgeInsets(top: 10, leading: 16, bottom: 8, trailing: 8))
     }
 
     /// Accounts (remaining or used, as Settings has it) and Usage, as two quiet words; the chosen
@@ -237,6 +254,9 @@ struct BrimPanelView: View {
             notice(symbol: "clock", tint: theme.warn, text: words.stale(minutes))
         case nil:
             EmptyView()
+        }
+        ForEach(incidents) { incident in
+            BrimIncidentLine(incident: incident, theme: theme, open: { actions.openStatusPage(incident.site) })
         }
     }
 

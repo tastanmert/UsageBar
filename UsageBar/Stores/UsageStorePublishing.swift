@@ -38,6 +38,7 @@ extension UsageStore {
                                ($0.id, RedeemAction.offer(for: $0).stateName)
                            }, uniquingKeysWith: { first, _ in first }))
         snapshot.write()
+        WidgetReload.snapshotWritten()
         adoptPublished(snapshot)
     }
 

@@ -54,6 +54,7 @@ struct BrimSettingsPane: View {
         case .general: BrimGeneralPane(data: data, bindings: bindings, actions: actions)
         case .accounts: BrimAccountsPane(data: data, actions: actions)
         case .routing: BrimRoutingPane(format: data.format)
+        case .notifications: BrimNotificationsPane()
         case .integrations: BrimIntegrationsPane(report: data.integrations)
         case .about: BrimAboutPane(data: data, actions: actions)
         }
@@ -150,6 +151,10 @@ struct BrimGeneralPane: View {
                     }
                     BrimSettingsDivider()
                     BrimLaunchAtLoginRow()
+                    BrimSettingsDivider()
+                    BrimHotKeyRow()
+                    BrimSettingsDivider()
+                    BrimKeepAwakeRow()
                 }
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)

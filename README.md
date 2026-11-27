@@ -16,8 +16,23 @@ It is free, open source and native (Swift, SwiftUI and AppKit, with a Rust core 
 - **Reset credits.** Banked rate-limit resets are shown on the account, and using one always asks for confirmation first.
 - **Early start.** Optionally opens a closed 5-hour window with one short message, so the clock runs before you sit down.
 - **Login health.** Accounts that are signed out or close to login expiry are flagged, with a shortcut to sign in again.
+- **Limit alerts.** A notification when any account's 5-hour, weekly or top-model window passes your threshold (75, 90 or 95%), another when it is used up, and one a day before a weekly window resets with half of it unused. Settings > Notifications.
+- **Service status.** When status.claude.com or status.openai.com reports an incident, the panel says so in one line that links to the page, and a notification says when it starts.
+- **Desktop widget.** Small, medium and large widgets with each account's 5-hour and weekly windows.
+- **Shortcut and keep awake.** An optional global shortcut opens the panel from anywhere, and the Mac can be kept from idle sleep while a session started through UsageBar is working.
+- **Copy as image.** The copy button in the panel puts a picture of your accounts on the clipboard.
 
 ## Install
+
+With Homebrew:
+
+```sh
+brew tap tastanmert/tap
+brew trust tastanmert/tap
+brew install --cask usagebar
+```
+
+Or by hand:
 
 1. Download the latest `UsageBar-<version>.dmg` from [GitHub Releases](https://github.com/tastanmert/UsageBar/releases/latest).
 2. Open the DMG and drag UsageBar into Applications.
@@ -107,7 +122,9 @@ To package a DMG, run `scripts/make-release.sh --unsigned` for a local test buil
 - After a sign-in that UsageBar drove, it marks Claude Code's first-run wizard as completed in that one config folder. It merges one key and never replaces the file.
 - The Cost tab reads the CLIs' local transcripts on your Mac. They never leave it.
 - UsageBar has no telemetry: no usage ping, no analytics and no crash reporting.
-- The network requests are the ones the official CLIs make to read usage, plus requests to `api.anthropic.com` that list and claim Claude reset credits, which run only for those features.
+- The network requests are the ones the official CLIs make to read usage, plus requests to `api.anthropic.com` that list and claim Claude reset credits, which run only for those features, and the status page reads described below.
+- With Service status on (Settings > Notifications), UsageBar sends one anonymous GET every 5 minutes to `status.claude.com` and `status.openai.com`, only for the providers you have accounts with. No cookie or identifier is sent. Turn it off to stop these requests.
+- The desktop widget is sandboxed and can read only `~/.usagebar`, where the app writes the snapshot it draws.
 - Plan renewal dates are read a few times a day with one GET per account. For Codex, UsageBar asks the official CLI for its access token, keeps it in memory for one request to `chatgpt.com/backend-api/subscriptions` and drops it. `auth.json` is never opened.
 - For Claude, the renewal date is only on claude.ai. It is read after you sign in to claude.ai inside UsageBar, in a web session kept apart from your browser and from every other account. Without that sign-in nothing is sent.
 - Local state lives in `~/.usagebar`, including the snapshot at `~/.usagebar/snapshot.json`, which holds percentages and paths and no tokens.

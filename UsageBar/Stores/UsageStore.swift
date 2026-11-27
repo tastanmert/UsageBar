@@ -396,6 +396,8 @@ final class UsageStore {
                 // And when a banked reset is worth spending: the user has to REMEMBER to look at a credit
                 // otherwise. Same rule as every other surface here - it names the account, it never redeems.
                 ResetHintNotifier.shared.evaluate(accounts: labeled)
+                // And each window crossing the user's threshold, or a week about to reset unused.
+                LimitAlertNotifier.shared.evaluate(accounts: labeled)
                 // BRIM-GATE: browser delegation and its prompts remain disabled.
                 if BrimFeatures.chromeStep { ChromeSettingNotifier.shared.evaluate(accounts: labeled) }
                 ClearanceIdleNotifier.shared.evaluate(accounts: labeled)

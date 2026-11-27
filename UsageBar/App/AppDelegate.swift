@@ -73,6 +73,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // on (`ProcessFootprintStore`). After the status item, because the roster it reads its
         // sessions from is installed there.
         ProcessFootprintStore.shared.install()
+        // The status pages, the global shortcut and the keep-awake switch, each as Settings has it.
+        ServiceStatusStore.shared.install()
+        GlobalHotKey.shared.apply(AlertPrefs.shared.hotKey)
+        KeepAwake.shared.reevaluate()
         OverlayApp.didFinishLaunching()   // private build hook (OverlayApp.swift)
         // Updater before the window restores: a restored Settings window renders update rows,
         // and they must see a live updater (plus the observable mirror, for any later render).
@@ -240,6 +244,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if UserDefaults.standard.bool(forKey: "UsageBarClearanceIdleTest") {
             ClearanceIdleNotifier.shared.postSampleNotification()
+        }
+        // The per-account limit alerts (-UsageBarLimitAlertTest): one threshold, one unused week.
+        if UserDefaults.standard.bool(forKey: "UsageBarLimitAlertTest") {
+            LimitAlertNotifier.shared.postSampleNotifications()
         }
         // And for the login-expiry alert (-UsageBarLoginExpiryTest), whose "Renew login" button is the
         // one path into a renewal that no card is involved in.

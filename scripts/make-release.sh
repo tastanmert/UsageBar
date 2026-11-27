@@ -153,6 +153,11 @@ sign_all() {  # sign_all <identity> [extra codesign flags...]: inside-out, deepe
   find "$APP" -mindepth 2 -type d \( -name '*.framework' -o -name '*.app' -o -name '*.xpc' \) -print \
     | awk -F/ '{print NF "\t" $0}' | sort -rn | cut -f2- \
     | while IFS= read -r f; do codesign --force "$@" --sign "$id" "$f"; done
+  # 2b. the widget, with its sandbox: a re-sign without --entitlements drops them, and WidgetKit
+  # refuses an extension that is not sandboxed.
+  local widget="$APP/Contents/PlugIns/UsageBarWidget.appex"
+  [ -d "$widget" ] || die "the widget extension is missing from the app"
+  codesign --force "$@" --entitlements UsageBarWidget/UsageBarWidget.entitlements --sign "$id" "$widget"
   # 3. the app itself
   codesign --force "$@" --sign "$id" "$APP"
 }

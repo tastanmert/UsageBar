@@ -129,7 +129,10 @@ final class StatusItemController: NSObject {
         // snapshot, so it needs its own reason to redraw: a session that starts waiting while
         // every window is closed is exactly the case the dot exists for (SessionRosterStore.swift
         // states how it hears about that with nothing open).
-        SessionRosterStore.shared.onChange = { [weak self] in self?.updateButton() }
+        SessionRosterStore.shared.onChange = { [weak self] in
+            self?.updateButton()
+            KeepAwake.shared.reevaluate()
+        }
         // A private build's mark (OverlayApp.statusItemNote) has its own reason to redraw too.
         OverlayApp.statusItemChanged = { [weak self] in self?.updateButton() }
         // Which order the board is in is the user's switch, and the roster READS it rather than
@@ -205,6 +208,12 @@ final class StatusItemController: NSObject {
             // without this, the ring and the arrow keys come back with a popover merely reopened.
             window?.makeFirstResponder(nil)
         }
+    }
+
+    /// The global shortcut (GlobalHotKey): the same toggle a click on the item is.
+    func toggleFromHotKey() {
+        guard let button = statusItem?.button else { return }
+        togglePopover(button: button, afterDismissal: false)
     }
 
     /// `-UsageBarPopoverCapture YES` (demo or dev builds only): open the popover at launch so it can be

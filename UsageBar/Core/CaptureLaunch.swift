@@ -92,6 +92,7 @@ enum CaptureLaunch {
         "UsageBarLoginExpiryTest",
         "UsageBarUpdateLagTest",
         "UsageBarClearanceIdleTest",
+        "UsageBarLimitAlertTest",
         // The host-pressure alarm, which is a banner like the three above it and reaches it the
         // same way: the flag reports a CPU share of 97% to the watch, and three samples later the
         // machine is in alarm (`HostHealthMonitor.testCPU`). A background launch for the family's
@@ -128,6 +129,8 @@ enum CaptureLaunch {
                                // Qualifies UsageBarDemoData: Settings' fallback command and its note as
                                // a Mac whose Terminal cannot find the CLI sees them (B-3745, Debug).
                                "UsageBarDemoCLIOffPath",
+                               // Qualifies UsageBarDemoData: the panel shows one status-page incident.
+                               "UsageBarDemoIncident",
                                // Qualifies UsageBarDemoData: one Settings row opens renaming (Debug).
                                "UsageBarDemoRenaming",
                                // Qualifies UsageBarDemoData: one Settings row's actions menu opens (Debug).

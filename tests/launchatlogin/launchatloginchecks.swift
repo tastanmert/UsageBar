@@ -465,9 +465,9 @@ func runLaunchAtLoginChecks() {
         "UsageBarStripSnapshot", "UsageBarWindowSnapshot",
         "UsageBarDryNotifyTest", "UsageBarResetHintTest", "UsageBarResetHintExpiryTest", "UsageBarLoginExpiryTest",
         "UsageBarHostHealthTest", "UsageBarCPUAlertTest",
-        "UsageBarUpdateLagTest", "UsageBarClearanceIdleTest",
+        "UsageBarUpdateLagTest", "UsageBarClearanceIdleTest", "UsageBarLimitAlertTest",
     ]
-    check("the family is exactly these thirty-three flags",
+    check("the family is exactly these thirty-four flags",
           Set(CaptureLaunch.backgroundKeys) == expectedFamily)
     check("and it carries no duplicates",
           CaptureLaunch.backgroundKeys.count == expectedFamily.count)
@@ -522,8 +522,8 @@ func runLaunchAtLoginChecks() {
           scanned.subtracting(CaptureLaunch.allFlagKeys).isEmpty)
     check("and every flag classified is spelled in the source",
           Set(CaptureLaunch.allFlagKeys).subtracting(scanned).isEmpty)
-    check("which comes to eighty-eight, in three buckets",
-          CaptureLaunch.allFlagKeys.count == 88 && scanned.count == 88)
+    check("which comes to ninety, in three buckets",
+          CaptureLaunch.allFlagKeys.count == 90 && scanned.count == 90)
     check("with nothing counted twice",
           Set(CaptureLaunch.allFlagKeys).count == CaptureLaunch.allFlagKeys.count)
     check("a launch carrying none of them does",

@@ -5,7 +5,7 @@ import SwiftUI
 /// dot. Colours come from the panel's `BrimTheme`.
 
 enum BrimSettingsTab: String, CaseIterable, Identifiable {
-    case general, accounts, routing, integrations, about
+    case general, accounts, routing, notifications, integrations, about
     var id: String { rawValue }
 
     var title: String {
@@ -13,6 +13,7 @@ enum BrimSettingsTab: String, CaseIterable, Identifiable {
         case .general: L("General")
         case .accounts: L("Accounts")
         case .routing: L("Routing")
+        case .notifications: L("Notifications")
         case .integrations: L("Integrations")
         case .about: L("About")
         }
@@ -23,6 +24,7 @@ enum BrimSettingsTab: String, CaseIterable, Identifiable {
         case .general: "slider.horizontal.3"
         case .accounts: "person"
         case .routing: "arrow.triangle.branch"
+        case .notifications: "bell"
         case .integrations: "powerplug"
         case .about: "info.circle"
         }

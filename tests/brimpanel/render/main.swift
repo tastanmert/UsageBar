@@ -213,6 +213,19 @@ try MainActor.assumeIsolated {
         } else {
             print("no usable reset row in the fixture")
         }
+        // The status-page incident line and the copy button.
+        var extras = BrimPanelActions()
+        extras.copyImage = {}
+        let incidents = [BrimServiceIncident(id: "claude", name: "Claude", indicator: .minor,
+                                             site: URL(string: "https://status.claude.com")!)]
+        for dark in [false, true] {
+            render(BrimPanelView(model: live, layout: BrimPanelLayout(), actions: extras, maxHeight: 1400,
+                                 screenWidth: 1512, incidents: incidents),
+                   dark: dark, name: "incident-tr-\(dark ? "dark" : "light").png")
+        }
+        render(BrimPanelView(model: live, layout: BrimPanelLayout(), maxHeight: 1400, screenWidth: 1512,
+                             snapshotMode: true),
+               dark: true, name: "copy-image-tr-dark.png")
         turkish = false
     }
 
